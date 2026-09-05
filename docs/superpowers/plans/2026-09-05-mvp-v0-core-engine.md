@@ -552,22 +552,31 @@ const stateSchema = z
     validFrom: z.string().datetime(),
     validUntil: z.string().datetime().nullable().default(null),
   })
-  .strict()
-  .refine(
-    (s) => s.validUntil === null || Date.parse(s.validUntil) >= Date.parse(s.validFrom),
-    { message: "validUntil precedes validFrom" },
-  );
+  .strict();
 
 /**
  * An event carries an instant and no interval; a state carries an interval and
  * no instant. The union is strict in both directions so that a state can never
  * acquire a date by accident, which is the defect the study's S3 signal
  * exhibited.
+ *
+ * The interval check sits on the union rather than on the state member because
+ * `z.discriminatedUnion` accepts plain objects only: a member ending in
+ * `.refine` is a `ZodEffects` and the union throws while it is being built.
  */
-export const observationSchema = z.discriminatedUnion("evidenceKind", [
-  eventSchema,
-  stateSchema,
-]);
+export const observationSchema = z
+  .discriminatedUnion("evidenceKind", [eventSchema, stateSchema])
+  .superRefine((o, ctx) => {
+    if (o.evidenceKind !== "state") return;
+    if (o.validUntil === null) return;
+    if (Date.parse(o.validUntil) < Date.parse(o.validFrom)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["validUntil"],
+        message: "validUntil precedes validFrom",
+      });
+    }
+  });
 
 export type Observation = z.infer<typeof observationSchema>;
 ```
@@ -800,7 +809,7 @@ Expected: FAIL, cannot resolve `./payloads.js`, and the fixtures directory is mi
 
 ```ts
 import { z } from "zod";
-import { CHANNELS, type Channel } from "./channel.js";
+import { type Channel } from "./channel.js";
 import { observationSchema, type Observation } from "./observation.js";
 import { deriveIdempotencyKey } from "./idempotency.js";
 
@@ -884,9 +893,12 @@ export function validateObservation(input: unknown): ValidationResult {
     value: { ...o, idempotencyKey: deriveIdempotencyKey(o.source, o.channel) },
   };
 }
-
-export { CHANNELS };
 ```
+
+`payloads.ts` does not re-export `CHANNELS`. It imports it to build the record
+and to let callers iterate, but `channel.ts` stays the single origin, because
+the index re-exports both files and two origins for one name fails to
+typecheck.
 
 - [ ] **Step 4: Write the seven fixtures**
 
