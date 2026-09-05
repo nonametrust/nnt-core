@@ -43,8 +43,8 @@ export interface Schema {
     saturation_state: "open" | "saturated";
     suppression_factor: number;
   };
-  // rescued_by is a plain uuid here; the foreign key arrives with the
-  // migration that creates trigger_event, and the type does not change then.
+  // rescued_by is a plain uuid here; the foreign key arrived with 0006, the
+  // migration that created trigger_event, and the type did not change then.
   permanent_record: {
     record_id: string;
     observation_id: string;
@@ -77,6 +77,55 @@ export interface Schema {
     terminal_sha256: Buffer;
     hmac: Buffer;
     sealed_at: Date;
+  };
+  // The four tables M2 and M3 fill. Every number here is stored as given
+  // and computed by nobody in this package.
+  //
+  // `n` is a bigint, and the driver hands a bigint back as a string, as it
+  // does audit_entry.seq. Unlike seq this one is arithmetic, so the baseline
+  // repository converts it and refuses a value past the safe-integer range
+  // rather than round it. The TypeScript field is `count`; the column is not,
+  // because `count` in hand-written SQL reads as the aggregate.
+  baseline: {
+    namespace_id: string;
+    channel: string;
+    aspect: string;
+    n: ColumnType<string, number, number>;
+    mean: number;
+    m2: number;
+    median_est: number | null;
+    mad_est: number | null;
+    fast_mean: number;
+    fast_m2: number;
+    slow_mean: number;
+    slow_m2: number;
+    updated_at: Date;
+  };
+  // `tier` is any text: the tiers themselves are the tiered failure policy,
+  // which is M3's. The check the table holds is that only a harm-confirmed
+  // row carries one.
+  trigger_event: {
+    trigger_id: string;
+    namespace_id: string;
+    observation_id: string;
+    status: "candidate" | "verified" | "harm_confirmed";
+    tier: string | null;
+    cluster_id: string | null;
+    surprise: number;
+    created_at: Date;
+  };
+  volatility: {
+    namespace_id: string;
+    q_hat: number;
+    updated_at: Date;
+  };
+  hot_window: {
+    window_id: string;
+    namespace_id: string;
+    trigger_id: string;
+    opens_at: Date;
+    closes_at: Date;
+    scale: number;
   };
 }
 

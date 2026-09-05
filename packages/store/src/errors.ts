@@ -48,6 +48,12 @@ export class DayNotClosed extends StoreError {}
 // re-run over the same head returns quietly; this difference is the signal
 // the seal exists to give, and it is raised rather than overwritten.
 export class SealMismatch extends StoreError {}
+// Both raised in TypeScript, from `get`, for the reason ObservationNotFound
+// is. baseline and volatility have no such class: a namespace with no
+// baseline or no estimate yet is every new namespace, so their reads answer
+// empty and null rather than raise.
+export class TriggerEventNotFound extends StoreError {}
+export class HotWindowNotFound extends StoreError {}
 export class MigrationDrift extends StoreError {}
 
 const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreError> = {
