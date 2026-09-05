@@ -53,16 +53,22 @@ describe("datedAt", () => {
   // other than the type definition and the reader must not name those fields.
   it("no module outside timing.ts reads a date off an observation", () => {
     const srcDir = dirname(fileURLToPath(import.meta.url));
+    // Exempt by path relative to src, not by basename: a later
+    // src/windows/timing.ts must not inherit the exemption for free.
     const exempt = new Set(["observation.ts", "timing.ts"]);
+    // Every extension the tsconfig admits, so none of them is a way past.
+    const source = /\.(ts|mts|cts|tsx)$/;
+    const test = /\.test\.(ts|mts|cts|tsx)$/;
     const dateFields = /\b(observedAt|validFrom|validUntil)\b/;
     const offenders: string[] = [];
     for (const entry of readdirSync(srcDir, { recursive: true, withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")) continue;
-      if (exempt.has(entry.name)) continue;
+      if (!entry.isFile() || !source.test(entry.name) || test.test(entry.name)) continue;
       const file = join(entry.parentPath, entry.name);
+      const rel = relative(srcDir, file);
+      if (exempt.has(rel)) continue;
       readFileSync(file, "utf8").split("\n").forEach((line, i) => {
         if (dateFields.test(line)) {
-          offenders.push(`${relative(srcDir, file)}:${i + 1}: ${line.trim()}`);
+          offenders.push(`${rel}:${i + 1}: ${line.trim()}`);
         }
       });
     }
