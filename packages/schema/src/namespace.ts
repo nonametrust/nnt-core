@@ -7,9 +7,11 @@ import { z } from "zod";
  * reason, and is stored as provenance.
  */
 export const continuityAssertionSchema = z.object({
-  assertedBy: z.string().min(1),
+  // A whitespace-only asserter is not a who and a whitespace-only reason is
+  // not a why, so both are trimmed before the length check.
+  assertedBy: z.string().trim().min(1),
   assertedAt: z.string().datetime(),
-  reason: z.string().min(1),
+  reason: z.string().trim().min(1),
 });
 export type ContinuityAssertion = z.infer<typeof continuityAssertionSchema>;
 

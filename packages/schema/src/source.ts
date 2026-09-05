@@ -8,9 +8,16 @@ import { z } from "zod";
  * property rather than a performance one.
  */
 export const sourceSchema = z.object({
-  producer: z.string().min(1).regex(/^[a-z0-9][a-z0-9-]*$/, {
-    message: "producer is a bare name; put the version in producerVersion",
-  }),
+  // Lowercase alphanumeric segments joined by single hyphens: no leading,
+  // trailing or doubled hyphen. Producer names are our own component names,
+  // so the tight form rejects nothing legitimate.
+  producer: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(/^[a-z0-9]+(-[a-z0-9]+)*$/, {
+      message: "producer is a bare name; put the version in producerVersion",
+    }),
   producerVersion: z.string().min(1),
   network: z.string().min(1).optional(),
   ref: z.string().min(1),
