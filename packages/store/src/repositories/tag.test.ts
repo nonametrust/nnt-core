@@ -143,12 +143,14 @@ describe("opening and reading", () => {
   // NaN and Infinity are accepted by a double precision column and NaN sorts
   // above every number in Postgres, so `check (g0 >= 0)` lets both through.
   // The refusal has to happen before the statement is sent.
-  it("refuses a g0 that is negative or not a finite number, before writing", async () => {
+  it("refuses a g0 that is negative or not a finite number, and writes nothing", async () => {
+    const before = await rowVersions();
     for (const g0 of [-0.1, Number.NaN, Number.POSITIVE_INFINITY]) {
       await expect(
         repo.open({ namespaceId: ns, observationId: obs, channel: "volume", g0 }),
       ).rejects.toBeInstanceOf(RangeError);
     }
+    expect(await rowVersions()).toEqual(before);
   });
 });
 

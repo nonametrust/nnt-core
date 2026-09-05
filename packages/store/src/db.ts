@@ -40,7 +40,7 @@ export interface Schema {
     g0: number;
     tagged_at: Date;
     refresh_count: number;
-    saturation_state: string;
+    saturation_state: "open" | "saturated";
     suppression_factor: number;
   };
 }

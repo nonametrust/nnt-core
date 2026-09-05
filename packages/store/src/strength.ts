@@ -9,8 +9,9 @@ import type { StoredTag } from "./repositories/tag.js";
  * audit log, because nothing was overwritten to produce today's number.
  *
  * Suppression multiplies elapsed time rather than subtracting from g0, so a
- * suppressed tag decays faster and never reaches zero. That is what makes
- * suppression accelerated decay rather than deletion.
+ * suppressed tag decays faster and, as a function, never reaches zero. That
+ * is what makes suppression accelerated decay rather than deletion. Where the
+ * double's representation ends is a separate matter, below.
  *
  * Before `taggedAt` the strength is g0: a tag has no history before it
  * existed, and returning something larger would let a clock skew invent
@@ -29,6 +30,11 @@ import type { StoredTag } from "./repositories/tag.js";
 export function strengthAt(tag: StoredTag, instant: Date, halfLifeMs: number): number {
   if (!(halfLifeMs > 0)) throw new RangeError("halfLifeMs must be positive");
   const elapsed = instant.getTime() - tag.taggedAt.getTime();
+  // An invalid Date on either side makes elapsed NaN, and NaN would pass the
+  // comparison below and come out of Math.pow as a strength of NaN, which a
+  // threshold comparison then silently treats as "not above". Refused like
+  // the half-life is, for the same reason.
+  if (Number.isNaN(elapsed)) throw new RangeError("instant and taggedAt must be valid dates");
   if (elapsed <= 0) return tag.g0;
   return tag.g0 * Math.pow(0.5, (elapsed * tag.suppressionFactor) / halfLifeMs);
 }

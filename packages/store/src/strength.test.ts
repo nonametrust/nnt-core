@@ -65,6 +65,16 @@ describe("strengthAt", () => {
 
   it("refuses a non-positive half-life rather than dividing by zero", () => {
     expect(() => strengthAt(base, base.taggedAt, 0)).toThrow(RangeError);
+    expect(() => strengthAt(base, base.taggedAt, -1)).toThrow(RangeError);
+    expect(() => strengthAt(base, base.taggedAt, Number.NaN)).toThrow(RangeError);
+  });
+
+  // A strength of NaN compares false against every threshold, so an invalid
+  // instant would read as "below threshold" with no error anywhere.
+  it("refuses an invalid instant rather than returning NaN", () => {
+    expect(() => strengthAt(base, new Date("not a date"), 7 * DAY)).toThrow(RangeError);
+    expect(() => strengthAt({ ...base, taggedAt: new Date(Number.NaN) }, base.taggedAt, 7 * DAY))
+      .toThrow(RangeError);
   });
 
   it("is a pure function of its arguments", () => {

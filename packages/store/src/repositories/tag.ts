@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Clock } from "../clock.js";
-import type { Db } from "../db.js";
+import type { Db, Schema } from "../db.js";
 import { TagNotFound, mapPgError } from "../errors.js";
 
 /**
@@ -168,11 +168,9 @@ export class TagRepository {
   }
 }
 
-function toStored(row: {
-  tag_id: string; namespace_id: string; observation_id: string; channel: string;
-  g0: number; tagged_at: Date; refresh_count: number; saturation_state: string;
-  suppression_factor: number;
-}): StoredTag {
+// The row type is the Schema's, so a column added to db.ts without a place
+// here is a compile error rather than a silently dropped field.
+function toStored(row: Schema["tag"]): StoredTag {
   return {
     tagId: row.tag_id,
     namespaceId: row.namespace_id,
@@ -181,7 +179,7 @@ function toStored(row: {
     g0: row.g0,
     taggedAt: row.tagged_at,
     refreshCount: row.refresh_count,
-    saturationState: row.saturation_state as StoredTag["saturationState"],
+    saturationState: row.saturation_state,
     suppressionFactor: row.suppression_factor,
   };
 }
