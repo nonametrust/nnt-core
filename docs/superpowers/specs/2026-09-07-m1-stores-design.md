@@ -101,8 +101,11 @@ is honest; one that does not is the failure this project keeps finding.
 ```
 packages/store/
   migrations/          0001_*.sql … applied in filename order
+  scripts/dev-db.sh    a cluster that belongs to the repository
   src/
     index.ts           the public surface
+    strength.ts        strengthAt, the derived tag strength
+    testing/harness.ts a private schema per test file
     clock.ts           the Clock interface and a fixed clock for tests
     db.ts              connection, Kysely instance, typed schema
     migrate.ts         the migration runner
@@ -195,10 +198,21 @@ Envelope encryption, two levels.
 - **Payload.** The full validated observation is serialised to JSON and
   encrypted with AES-256-GCM under that namespace's data key.
 
-**Associated data.** The additional authenticated data for the payload is the
-namespace identifier and the idempotency key, joined the same way the idempotency
-key joins its parts. A ciphertext therefore cannot be moved to another row or
-another namespace and still decrypt. Without this, an attacker with write access
+**Associated data.** The additional authenticated data for the payload binds
+the six values that identify the row: the namespace identifier, the idempotency
+key, the evidence kind, the channel, the source event kind, and the dated
+instant, joined the same way the idempotency key joins its parts. A ciphertext
+therefore cannot be moved to another row or another namespace and still
+decrypt, and neither can a derived column be rewritten underneath a payload
+that still opens.
+
+That last part was widened after the whole-branch review. Binding only the
+namespace and the key left the derived columns outside the envelope, and the
+promotion trigger measures against the `dated_at` **column**. Under this
+section's own threat model, an attacker with table write access could move that
+column while the payload still opened, and the promotion would then carry the
+row's instant rather than the evidence's. The layout is frozen by the first
+stored payload, so it was widened before anything was deployed. Without this, an attacker with write access
 to the table could swap two counterparties' evidence without breaking any
 signature we hold.
 
@@ -251,6 +265,13 @@ no delete-by-identifier for a tag at all. Expiry from the bounded window is a
 separate, named operation belonging to the nightly job, so the two can never be
 confused at a call site. The gate is a test over the exported repository surface
 asserting no general tag deletion is reachable.
+
+**`permanent_record` is append-only too.** The spec did not require this and
+the milestone ruled it in: every one of its columns is fixed at promotion time
+with no designed post-insert writer, the migration itself calls `confidence` a
+historical fact, and a DELETE would silently remove evidence from a later brief
+with no trace. A reversal, if one is ever needed, is a new row rather than a
+rewrite.
 
 **A promotion preserves the original timestamp.** `permanent_record` carries
 `original_dated_at` and a foreign key to the observation it was promoted from. A
@@ -332,7 +353,11 @@ fields in TypeScript, recomputes both hashes and checks the linkage. The
 database holds linkage and hash integrity; the verifier holds fidelity. Neither
 half is claimed to be the other.
 
-`audit_day` seals a day: `day`, `terminal_seq`, `terminal_sha256`, `hmac`. The
+`audit_day` seals a day: `day`, `terminal_seq`, `terminal_sha256`, `hmac`,
+`sealed_at`. It is append-only, and a re-run checks the existing seal against
+the entry it sealed rather than against a recomputed head, so an entry that
+arrives backdated after a seal does not falsify a statement the seal never
+made. The
 HMAC is over the terminal hash under a key derived from the master key, so a
 rewritten history cannot be re-chained without it. M1 lands the table and
 `sealDay()`; the nightly job that calls it is M4.
@@ -350,7 +375,9 @@ that. None gets a calculation.
 timescales as `fast_mean`, `fast_m2`, `slow_mean`, `slow_m2`. Mutable by design:
 a baseline is current state, not evidence. `updated_at` from the injected clock.
 
-**`trigger`**, one row per candidate. `trigger_id`, `namespace_id`,
+**`trigger_event`**, one row per candidate. The design called it `trigger`; it
+shipped as `trigger_event`, because a table named `trigger` sitting beside a
+dozen SQL triggers costs legibility on every read. `trigger_id`, `namespace_id`,
 `observation_id`, `status` (candidate, verified, harm_confirmed), `tier` for a
 harm-confirmed row, `cluster_id` nullable and unused in M1, `surprise`,
 `created_at`. *`trigger` is a non-reserved keyword in Postgres and works
@@ -444,7 +471,13 @@ and would let a test pass through a path production cannot use.
 
 Every enforced invariant raises a distinct SQLSTATE, and `errors.ts` maps each to
 a named error class: `AppendOnlyViolation`, `ChainBroken`, `TimestampAltered`,
-`NamespaceShredded`, `MigrationDrift`. Tests assert on
+`NamespaceShredded`, `NamespaceNotFound`, `ObservationNotFound`, `TagNotFound`,
+`PermanentRecordNotFound`, `IdempotencyKeyMismatch`, `StateNotPromotable`,
+`NamespaceAltered`, `DayNotClosed`, `SealMismatch`, `NothingToSeal`,
+`ConstraintViolation`, `CiphertextMalformed`, `CiphertextRejected`,
+`MigrationDrift`. The list grew as each invariant found its own caller-visible
+condition; the rule that fixed it is that a caller asserts on a class and never
+on message text. Tests assert on
 the class, never on the message text, so a reworded message is not a red suite
 and a swallowed violation is not a green one.
 

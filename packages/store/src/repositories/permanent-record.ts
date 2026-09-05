@@ -77,9 +77,9 @@ export class PermanentRecordRepository {
    *
    * A namespace the observation does not belong to, a second promotion of
    * the same observation and a confidence outside the unit interval are
-   * constraint violations and come back as the driver's error, with the
-   * constraint name on it, as tag's `open` does for the same kinds of
-   * caller defect.
+   * constraint violations and come back as `ConstraintViolation`, carrying
+   * the SQLSTATE and the constraint name, so a caller tells them apart by
+   * class rather than by message.
    *
    * The row comes back from `returning`, so what is reported is what was
    * stored and not what was meant to be.
