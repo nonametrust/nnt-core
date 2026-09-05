@@ -621,7 +621,7 @@ git commit -m "Schema: the observation, with events and states kept strictly apa
 
 **Interfaces:**
 - Consumes: `type Source` from `./source.js`, `type Channel` from `./channel.js`
-- Produces: `deriveIdempotencyKey(source: Source, channel: Channel): string`
+- Produces: `deriveIdempotencyKey(source: Source, channel: Channel): string`, keyed on producer, network, ref and channel
 
 - [ ] **Step 1: Write the failing test**
 
@@ -663,6 +663,27 @@ describe("idempotency key", () => {
     expect(deriveIdempotencyKey({ ...src, producer: "other-indexer" }, "volume"))
       .not.toBe(deriveIdempotencyKey(src, "volume"));
   });
+
+  it("differs per network, because operation ids repeat across them", () => {
+    expect(deriveIdempotencyKey({ ...src, network: "stellar:testnet" }, "volume"))
+      .not.toBe(deriveIdempotencyKey(src, "volume"));
+  });
+
+  it("is stable for a producer that declares no network", () => {
+    const { network: _drop, ...noNetwork } = src;
+    expect(deriveIdempotencyKey(noNetwork, "volume"))
+      .toBe(deriveIdempotencyKey(noNetwork, "volume"));
+    expect(deriveIdempotencyKey(noNetwork, "volume"))
+      .not.toBe(deriveIdempotencyKey(src, "volume"));
+  });
+
+  it("does not let a field boundary shift without changing the key", () => {
+    // With a space separator these two concatenate identically. The test fails
+    // if the separator is anything a field can contain.
+    const a = { ...src, network: "a", ref: "b c" };
+    const b = { ...src, network: "a b", ref: "c" };
+    expect(deriveIdempotencyKey(a, "volume")).not.toBe(deriveIdempotencyKey(b, "volume"));
+  });
 });
 ```
 
@@ -682,15 +703,25 @@ import type { Source } from "./source.js";
  * Deduplication is a correctness property, not a performance one: a duplicated
  * trace makes the tagging pipeline believe the evidence is twice as strong.
  *
- * The key is derived from the producer name, the source reference and the
- * channel, and from nothing else. The producer version is excluded so that a
- * version bump does not silently mint duplicates of everything already stored.
- * The fetch time is excluded so that a re-read of the same range produces no
- * new observations, which is the indexer's own acceptance criterion.
+ * The key is derived from the producer name, the network, the source reference
+ * and the channel, and from nothing else.
+ *
+ * The producer version is excluded so that a version bump does not silently
+ * mint duplicates of everything already stored. The fetch time is excluded so
+ * that a re-read of the same range produces no new observations, which is the
+ * indexer's own acceptance criterion. The network is included because Horizon
+ * operation ids repeat across pubnet and testnet, and one producer reading both
+ * is the expected configuration once the testnet demo runs alongside mainnet
+ * shadow observation.
+ *
+ * The parts are joined with a NUL rather than a space because `ref` is
+ * unconstrained: without a separator that cannot occur inside a field, a
+ * producer and reference could be re-partitioned into a different pair with the
+ * same concatenation.
  */
 export function deriveIdempotencyKey(source: Source, channel: Channel): string {
   return createHash("sha256")
-    .update(`${source.producer} ${source.ref} ${channel}`)
+    .update([source.producer, source.network ?? "", source.ref, channel].join("\u0000"))
     .digest("hex");
 }
 ```
@@ -698,7 +729,7 @@ export function deriveIdempotencyKey(source: Source, channel: Channel): string {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `pnpm --filter @nonametrust/schema test`
-Expected: PASS, six new tests.
+Expected: PASS, nine new tests.
 
 - [ ] **Step 5: Commit**
 

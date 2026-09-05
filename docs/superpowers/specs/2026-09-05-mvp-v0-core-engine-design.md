@@ -170,13 +170,17 @@ the indexer runs in the same trust domain.
 
 **`idempotencyKey` is deterministic from the source, and the producer version
 is not part of it.** The key is derived from the producer's bare name, the
-source reference and the channel. Reprocessing the same range yields zero new
+network, the source reference and the channel, joined by a separator no field
+can contain. Reprocessing the same range yields zero new
 observations, which is the indexer's own acceptance criterion, and it is a
 correctness requirement rather than a performance one: a duplicated trace makes
 the tagging pipeline believe the evidence is twice as strong. The version is a
 separate field because folding it into the producer name would change every key
 the moment the indexer is upgraded, silently minting a duplicate of everything
-already stored. The fetch time is excluded for the same reason.
+already stored. The fetch time is excluded for the same reason. The network is
+included because Horizon operation ids repeat across pubnet and testnet, and one
+producer reading both is the expected configuration once the testnet demo runs
+alongside mainnet shadow observation.
 
 **The engine never infers identity.** Continuity is an integration assertion,
 recorded as provenance. Where no continuity is supplied, a new address opens a
