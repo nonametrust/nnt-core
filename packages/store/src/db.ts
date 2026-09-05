@@ -43,6 +43,17 @@ export interface Schema {
     saturation_state: "open" | "saturated";
     suppression_factor: number;
   };
+  // rescued_by is a plain uuid here; the foreign key to trigger_event arrives
+  // with that table in 0006, and the type does not change when it does.
+  permanent_record: {
+    record_id: string;
+    observation_id: string;
+    namespace_id: string;
+    original_dated_at: Date;
+    promoted_at: Date;
+    rescued_by: string | null;
+    confidence: number;
+  };
 }
 
 export type Db = Kysely<Schema>;

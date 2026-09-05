@@ -28,6 +28,13 @@ export class TagNotFound extends StoreError {}
 // replaced: replaced, the caller would later ask for the key it wrote and be
 // told nothing is there, a claim accepted and then denied.
 export class IdempotencyKeyMismatch extends StoreError {}
+// Also raised in TypeScript, from `promote`, after the source is read and
+// before anything is written. A state has no instant to preserve, so the
+// column would refuse the row on its own as a not-null violation; the class
+// exists so a caller that promoted a state can tell that from a disk error.
+export class StateNotPromotable extends StoreError {}
+// Raised in TypeScript, from `get`, for the reason ObservationNotFound is.
+export class PermanentRecordNotFound extends StoreError {}
 export class MigrationDrift extends StoreError {}
 
 const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreError> = {
