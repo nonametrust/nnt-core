@@ -263,8 +263,8 @@ iki muxed kimliğine giden iki ödeme aynı karşı taraf hakkındadır (bölüm
 kimliği, **`address_integrity` payload'ındaki** ise bir geçişin içinde ilan
 edilen adresin muxed kimliği; ikincisini sen üretmiyorsun. **Şema muxed
 biçimi `id`'de reddediyor** (`@nonametrust/schema` 0.2.0'dan itibaren):
-`kind: "wallet"` bir namespace'in `id`'sine M ile başlayan 69 karakter
-yazarsan gözlem düşer ve `validateObservation`'dan şu gelir:
+`kind: "wallet"` bir namespace'in `id`'sine M ile başlayan 69 karakterlik
+base32 dizi yazarsan gözlem düşer ve `validateObservation`'dan şu gelir:
 `namespace.id: a wallet id is the base address: resolve the muxed address and carry its subaccount in muxedId`.
 Küçük harfe çevrilmiş hâli de düşer; kapısı `namespace.test.ts`'de. Kapı
 bilerek tek yönlü: muxed biçimi reddediyor, taban adresin neye benzediğine
@@ -334,9 +334,9 @@ değerli" burada geçerli.
 
 1. **Cüzdan `id`'sinin checksum'ı geçerli bir Stellar hesabı olması, ve
    `muxedId`'nin gerçekten o adresin kimliği olması** (bölüm 7). Şema M ile
-   başlayan 69 karakteri `id`'de reddediyor, o kadar; taban adresin biçimine
-   bakmıyor, checksum hesaplamıyor, `muxedId`'yi adresle karşılaştıramaz.
-   Yanlış kopyalanmış bir G... geçer.
+   başlayan 69 karakterlik base32 diziyi `id`'de reddediyor, o kadar; taban
+   adresin biçimine bakmıyor, checksum hesaplamıyor, `muxedId`'yi adresle
+   karşılaştıramaz. Yanlış kopyalanmış bir G... geçer.
 2. **`kind` sözlüğü** (bölüm 12). Şema `kind`'ın boş olmadığına bakıyor, başka
    hiçbir şeye.
 3. **`direction`'ın doğru tarafta olması.** Şema `"in"`/`"out"` olduğuna bakar,

@@ -6,6 +6,11 @@ function issuePaths(r: ReturnType<typeof namespaceRefSchema.safeParse>): string[
   return r.success ? [] : r.error.issues.map((i) => i.path.join("."));
 }
 
+/** The messages of every issue, for the one message a document quotes verbatim. */
+function issueMessages(r: ReturnType<typeof namespaceRefSchema.safeParse>): string[] {
+  return r.success ? [] : r.error.issues.map((i) => i.message);
+}
+
 const continuity = {
   assertedBy: "integrator:acme",
   assertedAt: "2026-09-05T10:00:00.000Z",
@@ -137,15 +142,22 @@ function baseShaped(): string {
 }
 
 describe("a wallet id is the base address", () => {
-  it("refuses a muxed-shaped id on a wallet", () => {
+  // docs/observation-contract.md quotes this message verbatim as what the
+  // indexer developer sees, so rewording it here silently makes the document
+  // wrong. The text is pinned for that reason, not for its own sake.
+  it("refuses a muxed-shaped id on a wallet, with the message the contract quotes", () => {
     const r = namespaceRefSchema.safeParse({ kind: "wallet", id: muxedShaped() });
     expect(r.success).toBe(false);
     expect(issuePaths(r)).toContain("id");
+    expect(issueMessages(r)).toContain(
+      "a wallet id is the base address: resolve the muxed address and carry its subaccount in muxedId",
+    );
   });
 
   it("refuses a lowercased muxed-shaped id, since case does not make it a base address", () => {
     const r = namespaceRefSchema.safeParse({ kind: "wallet", id: muxedShaped().toLowerCase() });
     expect(r.success).toBe(false);
+    expect(issuePaths(r)).toContain("id");
   });
 
   it("accepts a base-shaped id on a wallet", () => {
