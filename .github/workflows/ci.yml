@@ -15,9 +15,12 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Build first. The package resolves through dist and has no src fallback,
+      # so any package importing @nonametrust/schema fails typecheck and test on
+      # a fresh checkout unless dist exists. Deferred in Task 1; closed here.
+      - run: pnpm build
       - run: pnpm typecheck
       - run: pnpm test
-      - run: pnpm build
       # "The build emits no test file" was checked by hand until now. The
       # exclusion list in each package's tsconfig is the mechanism; this is
       # the gate on it. Both suffixes vitest collects, not only .test.

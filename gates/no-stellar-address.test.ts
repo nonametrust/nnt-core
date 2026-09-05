@@ -16,9 +16,24 @@ import { describe, it, expect } from "vitest";
 // synthetic identifier has to be obviously synthetic: short, like GOLDADDRESS.
 // A test that needs a real-shaped key generates one at run time and never
 // writes it to a file.
+//
+// There is no boundary on either side, on purpose. The first version used \b,
+// and an underscore is a word character, so `ADDR_G...` slipped past it, as did
+// a key with a letter glued to its end. A lookaround excluding the base32
+// alphabet fixes the underscore but not the letter, because every letter is in
+// the alphabet: `G...a` can never be caught by a boundary that refuses letters.
+// A key that leaks is a leak whatever sits next to it, so the shape is matched
+// wherever it occurs. A key is also caught lowercased, since a lowercased key
+// is still the key. Each case is matched as a whole, all upper or all lower,
+// rather than with the `i` flag: a mixed-case run is not a key anyone
+// lowercased, and admitting it would let a base64 digest in the lockfile trip
+// the gate by chance, while a single-case run of 56 inside base64 is not a
+// realistic accident. Proven against a keypair generated at run time in five
+// forms, bare, underscore-prefixed, letter-suffixed, letter-prefixed and
+// lowercased; see the M0 final fix report.
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const strkey = /\b(?:G[A-Z2-7]{55}|M[A-Z2-7]{68})\b/;
+const strkey = /G[A-Z2-7]{55}|M[A-Z2-7]{68}|g[a-z2-7]{55}|m[a-z2-7]{68}/;
 
 // Paths come from the index, content from the working tree. So a staged file
 // is scanned before it is committed and nothing gitignored is ever listed, but
