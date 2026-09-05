@@ -19,6 +19,11 @@ export class NamespaceNotFound extends StoreError {}
 // caller's condition, not the store's defect, and a generic Error would make
 // the two indistinguishable at the call site.
 export class ObservationNotFound extends StoreError {}
+// Raised in TypeScript, before anything is read or written. A caller-supplied
+// idempotency key that differs from the derived one is refused rather than
+// replaced: replaced, the caller would later ask for the key it wrote and be
+// told nothing is there, a claim accepted and then denied.
+export class IdempotencyKeyMismatch extends StoreError {}
 export class MigrationDrift extends StoreError {}
 
 const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreError> = {

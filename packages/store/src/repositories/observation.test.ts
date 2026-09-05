@@ -1,12 +1,12 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { deriveIdempotencyKey, observationSchema, type WireObservation } from "@nonametrust/schema";
+import { deriveIdempotencyKey, type WireObservation } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv, newDataKey } from "../crypto.js";
 import { fixedClock } from "../clock.js";
-import { NamespaceShredded, ObservationNotFound, StoreError } from "../errors.js";
+import { IdempotencyKeyMismatch, NamespaceShredded, ObservationNotFound, StoreError } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
 
@@ -59,10 +59,12 @@ describe("the round trip", () => {
     const input = anEvent({ source: { ...src, ref: "op:rt:1" } });
     const { observation, created } = await observations.append(input);
     expect(created).toBe(true);
-    const read = await observations.get(observation.observationId!);
-    const parsed = observationSchema.parse(read) as Record<string, unknown>;
+    // `get` has already re-parsed the decrypted blob through the schema; that
+    // parse is the proof, and a second one here would only hide which one
+    // carries it.
+    const read = (await observations.get(observation.observationId!)) as Record<string, unknown>;
     for (const key of Object.keys(input)) {
-      expect(parsed[key]).toEqual((input as Record<string, unknown>)[key]);
+      expect(read[key]).toEqual((input as Record<string, unknown>)[key]);
     }
   });
 
@@ -174,6 +176,31 @@ describe("idempotency", () => {
     );
   });
 
+  // A caller who writes with key K and then asks byIdempotencyKey(K) must not
+  // get null for something the store said it created. Silently storing the
+  // derived key instead would accept a claim and later deny it, so a key that
+  // is present and wrong is refused, and refused before the pre-read so it is
+  // never answered with `created: false` either.
+  it("refuses a caller-supplied key that differs from the derived one, and writes nothing", async () => {
+    const input = anEvent({ source: { ...src, ref: "op:mismatch:1" }, idempotencyKey: "a".repeat(64) });
+    await expect(observations.append(input)).rejects.toBeInstanceOf(IdempotencyKeyMismatch);
+    expect(await observations.byIdempotencyKey(
+      deriveIdempotencyKey(input.source, input.channel, input.namespace),
+    )).toBeNull();
+  });
+
+  it("refuses a mismatched key even when the observation is already stored, rather than calling it a duplicate", async () => {
+    const stored = anEvent({ source: { ...src, ref: "op:mismatch:2" } });
+    expect((await observations.append(stored)).created).toBe(true);
+    const wrong = anEvent({ source: { ...src, ref: "op:mismatch:2" }, idempotencyKey: "b".repeat(64) });
+    await expect(observations.append(wrong)).rejects.toBeInstanceOf(IdempotencyKeyMismatch);
+    const right = anEvent({
+      source: { ...src, ref: "op:mismatch:2" },
+      idempotencyKey: deriveIdempotencyKey(stored.source, stored.channel, stored.namespace),
+    });
+    expect((await observations.append(right)).created).toBe(false);
+  });
+
   // The race itself, made deterministic: this instance's first pre-read sees
   // nothing, as a writer that lost the race would, and its insert then lands
   // on the row the winner stored. The loser must come back with the winner's
@@ -199,13 +226,22 @@ describe("idempotency", () => {
   // caller told "already stored" when nothing was stored has lost evidence
   // with no error anywhere, which is the failure this whole table exists to
   // prevent. The stub hands back a namespace that has no row, so the insert
-  // fails on the foreign key and not on the key.
+  // fails on the foreign key and not on the key; and the reads after the
+  // first hand back a stand-in row, as they would if a concurrent writer had
+  // stored the key meanwhile. A catch that re-read after any failure would
+  // return that stand-in with `created: false`. This one must rethrow 23503.
   it("does not report a failed insert as already stored", async () => {
     const orphan = {
       ensure: async () => ({ namespaceId: randomUUID(), kind: "wallet", nsId: "ORPHAN", shreddedAt: null }),
       dataKey: async () => newDataKey(),
     } as unknown as NamespaceRepository;
     const broken = new ObservationRepository(db, orphan, clock);
+    const standIn = (await observations.append(anEvent({ source: { ...src, ref: "op:orphan:standin" } }))).observation;
+    let blind = true;
+    broken.byIdempotencyKey = async () => {
+      if (blind) { blind = false; return null; }
+      return standIn;
+    };
     const input = anEvent({ source: { ...src, ref: "op:orphan:1" }, namespace: { kind: "wallet", id: "ORPHAN" } });
     await expect(broken.append(input)).rejects.toMatchObject({ code: "23503" });
     expect(await observations.byIdempotencyKey(
@@ -221,6 +257,9 @@ describe("append-only", () => {
       sql`update observation set kind = 'tampered' where observation_id = ${observation.observationId}`
         .execute(db),
     ).rejects.toMatchObject({ code: "NNT01" });
+    const row = await db.selectFrom("observation").select(["kind"])
+      .where("observation_id", "=", observation.observationId!).executeTakeFirstOrThrow();
+    expect(row.kind).toBe("payment");
   });
 
   it("refuses a DELETE", async () => {
@@ -228,6 +267,9 @@ describe("append-only", () => {
     await expect(
       sql`delete from observation where observation_id = ${observation.observationId}`.execute(db),
     ).rejects.toMatchObject({ code: "NNT01" });
+    const row = await db.selectFrom("observation").select(["observation_id"])
+      .where("observation_id", "=", observation.observationId!).executeTakeFirst();
+    expect(row?.observation_id).toBe(observation.observationId);
   });
 
   it("exposes no update or delete on the repository surface at all", () => {
@@ -248,5 +290,20 @@ describe("shredding", () => {
     expect(row).toBeDefined();
     await expect(observations.get(observation.observationId!))
       .rejects.toBeInstanceOf(NamespaceShredded);
+  });
+
+  // Correct by reading, since `ensure` leaves a shredded row as it is and
+  // `dataKey` throws before any insert, but every unenforced property in this
+  // repository has turned out false at some point, so it is pinned.
+  it("refuses a new observation for a shredded namespace, by class, and stores nothing", async () => {
+    const ns = await namespaces.ensure({ kind: "wallet", id: "SHREDFIRST" });
+    await namespaces.shred(ns.namespaceId);
+    const input = anEvent({
+      source: { ...src, ref: "op:shred:2" }, namespace: { kind: "wallet", id: "SHREDFIRST" },
+    });
+    await expect(observations.append(input)).rejects.toBeInstanceOf(NamespaceShredded);
+    const rows = await db.selectFrom("observation").select(["observation_id"])
+      .where("namespace_id", "=", ns.namespaceId).execute();
+    expect(rows).toEqual([]);
   });
 });

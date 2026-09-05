@@ -6,20 +6,12 @@ import {
 import type { Clock } from "../clock.js";
 import type { Db } from "../db.js";
 import { open, payloadAad, seal } from "../crypto.js";
-import { ObservationNotFound, mapPgError } from "../errors.js";
+import { IdempotencyKeyMismatch, ObservationNotFound, mapPgError } from "../errors.js";
 import type { NamespaceRepository } from "./namespace.js";
 
 export interface AppendResult {
   observation: Observation;
   created: boolean;
-}
-
-interface EncryptedRow {
-  namespace_id: string;
-  idempotency_key: string;
-  payload_nonce: Buffer;
-  payload_tag: Buffer;
-  payload_ciphertext: Buffer;
 }
 
 // The one insert failure that means "already stored": Postgres's
@@ -49,10 +41,22 @@ export class ObservationRepository {
    * `created: false` rather than raising. The distinction between "already
    * stored" and "conflicting" is drawn on the idempotency key alone, which is
    * what the key exists for.
+   *
+   * A key the caller supplied is compared with the derived one, not replaced
+   * by it. Replaced, a caller that wrote under key K and then asked for K
+   * would be told nothing is there about an observation this store said it
+   * created. The comparison comes before the pre-read so a mismatch is never
+   * answered with `created: false` either: a wrong key is a wrong key whether
+   * or not the observation happens to be stored already.
    */
   async append(wire: WireObservation): Promise<AppendResult> {
     const parsed = observationSchema.parse(wire) as Observation;
     const key = deriveIdempotencyKey(parsed.source, parsed.channel, parsed.namespace);
+    if (parsed.idempotencyKey !== undefined && parsed.idempotencyKey !== key) {
+      throw new IdempotencyKeyMismatch(
+        `idempotency key ${parsed.idempotencyKey} was supplied, but this observation derives to ${key}`,
+      );
+    }
 
     const existing = await this.byIdempotencyKey(key);
     if (existing) return { observation: existing, created: false };
@@ -110,31 +114,35 @@ export class ObservationRepository {
   }
 
   async get(observationId: string): Promise<Observation> {
-    const row = await this.db
-      .selectFrom("observation")
-      .select([
-        "namespace_id", "idempotency_key",
-        "payload_nonce", "payload_tag", "payload_ciphertext",
-      ])
-      .where("observation_id", "=", observationId)
-      .executeTakeFirst();
-    if (!row) throw new ObservationNotFound(`no observation ${observationId}`);
-    return this.decrypt(row);
+    const found = await this.read("observation_id", observationId);
+    if (!found) throw new ObservationNotFound(`no observation ${observationId}`);
+    return found;
   }
 
   async byIdempotencyKey(key: string): Promise<Observation | null> {
+    return this.read("idempotency_key", key);
+  }
+
+  /**
+   * The one read path. Both public reads go through it because both must
+   * rebuild the associated data from the same two columns the write bound it
+   * to; two hand-copied selects are how those inputs would eventually diverge,
+   * and the failure would be a payload that opens on one path and not the
+   * other.
+   */
+  private async read(
+    column: "observation_id" | "idempotency_key",
+    value: string,
+  ): Promise<Observation | null> {
     const row = await this.db
       .selectFrom("observation")
       .select([
         "namespace_id", "idempotency_key",
         "payload_nonce", "payload_tag", "payload_ciphertext",
       ])
-      .where("idempotency_key", "=", key)
+      .where(column, "=", value)
       .executeTakeFirst();
-    return row ? this.decrypt(row) : null;
-  }
-
-  private async decrypt(row: EncryptedRow): Promise<Observation> {
+    if (!row) return null;
     // Raises NamespaceShredded when the key is gone, which is the whole point
     // of shredding: the row survives and the content does not.
     const dataKey = await this.namespaces.dataKey(row.namespace_id);
