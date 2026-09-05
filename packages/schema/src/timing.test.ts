@@ -21,7 +21,7 @@ describe("datedAt", () => {
   it("returns null for a state, so a state can never be dated", () => {
     expect(datedAt({
       schemaVersion: "0.1.0", namespace: { kind: "wallet", id: "G" },
-      channel: "protocol", evidenceKind: "state", kind: "account_young",
+      channel: "protocol", evidenceKind: "state", kind: "trustline_open",
       validFrom: "2026-09-01T00:00:00.000Z", validUntil: null,
       source: src, payload: {},
     })).toBeNull();
@@ -39,7 +39,7 @@ describe("datedAt", () => {
   it("returns null for a closed state as well as an open one", () => {
     expect(datedAt({
       schemaVersion: "0.1.0", namespace: { kind: "wallet", id: "G" },
-      channel: "protocol", evidenceKind: "state", kind: "account_young",
+      channel: "protocol", evidenceKind: "state", kind: "trustline_open",
       validFrom: "2026-09-01T00:00:00.000Z", validUntil: "2026-09-03T00:00:00.000Z",
       source: src, payload: {},
     })).toBeNull();
@@ -56,9 +56,10 @@ describe("datedAt", () => {
     // Exempt by path relative to src, not by basename: a later
     // src/windows/timing.ts must not inherit the exemption for free.
     const exempt = new Set(["observation.ts", "timing.ts"]);
-    // Every extension the tsconfig admits, so none of them is a way past.
+    // Every extension the tsconfig admits, so none of them is a way past, and
+    // both suffixes vitest collects, matching the build exclusion.
     const source = /\.(ts|mts|cts|tsx)$/;
-    const test = /\.test\.(ts|mts|cts|tsx)$/;
+    const test = /\.(test|spec)\.(ts|mts|cts|tsx)$/;
     const dateFields = /\b(observedAt|validFrom|validUntil)\b/;
     const offenders: string[] = [];
     for (const entry of readdirSync(srcDir, { recursive: true, withFileTypes: true })) {

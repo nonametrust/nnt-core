@@ -36,7 +36,7 @@ pnpm build       # emits packages/*/dist; no test file may land there
 ```
 
 CI runs those four in that order and then fails if any file under
-`packages/*/dist` matches `*.test.*`.
+`packages/*/dist` matches `*.test.*` or `*.spec.*`.
 
 ## Gates
 
@@ -45,14 +45,17 @@ each property the code claims has a test that would fail if it stopped being
 true. The ones worth knowing before you add a file:
 
 - **No Stellar account id in any tracked file**, checksum-valid or not
-  (`gates/no-stellar-address.test.ts`). Scans the git index, so a file fails
-  the moment it is `git add`ed, and refuses to report green unless it can see
-  its own file in the index. Synthetic ids in fixtures are short and obviously
+  (`gates/no-stellar-address.test.ts`). Takes its paths from the git index and
+  their content from the working tree, so a staged file is scanned before it
+  is committed, while an address staged and then scrubbed locally is caught by
+  CI on the committed tree. Refuses to report green unless it can see its own
+  file in the index. Synthetic ids in fixtures are short and obviously
   fake, like `GOLDADDRESS`; a test that needs a real-shaped key generates one
   at run time and never writes it to disk.
-- **No test file in `dist`** (CI, after `pnpm build`).
+- **No test file in `dist`**, `*.test.*` or `*.spec.*` (CI, after `pnpm build`).
 - **Only `datedAt` reads a date off an observation**
   (`packages/schema/src/timing.test.ts`), so a state can never be credited as
   a dated event.
-- **The schema version is checked exactly** on every observation, and the
-  golden fixtures must all validate (`packages/schema/src/fixtures.test.ts`).
+- **The schema version is checked exactly** on every observation
+  (`packages/schema/src/payloads.test.ts`), and the golden fixtures must all
+  validate (`packages/schema/src/fixtures.test.ts`).

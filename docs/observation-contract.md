@@ -3,10 +3,11 @@
 Atahan, bu doküman indexer'ın motora ne vereceğini anlatıyor. Şema
 `packages/schema` içinde, kod ve fixture'lar burada yazılanla birebir aynı;
 ikisi ayrışırsa kod haklıdır ve bu dokümanı düzeltiriz. Bir saat içinde eşleyiciyi
-yazmaya başlayabilmen için yazıldı, o yüzden sıra: önce nasıl kullanılır, sonra
-alanlar, sonra şemanın **kontrol etmediği** kurallar. O son bölüm en önemlisi;
-düzyazıda duran ve kimsenin zorlamadığı her iddia bu projede yanlış çıktı, o
-yüzden zorlanmayan kural burada "zorlanmıyor" diye açıkça yazılı.
+yazmaya başlayabilmen için yazıldı, o yüzden sıra: önce nasıl kullanılır ve
+16 Eylül'de ne bekleniyor, sonra alanlar, sonra şemanın **kontrol etmediği**
+kurallar. O son bölüm en önemlisi; düzyazıda duran ve kimsenin zorlamadığı her
+iddia bu projede yanlış çıktı, o yüzden zorlanmayan kural burada "zorlanmıyor"
+diye açıkça yazılı.
 
 ## 1. Nereden başlıyorsun
 
@@ -21,11 +22,11 @@ koşman gerekiyor. Sonra:
 
 ```ts
 import { validateObservation, deriveIdempotencyKey } from "@nonametrust/schema";
-import type { Observation, VolumePayload, PayloadByChannel } from "@nonametrust/schema";
+import type { Observation, VolumePayload, ProtocolPayload, ContentPayload } from "@nonametrust/schema";
 
 const r = validateObservation(obj);      // obj: parse edilmiş JSON, string değil
 if (!r.ok) console.error(r.errors);       // ["alan: mesaj", ...]
-else store(r.value);                      // r.value.idempotencyKey atanmış geliyor
+else out.write(JSON.stringify(r.value) + "\n");   // r.value.idempotencyKey atanmış geliyor
 ```
 
 Hatalar `alan: mesaj` biçiminde ve kontrol sırası şu: obje mi, motorun alanları
@@ -40,6 +41,35 @@ ihtimalle senin taraf yanlış, ama fixture da yanlış olabilir, söyle.
 
 Testler: repo kökünde `pnpm test`. Kendi paketini eklediğinde `pnpm -r test` onu
 da koşar.
+
+### Gözlemler nereye gidiyor
+
+16 Eylül'de motor yok, dolayısıyla ingest de yok; brief'in dediği gibi
+gözlemleri **diske yaz**. Biçim: newline-delimited JSON, her satırda
+`validateObservation`'dan `ok: true` çıkmış **tek gözlem** (yani
+`idempotencyKey` satırda var), her geri doldurma koşusu için **bir dosya**,
+dosya adı kapsadığı aralığı söylüyor:
+
+```
+out/stellar-pubnet_2026-08-01_2026-08-31.ndjson
+```
+
+Yeniden koşma kabul testin bizim depoyu beklemiyor: aynı aralığı iki kez koş,
+iki dosyanın her satırından `idempotencyKey`'i topla, iki küme **birebir aynı**
+olmalı. Fazla bir anahtar varsa ya `ref` kararlı değil ya aynı olayı iki kez
+üretiyorsun; eksik varsa bir okuma sessizce düştü. Bu test senin tarafında
+yaşar ve 7. bölümdeki "tekilleştirme" sayısı onun çıktısıdır.
+
+### 16 Eylül'de ne var, ne yok
+
+Teslimde **üç kanal** var: `volume`, `content` (sadece memo) ve `protocol`.
+Kabul ölçütlerin bunları ölçüyor: ödeme ailesi üzerinde kapsama, tekilleştirme,
+sebebiyle düşen kayıt, muxed payı.
+
+`cluster_proximity` **16 Eylül'de yok.** Bir küme listesi ve bir dust eşiği
+gerekiyor, ikisi de ölçüm çalışmasından gelecek ve henüz vermediğimiz ayrı bir
+karar. Onu kurma, onun için endişelenme; kanal şemada duruyor ki sonra
+eklemek şema göçü olmasın.
 
 ## 2. Zarf: her gözlemde olan alanlar
 
@@ -75,36 +105,38 @@ geçmez. İşareti `direction` taşır.
 İki üretici var ve bu ayrımı karıştırmak kolay:
 
 - **`stellar-indexer`** (sen): zincirden görülen şeyler. `volume`, `protocol`,
-  `cluster_proximity`, `content`.
+  `content`'in **memo** çeşidi, ve sonra `cluster_proximity`.
 - **`x402-gateway`**: 402 cevabının içinde olan şeyler, zincirde hiç görünmez.
-  `latency`, `price`, `address_integrity`. Bunları sen üretmiyorsun; fixture'larda
-  duruyorlar ki `producer`'ın sabit olmadığını ve `network`'ün isteğe bağlı
-  olduğunu göresin.
+  `latency`, `price`, `address_integrity`, ve `content`'in **error** ile
+  **response** çeşitleri. Bunları sen üretmiyorsun; fixture'larda duruyorlar ki
+  `producer`'ın sabit olmadığını ve `network`'ün isteğe bağlı olduğunu göresin.
 
-| Kanal | Ne | Üretici | Payload | Fixture | Fixture'daki `kind` |
-|---|---|---|---|---|---|
-| `volume` | Değer hareketi | indexer | `amount` string, `assetCode`, `direction: "in" \| "out"` | `volume.json` | `payment` |
-| `protocol` | Protokol seviyesinde olgu: trustline, kabul edilen varlık, hesap bayrağı | indexer | `event` zorunlu; `assetCode?`, `assetIssuer?`, `issuerKnown?: boolean` | `protocol.json` | `trustline_open` |
-| `cluster_proximity` | Bilinen bir operasyon kümesine graf yakınlığı | indexer | `clusterId`, `hops` pozitif tam sayı (doğrudan temas = 1), `amount?` string | `cluster_proximity.json` | `dust_received` |
-| `content` | Karşı tarafın ürettiği serbest metin | indexer | `text`, `field: "memo" \| "error" \| "response"` | `content.json` | `memo` |
-| `latency` | Cevap süresi | gateway | `latencyMs: number ≥ 0` | `latency.json` | `response_received` |
-| `price` | İstenen fiyat | gateway | `quoted` string, `unit` (`"USDC"`) | `price.json` | `price_quoted` |
-| `address_integrity` | İlan edilen ödeme adresinin değişmesi | gateway | `previous` zorunlu, `current` zorunlu, `muxedId?` | `address_integrity.json` ve `day-twelve/` | `payment_address_changed` |
+| Kanal | Ne | Üretici | 16 Eylül | Payload | Fixture | Fixture'daki `kind` |
+|---|---|---|---|---|---|---|
+| `volume` | Değer hareketi | indexer | evet | `amount` string, `assetCode`, `direction: "in" \| "out"` | `volume.json` | `payment` |
+| `protocol` | Protokol seviyesinde olgu: trustline, kabul edilen varlık, hesap bayrağı | indexer | evet | `event` zorunlu; `assetCode?`, `assetIssuer?`, `issuerKnown?: boolean` | `protocol.json` | `trustline_open` |
+| `content` | Karşı tarafın ürettiği serbest metin | memo: indexer; error, response: gateway | evet (memo) | `text`, `field: "memo" \| "error" \| "response"` | `content.json` | `memo` |
+| `cluster_proximity` | Bilinen bir operasyon kümesine graf yakınlığı | indexer | **hayır** | `clusterId`, `hops` pozitif tam sayı (doğrudan temas = 1), `amount?` string | `cluster_proximity.json` | `dust_received` |
+| `latency` | Cevap süresi | gateway | – | `latencyMs: number ≥ 0` | `latency.json` | `response_received` |
+| `price` | İstenen fiyat | gateway | – | `quoted` string, `unit` (`"USDC"`) | `price.json` | `price_quoted` |
+| `address_integrity` | İlan edilen ödeme adresinin değişmesi | gateway | – | `previous` zorunlu, `current` zorunlu, `muxedId?` | `address_integrity.json` ve `day-twelve/` | `payment_address_changed` |
 
 Bir zincir olayı birden fazla gözlem üretebilir, her gözlem tek kanal taşır.
 `volume.json` ile `content.json` bilerek aynı operasyondur: aynı `source`, iki
 kanal, iki farklı anahtar. Ödeme ve memosu böyle akar.
 
-Payload tipleri export edilmiş: `VolumePayload` yazılı bir interface (yön kuralı
-doc comment'inde), diğer altısı `PayloadByChannel["protocol"]` gibi map üzerinden
-geliyor. Eşleyicinin dönüş tipini bunlardan seç, uydurma.
+Payload tipleri adıyla export edilmiş: `VolumePayload` yazılı bir interface (yön
+kuralı doc comment'inde); `ProtocolPayload`, `ContentPayload`,
+`ClusterProximityPayload`, `AddressIntegrityPayload`, `LatencyPayload`,
+`PricePayload` de var, hepsi `PayloadByChannel["protocol"]` gibi map üzerinden de
+erişilir. Eşleyicinin dönüş tipini bunlardan seç, uydurma.
 
-## 4. `event` mi `state` mi
+## 4. `event` mi `state` mi, ve bir state nasıl biter
 
 Event bir anda oldu: ödeme, memo, adres değişimi. `observedAt` taşır, aralık
-taşımaz. State bir süre boyunca geçerli: açık trustline, genç hesap. `validFrom`
-ve `validUntil` taşır, an taşımaz. Şema iki yönde de sıkı; state'e `observedAt`
-yazamazsın.
+taşımaz. State bir süre boyunca geçerli: açık trustline. `validFrom` ve
+`validUntil` taşır, an taşımaz. Şema iki yönde de sıkı; state'e `observedAt`,
+event'e `validFrom` yazamazsın.
 
 Neden bu kadar katı: ölçüm çalışmasında S3 sinyali tarihsiz bir durumdu.
 Analiz onu her pencereye, yedi günlük olana bile, "isabet" diye yazdı; kontrol
@@ -113,6 +145,15 @@ bir state'i hiçbir zaman zaman hesabına sokmaz (`datedAt` state için null dö
 ve bunun kapısı var). Sen de bir olguyu tarihlemek için `observedAt`'a
 sıkıştırma; süren bir şeyse state'tir. Örnek `protocol.json`: trustline 20
 Ağustos'ta açıldı, `validUntil: null`, hâlâ sürüyor.
+
+**Bir state nasıl biter.** State'in `ref`'i onu kuran operasyondur ve aynı `ref`
+bir daha gönderilemez (bölüm 9), yani aralığı kapatmak için state'i yeniden
+yayınlamak yapı gereği imkânsız. Kural, 5. bölümdeki adres kuralıyla aynı
+biçimde: **süren durum bir state, bitişi ayrı bir gözlem.** Bitiş aynı kanalda
+bir **event**tir, kapatan operasyonun kendi `ref`'ini ve anını taşır; trustline
+için `kind: "trustline_closed"`. State'i **hiçbir zaman yeniden yazmazsın**,
+`validUntil`'i sen doldurmazsın. Motorun bu event'i görüp aralığı kendiliğinden
+kapatması M1'in işi, senin değil.
 
 ## 5. `address_integrity`: bir gözlem, bir geçiş
 
@@ -130,7 +171,9 @@ Bu kanal gateway'in; ilan edilen adres 402 cevabında yaşıyor, zincir onu
 görmüyor. Ama kuralı bilmen lazım çünkü aynı "geçiş = gözlem" mantığı sende de
 geçerli: bir durum değiştiyse değişimi yaz, bayrak koyma.
 
-## 6. `volume`'da yön, ve Horizon kaydından eşleme
+## 6. Horizon kaydından eşleme: `volume` ve `protocol`
+
+### `volume`: yön namespace'e göre
 
 `direction` **namespace'e göre**dir, ödeyene göre değil. `"in"`: değer karşı
 tarafa ulaştı. `"out"`: karşı taraftan çıktı. Bir zincir ödemesi iki gözlem
@@ -152,11 +195,37 @@ Horizon `payment` kaydından kural:
 `path_payment_strict_send` ve `path_payment_strict_receive` için alıcı tarafı
 `amount` + `asset_code`, gönderen tarafı `source_amount` + `source_asset_code`.
 `create_account`: `account` tarafı `"in"`, `funder` tarafı `"out"`,
-`starting_balance`, XLM. Bunlar brief'teki "ödeme ailesi üç tür" uyarısının
-karşılığı; sadece `payment`'a bakarsan bir kısmını hiç görmezsin.
+`starting_balance`, XLM; `kind: "create_account"`. Bunlar brief'teki "ödeme
+ailesi üç tür" uyarısının karşılığı; sadece `payment`'a bakarsan bir kısmını hiç
+görmezsin.
 
-Yalnızca takip ettiğin namespace'ler için gözlem üret; karşı taraf takipte
-değilse o tarafın gözlemi yoktur.
+`create_account` **`volume`'un**dur, `protocol`'ün değil: kayıt bir değer
+hareketidir (başlangıç bakiyesi funder'dan yeni hesaba geçer) ve bir kaynak
+kayıt iki kanalda iki ad almaz. Hesabın "yeni" olması bir olgu olarak sonra
+lazım olursa motor onu bu gözlemin tarihinden türetir; sen ayrıca yazmazsın.
+
+Bizim kararımız, Horizon kuralı değil: **yalnızca takip ettiğin namespace'ler için
+gözlem üret**; karşı taraf takipte değilse o tarafın gözlemi yoktur.
+
+### `protocol`: hangi kayıt, hangi aralık, `event`'te ne var
+
+`payload.event`, Horizon'un **effect tipi adını** taşır, olduğu gibi:
+`trustline_created`, `trustline_removed`, `claimable_balance_claimant_created`,
+`account_flags_updated`. `kind` ise bizim olay türü adımız (`trustline_open`).
+İkisi ayrı çünkü biri Horizon'un sözlüğü, biri bizim; Horizon adı değişirse
+`kind` değişmez.
+
+| Horizon kaydı | Gözlem |
+|---|---|
+| `change_trust` op, `limit` sıfırdan büyük ve o hesap için bu varlıkta daha önce trustline yok (effect `trustline_created`) | **state**, `kind: "trustline_open"`, `validFrom: created_at`, `validUntil` yazılmaz, `ref: "op:<id>"`, namespace `trustor`. Payload: `event: "trustline_created"`, `assetCode`, `assetIssuer`, `issuerKnown`. `protocol.json` bu. |
+| `change_trust` op, `limit: "0.0000000"` (effect `trustline_removed`) | **event**, `kind: "trustline_closed"`, `observedAt: created_at`, `ref` kapatan op, namespace `trustor`. Payload: `event: "trustline_removed"`, aynı varlık alanları. State'e dokunma (bölüm 4). |
+| `change_trust` op, `limit` değişti ama sıfır değil (effect `trustline_updated`) | v0'da gözlem **yok**. Limit değişimi bir kabul ya da ret değil. |
+| `create_claimable_balance` op'un her claimant'ı (effect `claimable_balance_claimant_created`, effect'teki `account`) | **event**, `kind: "claimable_balance_offered"`, `observedAt: created_at`, `ref: "op:<id>"`, namespace claimant. Payload: `event: "claimable_balance_claimant_created"`, `assetCode`, `assetIssuer`, `issuerKnown`. Bilinmeyen bir issuer'ın varlığını kapına bırakması airdrop tuzağının ilk adımı; `issuerKnown: false` o yüzden burada. Aynı op birden çok claimant'a giderse her biri ayrı namespace, ayrı anahtar. |
+| `set_options` op, `set_flags_s` ya da `clear_flags_s` dolu (effect `account_flags_updated`) | **event**, `kind: "account_flags_changed"`, `observedAt: created_at`, `ref: "op:<id>"`, namespace `source_account`. Payload: `event: "account_flags_updated"`, varlık alanları yok. Hangi bayrağın değiştiğini taşıyacak alan payload'da **yok**; bölüm 14. |
+
+`issuerKnown`: issuer senin bilinen-issuer listende var mı. Liste v0'da senin
+elinde, kısa olacak (USDC issuer ve birkaç tane); listeyi repoya yaz, kartın
+gövdesine not düş.
 
 ## 7. Namespace kuralları
 
@@ -186,7 +255,7 @@ v0'da yazmana gerek yok.
 |---|---|
 | `producer` | Çıplak isim: `stellar-indexer`. Küçük harf, rakam, tek tire. Versiyon **buraya girmez**; girerse reddedilir. |
 | `producerVersion` | `"0.1.0"`. Ayrı alan, çünkü anahtara girmiyor: versiyon yükselttiğinde depodaki her şeyin kopyası doğmasın. |
-| `network` | `"stellar:pubnet"` ya da `"stellar:testnet"`. Sen her zaman yaz; Horizon operasyon id'leri iki ağda çakışır. Gateway'in ağı yok, o yazmıyor; isteğe bağlılığı bundan. |
+| `network` | `"stellar:pubnet"` ya da `"stellar:testnet"`; şema sadece boş olmadığına bakar, bu iki yazım bizim sözümüz (bölüm 11). Sen her zaman yaz; Horizon operasyon id'leri iki ağda çakışır. Gateway'in ağı yok, o yazmıyor; isteğe bağlılığı bundan. |
 | `ref` | Kaynak olayın kararlı referansı: `"op:214720397313"`. Aynı olayı yeniden okuduğunda **birebir aynı** çıkmalı. Operasyon id bunu sağlar; paging token da olur ama birini seç ve değiştirme. NUL içeremez. |
 | `fetchedAt` | Sen okuduğun an, UTC `Z`. Anahtara girmez; iki kez okuman iki gözlem doğurmaz. |
 
@@ -198,18 +267,17 @@ etmediği için iki alan sınırı kaydırılıp aynı anahtara varılamaz. Sır
 
 Pratikte anlamı:
 
-- Aynı aralığı iki kez okursan aynı anahtarlar çıkar, sıfır yeni gözlem. Bu senin
-  16 Eylül kabul ölçütün ve motor tarafında doğruluk meselesi: kopya iz,
-  etiketleme hattına kanıtı iki kat güçlü gösterir.
+- Aynı aralığı iki kez okursan aynı anahtarlar çıkar, sıfır yeni gözlem. Nasıl
+  ölçeceğin 1. bölümde. Motor tarafında doğruluk meselesi: kopya iz, etiketleme
+  hattına kanıtı iki kat güçlü gösterir.
 - `fetchedAt` ve `producerVersion` anahtarda yok; yeniden okuma ve sürüm yükseltme
   kopya doğurmaz.
 - Namespace anahtarda **var**; bir ödemenin iki tarafı aynı ref'i paylaşır ve
   ikisi de yaşar.
 - `kind`, `evidenceKind` ve payload anahtarda **yok**. Yani bir `(ref, channel,
   namespace)` üçlüsünden en fazla bir gözlem üret; ikincisi kopya sayılır. Aynı
-  op'tan aynı kanalda aynı karşı taraf için iki şey söyleyeceksen ref'i ayır
-  (`op:<id>#2` gibi) ya da tek gözleme sığdır; hangisi olacağına birlikte karar
-  verelim, bölüm 14.
+  op'tan aynı kanalda aynı karşı taraf için iki şey söylemen gerekirse bu bir
+  sözleşme sorusudur, ref'i oynayarak çözme; bölüm 14.
 
 Anahtarı önceden hesaplamak istersen `deriveIdempotencyKey(source, channel,
 namespace)` export edilmiş; kendi tekilleştirmeni motorla aynı anahtar
@@ -226,7 +294,8 @@ spread'leyip tele geri yazdığında olur bu, çözümü de aynı: anahtarı dü
 `idempotencyKey`'i yazabilirsin ama türetilenle aynı olması şart; farklıysa
 reddedilir ve mesaj türetilen anahtarı gösterir. Sessizce düzeltmiyoruz, çünkü o
 zaman sen ve motor "kopya nedir" konusunda farklı düşünür ve kimse öğrenmez.
-En kolayı: üçünü de yazma.
+En kolayı: üçünü de yazma. (Diske yazarken satırda `idempotencyKey` olması
+normal; o `validateObservation`'ın çıktısı, senin girdin değil.)
 
 ## 11. Şemanın kontrol **etmediği** kurallar
 
@@ -241,14 +310,20 @@ değerli" burada geçerli.
    Horizon'un `to`/`from`'una göre doğru olup olmadığını bilemez.
 4. **`assetCode` yazımı.** Native için `"XLM"` bizim sözümüz, şema `min(1)` string
    görüyor.
-5. **`ref` kararlılığı.** Aynı olaya aynı ref; bunu ancak "aynı aralığı iki kez
-   koş, sıfır yeni gözlem" testi yakalar.
+5. **`ref` kararlılığı.** Aynı olaya aynı ref; bunu ancak 1. bölümdeki iki koşu
+   testi yakalar.
 6. **Bir `(ref, channel, namespace)` → en fazla bir gözlem** (bölüm 9).
 7. **`salienceHints`'in payload ile aynı değeri taşıması.** Şema iki alanı ayrı
    ayrı doğrular, birbirine bakmaz.
-8. **`network`'ün indexer'da her zaman dolu olması** (bölüm 8). Şemada isteğe
-   bağlı, çünkü gateway'in ağı yok; sen boş bırakırsan pubnet ve testnet
-   operasyonları aynı anahtara düşer ve biri sessizce kaybolur.
+8. **`network`'ün indexer'da her zaman dolu olması ve iki yazımdan biri olması**
+   (`"stellar:pubnet"`, `"stellar:testnet"`; bölüm 8). Şema sadece boş ve NUL'suz
+   olmasına bakar, çünkü gateway'in ağı yok. Boş bırakırsan pubnet ve testnet
+   operasyonları aynı anahtara düşer ve biri sessizce kaybolur; farklı yazarsan
+   aynı ağ iki ağ sayılır.
+9. **`payload.event`'in Horizon effect adı olması** (bölüm 6). Şema boş olmayan
+   string görüyor.
+10. **Bir state'in hiç yeniden yazılmaması, bitişin ayrı event olması** (bölüm 4).
+    Şema iki gözlemi ayrı ayrı doğrular; ilişkiyi motor M1'de kurar.
 
 Şemanın kontrol **ettiği** şeyleri saymıyorum; onlar zaten hata mesajı olarak
 sana gelir.
@@ -263,18 +338,20 @@ türü tek bir `kind` yazımı alır, bir kez seçilir, her yerde o kullanılır
 Fixture'lardaki yazımlar referans. Geri dönüşün `kind`'ı ileri gidişle aynıdır
 (`payment_address_changed`), çünkü aynı olay türü: bir geçiş.
 
-Beklediğimiz `kind`'lar, kanal başına. **Şema bunları kontrol etmiyor**; sözlük,
-indexer gerçekte ne ürettiğini gördükten sonra dondurulacak.
+Beklediğimiz `kind`'lar, kanal başına. İki sütun ayrı tutuldu: soldakiler bir
+fixture'da duruyor ve testten geçiyor, sağdakiler bu dokümandan başka hiçbir
+yerde yok, önerdik. **Şema ikisini de kontrol etmiyor**; sözlük, indexer
+gerçekte ne ürettiğini gördükten sonra dondurulacak.
 
-| Kanal | Beklenen `kind`'lar |
-|---|---|
-| `volume` | `payment`, `path_payment`, `create_account`, `claimable_balance_claimed` |
-| `protocol` | `trustline_open`, `trustline_closed`, `account_flags_changed`, `account_created` |
-| `cluster_proximity` | `dust_received` |
-| `content` | `memo` |
-| `latency` (gateway) | `response_received` |
-| `price` (gateway) | `price_quoted` |
-| `address_integrity` (gateway) | `payment_address_changed` |
+| Kanal | Fixture'da var | Önerilen, henüz hiçbir yerde yok |
+|---|---|---|
+| `volume` | `payment` | `path_payment`, `create_account` |
+| `protocol` | `trustline_open` (state) | `trustline_closed` (event), `claimable_balance_offered` (event), `account_flags_changed` (event) |
+| `content` | `memo` | – |
+| `cluster_proximity` | `dust_received` | – |
+| `latency` (gateway) | `response_received` | – |
+| `price` (gateway) | `price_quoted` | – |
+| `address_integrity` (gateway) | `payment_address_changed` | – |
 
 Bir yeni `kind` gerekirse ekle, fixture'a yaz, kartın gövdesine not düş. Listeyi
 dondurduğumuzda enum olacak ve o gün yazımı değiştirmek göç demek; o yüzden
@@ -284,12 +361,14 @@ dondurduğumuzda enum olacak ve o gün yazımı değiştirmek göç demek; o yü
 
 Kökte bir kapı var: izlenen hiçbir dosyada Stellar hesap adresi şeklinde bir
 şey olamaz, G ile başlayan 56 ya da M ile başlayan 69 karakter, checksum
-geçerli olsun olmasın. `git add` ettiğin anda taranır ve senin paketin de
-kapsamda. Test fixture'larında kısa, belli ki sahte kimlikler kullan
-(`GOLDADDRESS` gibi); gerçek biçimli bir anahtara ihtiyacın olan test onu
-çalışma anında üretir ve dosyaya yazmaz. Bu kural pazarlık dışı; repo v0'da
-public oluyor ve bu projenin arkasındaki veri dolandırılmış hesapları
-tanımlıyor.
+geçerli olsun olmasın. Kapı yolları git index'inden, içeriği çalışma ağacından
+okur: `git add` ettiğin dosya commit'ten önce taranır, ama stage'leyip sonra
+yerelde temizlediğin bir adres yerelde geçer, onu commit edilmiş ağaç üzerinde
+koşan CI yakalar. Senin paketin de kapsamda. Test fixture'larında kısa, belli
+ki sahte kimlikler kullan (`GOLDADDRESS` gibi); gerçek biçimli bir anahtara
+ihtiyacın olan test onu çalışma anında üretir ve dosyaya yazmaz. Bu kural
+pazarlık dışı; repo v0'da public oluyor ve bu projenin arkasındaki veri
+dolandırılmış hesapları tanımlıyor.
 
 ## 14. Açık noktalar, birlikte kapatacağız
 
@@ -297,10 +376,12 @@ tanımlıyor.
   operasyonun. Fixture memo'yu ödeme op'unun ref'iyle yazıyor ki `volume` ile
   `content` aynı `source`'u paylaşsın. Bir işlemde aynı karşı tarafa birden
   fazla op varsa memo kaç gözlem olur, ilk gün konuşalım.
-- **`protocol.event` ile `kind` çakışıyor mu?** Fixture'da `kind:
-  "trustline_open"`, `payload.event: "trustline_established"`. İki alan aynı
-  şeyi mi söylüyor, yoksa `event` Horizon'un effect adı mı olacak? Sen Horizon'dan
-  ne geldiğini görünce netleşir.
+- **Aynı op, aynı kanal, aynı karşı taraf için iki gözlem gerekirse ne olur?**
+  Anahtar buna yer bırakmıyor (bölüm 9). Bugün böyle bir durum bilmiyoruz;
+  eşleyiciyi yazarken çıkarsa mekanizma uydurmadan getir, sözleşmede çözelim.
+- **Hesap bayrakları.** `protocol` payload'ında hangi bayrağın değiştiğini
+  taşıyacak alan yok; v0 sadece değiştiğini kaydediyor. Alan gerekirse şemaya
+  ekleriz, sen `event`'e sıkıştırma.
 - **`kind` sözlüğü** bölüm 12'de; ilk eşleyici çıktısından sonra donduracağız.
 
 Sorusu olan yeri işaretle, oturup konuşalım. Fixture'la çelişen bir şey görürsen

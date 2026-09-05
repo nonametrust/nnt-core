@@ -20,8 +20,10 @@ import { describe, it, expect } from "vitest";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const strkey = /\b(?:G[A-Z2-7]{55}|M[A-Z2-7]{68})\b/;
 
-// The index rather than the working tree: a file that has been `git add`ed is
-// scanned before it is committed, and nothing gitignored is ever listed.
+// Paths come from the index, content from the working tree. So a staged file
+// is scanned before it is committed and nothing gitignored is ever listed, but
+// an address staged and then scrubbed locally passes here; CI, running on the
+// committed tree, is what catches that one.
 function trackedFiles(): string[] {
   return execFileSync("git", ["ls-files", "-z"], { cwd: root, encoding: "utf8" })
     .split("\0")
