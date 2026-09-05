@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from "node:crypto";
 
 const ALGORITHM = "aes-256-gcm";
 const KEY_BYTES = 32;
@@ -44,6 +44,16 @@ export interface Sealed {
 export interface KeyRing {
   wrap(dataKey: Buffer, namespaceId: string): Buffer;
   unwrap(wrapped: Buffer, namespaceId: string): Buffer;
+  /**
+   * A 32-byte key derived from the master key under `label`, by HKDF-SHA256
+   * with the label as its info. The master key itself never leaves the ring:
+   * the audit day seal needs an HMAC key, and using the master directly would
+   * make a seal and a wrapped data key two uses of one key, which is the
+   * confusion a fixed, documented label per purpose exists to rule out. The
+   * same label yields the same key on every call, so a seal made today can be
+   * checked in a year.
+   */
+  deriveKey(label: string): Buffer;
 }
 
 export function newDataKey(): Buffer {
@@ -145,6 +155,16 @@ export function keyRingFromEnv(env: NodeJS.ProcessEnv = process.env): KeyRing {
       decipher.setAAD(Buffer.from(namespaceId, "utf8"));
       decipher.setAuthTag(tag);
       return Buffer.concat([decipher.update(body), decipher.final()]);
+    },
+    deriveKey(label: string): Buffer {
+      if (label.length === 0) {
+        throw new RangeError("a derived key needs a label; the empty label is the master key's own use");
+      }
+      // No salt: the master key is already uniform, and a salt that had to be
+      // stored beside the seal would be one more thing a verifier must hold.
+      return Buffer.from(
+        hkdfSync("sha256", master, Buffer.alloc(0), Buffer.from(label, "utf8"), KEY_BYTES),
+      );
     },
   };
 }

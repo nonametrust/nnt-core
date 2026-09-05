@@ -1,4 +1,4 @@
-import { Kysely, PostgresDialect, type Generated } from "kysely";
+import { Kysely, PostgresDialect, type ColumnType, type Generated } from "kysely";
 import pg from "pg";
 
 // The store owns its own schema type. Each task adds its tables here.
@@ -53,6 +53,30 @@ export interface Schema {
     promoted_at: Date;
     rescued_by: string | null;
     confidence: number;
+  };
+  // `seq` is a string throughout. bigint arrives from the driver as a string
+  // unless a type parser is configured, and none is: a chain sequence is an
+  // identifier and never arithmetic. `body` is written as the canonical JSON
+  // text, never as an object, because the driver would render a top-level
+  // array as a Postgres array literal rather than as JSON.
+  audit_entry: {
+    seq: Generated<string>;
+    occurred_at: Date;
+    policy_version: string;
+    kind: string;
+    body: ColumnType<unknown, string, never>;
+    canonical: string;
+    prev_sha256: Buffer;
+    entry_sha256: Buffer;
+  };
+  // `day` is written as an ISO date string and read back as the driver's
+  // Date, which is what it makes of a `date` column without a parser.
+  audit_day: {
+    day: ColumnType<Date, string, never>;
+    terminal_seq: string;
+    terminal_sha256: Buffer;
+    hmac: Buffer;
+    sealed_at: Date;
   };
 }
 

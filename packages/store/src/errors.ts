@@ -35,6 +35,10 @@ export class IdempotencyKeyMismatch extends StoreError {}
 export class StateNotPromotable extends StoreError {}
 // Raised in TypeScript, from `get`, for the reason ObservationNotFound is.
 export class PermanentRecordNotFound extends StoreError {}
+// Raised in TypeScript, from `sealDay`, when nothing had been appended by the
+// close of the day named. There is no chain head to seal, and a seal row
+// pointing at nothing would be a claim about a history that did not exist.
+export class NothingToSeal extends StoreError {}
 export class MigrationDrift extends StoreError {}
 
 const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreError> = {

@@ -182,3 +182,31 @@ describe("payloadAad", () => {
     expect(() => payloadAad("a", "b\u0000c")).toThrow(/separator/);
   });
 });
+
+describe("deriveKey", () => {
+  const LABEL = "nnt/test-purpose/v1";
+
+  it("derives the same thirty-two bytes for the same label on every call, so a seal made today checks in a year", () => {
+    const a = ring.deriveKey(LABEL);
+    expect(a.length).toBe(32);
+    expect(ring.deriveKey(LABEL).equals(a)).toBe(true);
+    expect(keyRingFromEnv({ NNT_MASTER_KEY: MASTER } as NodeJS.ProcessEnv).deriveKey(LABEL).equals(a)).toBe(true);
+  });
+
+  it("derives a different key under a different label, and neither is the master", () => {
+    const a = ring.deriveKey(LABEL);
+    const b = ring.deriveKey("nnt/other-purpose/v1");
+    expect(a.equals(b)).toBe(false);
+    expect(a.equals(Buffer.from(MASTER, "base64"))).toBe(false);
+    expect(b.equals(Buffer.from(MASTER, "base64"))).toBe(false);
+  });
+
+  it("derives a different key under a different master", () => {
+    const other = keyRingFromEnv({ NNT_MASTER_KEY: randomBytes(32).toString("base64") } as NodeJS.ProcessEnv);
+    expect(other.deriveKey(LABEL).equals(ring.deriveKey(LABEL))).toBe(false);
+  });
+
+  it("refuses the empty label", () => {
+    expect(() => ring.deriveKey("")).toThrow(RangeError);
+  });
+});

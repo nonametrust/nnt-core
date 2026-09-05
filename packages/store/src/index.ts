@@ -10,4 +10,5 @@ export * from "./repositories/namespace.js";
 export * from "./repositories/observation.js";
 export * from "./repositories/tag.js";
 export * from "./repositories/permanent-record.js";
+export * from "./audit/chain.js";
 export * from "./strength.js";
