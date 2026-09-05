@@ -21,5 +21,11 @@ describe("source", () => {
       fetchedAt: "2026-09-05T10:00:00.000Z",
     });
     expect(r.success).toBe(false);
+    // The rejection must come from the producer field itself, not from some
+    // other field happening to be invalid, or this test would pass for the
+    // wrong reason.
+    expect(r.success ? [] : r.error.issues.map((i) => [i.path.join("."), i.message])).toEqual([
+      ["producer", "producer is a bare name; put the version in producerVersion"],
+    ]);
   });
 });
