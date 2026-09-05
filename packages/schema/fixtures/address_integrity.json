@@ -6,11 +6,10 @@
   "kind": "payment_address_changed",
   "observedAt": "2026-09-12T08:14:00.000Z",
   "source": {
-    "producer": "stellar-indexer",
+    "producer": "x402-gateway",
     "producerVersion": "0.1.0",
-    "network": "stellar:pubnet",
-    "ref": "op:214748367361",
-    "fetchedAt": "2026-09-12T08:20:00.000Z"
+    "ref": "req:01J9RB6X3K",
+    "fetchedAt": "2026-09-12T08:14:00.000Z"
   },
-  "payload": { "previous": "GOLDADDRESS", "current": "GNEWADDRESS", "reverted": true }
+  "payload": { "previous": "GOLDADDRESS", "current": "GNEWADDRESS" }
 }

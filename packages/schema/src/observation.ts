@@ -2,6 +2,7 @@ import { z } from "zod";
 import { channelSchema } from "./channel.js";
 import { namespaceRefSchema } from "./namespace.js";
 import { sourceSchema } from "./source.js";
+import { decimalStringSchema, utcDatetimeSchema } from "./scalars.js";
 
 export const OBSERVATION_SCHEMA_VERSION = "0.1.0";
 
@@ -17,9 +18,13 @@ const common = {
    * let a missing payload through; `observation.test.ts` gates both.
    */
   payload: z.record(z.string(), z.unknown()),
+  /**
+   * Read by the salience computation without opening the payload, which is
+   * encrypted at rest, so the amount obeys the same rule as a payload amount.
+   */
   salienceHints: z
     .object({
-      amount: z.string().optional(),
+      amount: decimalStringSchema.optional(),
       latencyMs: z.number().nonnegative().optional(),
     })
     .strict()
@@ -29,14 +34,14 @@ const common = {
   /** Assigned by the engine on ingest, absent on the wire. */
   observationId: z.string().uuid().optional(),
   idempotencyKey: z.string().optional(),
-  ingestedAt: z.string().datetime().optional(),
+  ingestedAt: utcDatetimeSchema.optional(),
 };
 
 const eventSchema = z
   .object({
     ...common,
     evidenceKind: z.literal("event"),
-    observedAt: z.string().datetime(),
+    observedAt: utcDatetimeSchema,
   })
   .strict();
 
@@ -44,8 +49,8 @@ const stateSchema = z
   .object({
     ...common,
     evidenceKind: z.literal("state"),
-    validFrom: z.string().datetime(),
-    validUntil: z.string().datetime().nullable().default(null),
+    validFrom: utcDatetimeSchema,
+    validUntil: utcDatetimeSchema.nullable().default(null),
   })
   .strict();
 

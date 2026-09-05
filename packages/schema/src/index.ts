@@ -2,6 +2,7 @@
 // of the names it exports; nothing is re-exported twice. Dates on an
 // observation are read through `datedAt` in timing.ts and nowhere else, and a
 // gate in timing.test.ts scans this file too, so this file does not name them.
+export * from "./scalars.js";
 export * from "./channel.js";
 export * from "./namespace.js";
 export * from "./source.js";

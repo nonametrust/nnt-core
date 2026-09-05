@@ -73,6 +73,16 @@ describe("golden fixtures", () => {
     expect(fixture("volume").source).toEqual(fixture("content").source);
   });
 
+  // The advertised pay-to address lives in the 402 response, which the gateway
+  // sees; the chain indexer only sees payments landing somewhere else. And one
+  // observation is one transition: the day-twelve revert is a second
+  // observation with its own reference, not a flag on this one.
+  it("the address change is one transition, seen by the gateway", () => {
+    const f = fixture("address_integrity");
+    expect((f.source as { producer: string }).producer).toBe("x402-gateway");
+    expect(Object.keys(f.payload as object).sort()).toEqual(["current", "previous"]);
+  });
+
   // No tracked file in this package may contain a real Stellar address. The
   // study this engine comes from shipped five real addresses in fixtures that
   // its README called synthetic, and its compiled artefacts identify defrauded

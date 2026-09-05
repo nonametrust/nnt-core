@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { utcDatetimeSchema } from "./scalars.js";
 
 // The idempotency key joins its parts on a NUL, so no part may contain one.
 // Gated in source.test.ts and, for the derivation itself, idempotency.test.ts.
@@ -26,7 +27,7 @@ export const sourceSchema = z.object({
   producerVersion: z.string().min(1),
   network: z.string().min(1).regex(NO_NUL, { message: NO_NUL_MESSAGE }).optional(),
   ref: z.string().min(1).regex(NO_NUL, { message: NO_NUL_MESSAGE }),
-  fetchedAt: z.string().datetime(),
+  fetchedAt: utcDatetimeSchema,
 })
   // Strict: an unknown key is rejected rather than stripped, because a
   // stripped key tells the indexer a field is flowing when it is not. Gated in

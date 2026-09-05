@@ -6,32 +6,26 @@ import {
   type Observation,
 } from "./observation.js";
 import { deriveIdempotencyKey } from "./idempotency.js";
-
-/**
- * Amounts and prices travel as decimal strings, never as numbers, because a
- * JSON number is a double and Stellar amounts carry seven decimals. The
- * pattern admits what Horizon emits ("0.0000100", "500") and nothing else: no
- * sign, no exponent, no locale separator. Direction carries the sign.
- */
-const decimalString = z.string().regex(/^\d+(\.\d+)?$/, {
-  message: "must be a non-negative decimal string such as \"12.5\"",
-});
+import { decimalStringSchema } from "./scalars.js";
 
 // Every payload object is strict, like every other object in this package. An
 // unknown key is rejected rather than stripped, because a stripped key tells
 // the indexer a field is flowing when it is not. Gated in payloads.test.ts.
 
 /**
- * A counterparty's payment address moved. `previous` is required: a change
- * with no previous address is a first sighting, not a change, and belongs to
- * a different kind. `reverted` marks the day-twelve scenario, a change that
- * went back. `muxedId` is the muxed identifier when the address was muxed;
- * the namespace itself always holds the base address.
+ * A counterparty's advertised payment address moved from `previous` to
+ * `current`. One observation records exactly one transition; a revert is a
+ * second transition, with its own source reference, and is a second
+ * observation. Two transitions in one day is the anomaly the engine looks
+ * for, and a flag folding both into one observation would hide it.
+ * `previous` is required: a change with no previous address is a first
+ * sighting, not a change, and belongs to a different kind. `muxedId` is the
+ * muxed identifier when the address was muxed; the namespace itself always
+ * holds the base address.
  */
 const addressIntegrity = z.object({
   previous: z.string().min(1),
   current: z.string().min(1),
-  reverted: z.boolean().optional(),
   muxedId: z.string().optional(),
 }).strict();
 
@@ -43,7 +37,7 @@ const latency = z.object({ latencyMs: z.number().nonnegative() }).strict();
  * its denomination, for example "USDC". What the amount buys is the `kind` of
  * the observation, for example "price_quoted" for one x402 request.
  */
-const price = z.object({ quoted: decimalString, unit: z.string().min(1) }).strict();
+const price = z.object({ quoted: decimalStringSchema, unit: z.string().min(1) }).strict();
 
 /**
  * A protocol-level fact about the counterparty: a trustline, an asset it
@@ -59,17 +53,31 @@ const protocol = z.object({
 }).strict();
 
 /**
- * Value moved. `direction` is relative to the namespace the observation is
- * about: "in" means value reached the counterparty, "out" means it left.
- * The same chain payment therefore produces an "in" observation for the
- * receiver's namespace and an "out" observation for the sender's, and the
- * idempotency key keeps both.
+ * Value moved. The type is written out rather than inferred so that the field
+ * documentation reaches the declarations a mapper author reads; the validator
+ * below is checked against it, and `payloads.test.ts` checks the two agree in
+ * both directions.
  */
+export interface VolumePayload {
+  /** Decimal string, no sign, no exponent, no leading zero: "0.2500000". */
+  amount: string;
+  /** The asset code as the chain reports it, for example "USDC" or "XLM". */
+  assetCode: string;
+  /**
+   * Relative to the namespace this observation is about, not to the payer.
+   * "in" means value reached the counterparty; "out" means it left. One chain
+   * payment therefore yields an "in" observation for the receiver's namespace
+   * and an "out" observation for the sender's, and the idempotency key, which
+   * carries the namespace, keeps both.
+   */
+  direction: "in" | "out";
+}
+
 const volume = z.object({
-  amount: decimalString,
+  amount: decimalStringSchema,
   assetCode: z.string().min(1),
   direction: z.enum(["in", "out"]),
-}).strict();
+}).strict() satisfies z.ZodType<VolumePayload>;
 
 /**
  * Graph proximity to a known operation cluster. `hops` is the shortest path
@@ -79,7 +87,7 @@ const volume = z.object({
 const clusterProximity = z.object({
   clusterId: z.string().min(1),
   hops: z.number().int().positive(),
-  amount: decimalString.optional(),
+  amount: decimalStringSchema.optional(),
 }).strict();
 
 /** Free text the counterparty produced, and which field it arrived in. */
@@ -104,7 +112,6 @@ export type AddressIntegrityPayload = PayloadByChannel["address_integrity"];
 export type LatencyPayload = PayloadByChannel["latency"];
 export type PricePayload = PayloadByChannel["price"];
 export type ProtocolPayload = PayloadByChannel["protocol"];
-export type VolumePayload = PayloadByChannel["volume"];
 export type ClusterProximityPayload = PayloadByChannel["cluster_proximity"];
 export type ContentPayload = PayloadByChannel["content"];
 
@@ -127,26 +134,45 @@ function formatIssue(issue: z.ZodIssue, root: string, prefix: string[] = []): st
   return `${path || root}: ${issue.message}`;
 }
 
+/** Assigned by the engine on ingest; their presence on the wire is an error. */
+const ENGINE_ASSIGNED = ["observationId", "ingestedAt"] as const;
+
 /**
- * Validates the schema version, then the envelope, then the channel-specific
- * payload, then assigns the deterministic idempotency key. Every layer must
- * pass; a valid envelope with a malformed payload is a rejection, because a
- * half-understood observation that reaches the tagging pipeline is worse than
- * one that never arrives.
+ * Validates that the input is an object, then the schema version, then the
+ * envelope, then the channel-specific payload, then that no engine-assigned
+ * field arrived on the wire, then assigns the deterministic idempotency key.
+ * Every layer must pass; a valid envelope with a malformed payload is a
+ * rejection, because a half-understood observation that reaches the tagging
+ * pipeline is worse than one that never arrives.
  *
- * The version is checked first and exactly. Both sides of this contract live in
+ * The object check comes first because an unparsed JSON string is the first
+ * mistake a caller makes, and blaming `schemaVersion` for it sends them to the
+ * wrong place.
+ *
+ * The version is checked next and exactly. Both sides of this contract live in
  * one repository and move together, so a producer declaring a version we do not
  * implement is telling us its shape was written against a different schema, and
  * accepting it half-understood is the worse failure. The check exists because
  * an exported version constant that nothing reads is a claim with no gate.
  *
- * The key is the engine's to assign. A producer that sends one anyway and gets
- * it wrong is rejected rather than corrected, because a silently replaced key
- * means the producer's deduplication and ours disagree about what a duplicate
- * is, and neither side would ever learn it.
+ * `observationId`, `ingestedAt` and `idempotencyKey` are the engine's to
+ * assign. The first two must be absent on the wire. The key may be present
+ * only if it equals the derived one, so a producer that precomputes it with
+ * `deriveIdempotencyKey` is not turned away; one that gets it wrong is
+ * rejected rather than corrected, because a silently replaced key means the
+ * producer's deduplication and ours disagree about what a duplicate is, and
+ * neither side would ever learn it. The message carries the derived key so the
+ * producer can see what it should have sent.
  */
 export function validateObservation(input: unknown): ValidationResult {
-  const declared = (input as { schemaVersion?: unknown } | null | undefined)?.schemaVersion;
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    const received = input === null ? "null" : Array.isArray(input) ? "array" : typeof input;
+    return {
+      ok: false,
+      errors: [`observation: expected a parsed JSON object, received ${received}`],
+    };
+  }
+  const declared = (input as { schemaVersion?: unknown }).schemaVersion;
   if (declared !== OBSERVATION_SCHEMA_VERSION) {
     return {
       ok: false,
@@ -170,12 +196,21 @@ export function validateObservation(input: unknown): ValidationResult {
       errors: payload.error.issues.map((i) => formatIssue(i, "payload", ["payload"])),
     };
   }
+  const supplied = ENGINE_ASSIGNED.filter((field) => o[field] !== undefined);
+  if (supplied.length > 0) {
+    return {
+      ok: false,
+      errors: supplied.map(
+        (field) => `${field}: assigned by the engine on ingest and must not appear on the wire`,
+      ),
+    };
+  }
   const idempotencyKey = deriveIdempotencyKey(o.source, o.channel, o.namespace);
   if (o.idempotencyKey !== undefined && o.idempotencyKey !== idempotencyKey) {
     return {
       ok: false,
       errors: [
-        "idempotencyKey: does not match the key derived from source, channel and namespace; omit it on the wire",
+        `idempotencyKey: received ${o.idempotencyKey}, but source, channel and namespace derive ${idempotencyKey}; omit it on the wire or compute it with deriveIdempotencyKey`,
       ],
     };
   }

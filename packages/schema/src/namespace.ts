@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { utcDatetimeSchema } from "./scalars.js";
 
 /**
  * Continuity is an integration assertion, never an inference. The engine does
@@ -13,7 +14,7 @@ export const continuityAssertionSchema = z.object({
   // A whitespace-only asserter is not a who and a whitespace-only reason is
   // not a why, so both are trimmed before the length check.
   assertedBy: z.string().trim().min(1),
-  assertedAt: z.string().datetime(),
+  assertedAt: utcDatetimeSchema,
   reason: z.string().trim().min(1),
 }).strict();
 export type ContinuityAssertion = z.infer<typeof continuityAssertionSchema>;
