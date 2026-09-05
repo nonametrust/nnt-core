@@ -26,12 +26,24 @@ let dir: string;
 // harmless too; nothing here depends on teardown having happened.
 const schemaName = "migrate_test";
 
+// Every session this file opens announces itself, so the lock proof below can
+// ask about this file's sessions and no others. The advisory key is
+// database-wide and vitest runs test files in parallel workers, each of which
+// migrates its own schema under the same key; a count over the whole database
+// sees a neighbouring file's runner and goes red for a lock this file never
+// took. That was observed, not guessed: the holder was another backend
+// running the runner's own first statement.
+const APP = "migrate_test";
+function announced(base: string): string {
+  return `${base}${base.includes("?") ? "&" : "?"}application_name=${APP}`;
+}
+
 beforeAll(async () => {
   const admin = openDb(url);
   await sql.raw(`drop schema if exists ${schemaName} cascade`).execute(admin);
   await sql.raw(`create schema ${schemaName}`).execute(admin);
   await admin.destroy();
-  db = openDb(urlForSchema(url, schemaName));
+  db = openDb(announced(urlForSchema(url, schemaName)));
   dir = mkdtempSync(join(tmpdir(), "nnt-migrations-"));
 });
 
@@ -74,10 +86,24 @@ describe("migrate", () => {
     // some other key it would finish while this session still holds LOCK_KEY;
     // if it never unlocked, a lock would survive its return. The key is the
     // runner's own export, so the test cannot drift onto a stale copy of it.
-    const admin = openDb(url);
+    // Granted holders of LOCK_KEY among this file's own sessions. Asked twice:
+    // once while the holder below has the key, where the answer must be one,
+    // so that a filter matching no session at all cannot make the final
+    // answer a vacuous zero.
+    const heldHere = async () =>
+      (
+        await sql<{ n: string }>`
+          select count(*)::text as n from pg_locks l
+          join pg_stat_activity a on a.pid = l.pid
+          where l.locktype = 'advisory' and l.granted and l.objid = ${LOCK_KEY}
+            and a.application_name = ${APP}
+        `.execute(db)
+      ).rows[0]?.n;
+    const admin = openDb(announced(url));
     try {
       await admin.connection().execute(async (holder) => {
         await sql`select pg_advisory_lock(${LOCK_KEY})`.execute(holder);
+        expect(await heldHere(), "the holder's own lock is not visible to the filter").toBe("1");
         let settled = false;
         const run = migrate(db, dir).then((r) => {
           settled = true;
@@ -88,13 +114,7 @@ describe("migrate", () => {
         await sql`select pg_advisory_unlock(${LOCK_KEY})`.execute(holder);
         expect(await run).toEqual([]);
       });
-      const held = await sql<{ n: string }>`
-        select count(*)::text as n from pg_locks
-        where locktype = 'advisory' and objid = ${LOCK_KEY} and database = (
-          select oid from pg_database where datname = current_database()
-        )
-      `.execute(db);
-      expect(held.rows[0]?.n).toBe("0");
+      expect(await heldHere()).toBe("0");
     } finally {
       await admin.destroy();
     }
