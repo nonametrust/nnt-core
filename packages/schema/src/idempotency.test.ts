@@ -93,14 +93,18 @@ describe("idempotency key", () => {
     expect(deriveIdempotencyKey(a, "volume", ns)).not.toBe(deriveIdempotencyKey(b, "volume", ns));
   });
 
-  it("does not let the namespace id boundary shift without changing the key", () => {
-    // The id is the last part; a shift between the part before it and the id
-    // itself must not re-partition into the same concatenation. The type of
-    // `kind` is an enum, so the shift is tested against the part before the
-    // namespace, which is the channel: "volume" versus "volum" + "e".
-    const a = deriveIdempotencyKey(src, "volume", { kind: "wallet", id: "X" });
-    const b = deriveIdempotencyKey(src, "volum" as "volume", { kind: "e wallet" as "wallet", id: "X" });
+  it("does not let a namespace boundary shift without changing the key", () => {
+    // The namespace kind and id are the last two parts. Each pair below
+    // concatenates identically under a space separator, so the test fails if
+    // the separator is anything a field can contain. `channel` and `kind` are
+    // enums only at the type level; the derivation does not check them, so an
+    // unvalidated caller could pass the shifted values, and they are cast here.
+    // First, "x" crosses the boundary between the channel and the kind:
+    // "volume" + "x wallet" versus "volume x" + "wallet".
+    const a = deriveIdempotencyKey(src, "volume", { kind: "x wallet" as "wallet", id: "X" });
+    const b = deriveIdempotencyKey(src, "volume x" as "volume", { kind: "wallet", id: "X" });
     expect(a).not.toBe(b);
+    // Then a space crosses the boundary between the kind and the id.
     const c = deriveIdempotencyKey(src, "volume", { kind: "wallet", id: " X" });
     const d = deriveIdempotencyKey(src, "volume", { kind: "wallet " as "wallet", id: "X" });
     expect(c).not.toBe(d);

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "0.1.0",
+  "namespace": { "kind": "endpoint", "id": "https://data.example/x402" },
+  "channel": "price",
+  "evidenceKind": "event",
+  "kind": "price_quoted",
+  "observedAt": "2026-09-01T08:00:00.412Z",
+  "source": {
+    "producer": "x402-gateway",
+    "producerVersion": "0.1.0",
+    "ref": "req:01J6WQZ3H8",
+    "fetchedAt": "2026-09-01T08:00:00.412Z"
+  },
+  "payload": { "quoted": "0.25", "unit": "USDC" }
+}

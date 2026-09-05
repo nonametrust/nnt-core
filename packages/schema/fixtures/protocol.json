@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "0.1.0",
+  "namespace": { "kind": "endpoint", "id": "https://data.example/x402" },
+  "channel": "protocol",
+  "evidenceKind": "state",
+  "kind": "trustline_open",
+  "validFrom": "2026-08-20T11:02:31.000Z",
+  "validUntil": null,
+  "source": {
+    "producer": "stellar-indexer",
+    "producerVersion": "0.1.0",
+    "network": "stellar:pubnet",
+    "ref": "op:214701113857",
+    "fetchedAt": "2026-09-01T07:55:00.000Z"
+  },
+  "payload": {
+    "event": "trustline_established",
+    "assetCode": "USDC",
+    "assetIssuer": "GISSUERADDRESS",
+    "issuerKnown": true
+  }
+}
