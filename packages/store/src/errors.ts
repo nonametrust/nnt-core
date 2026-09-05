@@ -12,7 +12,7 @@ export class TimestampAltered extends StoreError {}
 export class NamespaceShredded extends StoreError {}
 export class MigrationDrift extends StoreError {}
 
-const BY_SQLSTATE: Record<string, new (m: string) => StoreError> = {
+const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreError> = {
   NNT01: AppendOnlyViolation,
   NNT02: ChainBroken,
   NNT03: ChainBroken,
@@ -24,6 +24,10 @@ const BY_SQLSTATE: Record<string, new (m: string) => StoreError> = {
  * anything else. Null rather than a generic wrapper: an error we did not
  * design is rethrown unchanged, because flattening an unknown driver failure
  * into a store error hides it.
+ *
+ * The original is kept as `cause`. A trigger's `detail`, `hint`, `constraint`
+ * and stack live on the pg error, and a chain break in production is debugged
+ * from those, not from the message.
  */
 export function mapPgError(e: unknown): StoreError | null {
   if (typeof e !== "object" || e === null) return null;
@@ -32,5 +36,5 @@ export function mapPgError(e: unknown): StoreError | null {
   const Ctor = BY_SQLSTATE[code];
   if (!Ctor) return null;
   const message = (e as { message?: unknown }).message;
-  return new Ctor(typeof message === "string" ? message : code);
+  return new Ctor(typeof message === "string" ? message : code, { cause: e });
 }

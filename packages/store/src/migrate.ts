@@ -5,17 +5,21 @@ import { sql } from "kysely";
 import type { Db } from "./db.js";
 import { MigrationDrift } from "./errors.js";
 
-// One arbitrary but fixed key, so two processes migrating at once serialise
-// rather than racing to create the same table.
-const LOCK_KEY = 81402026;
+/**
+ * One arbitrary but fixed advisory-lock key, so two processes migrating at
+ * once serialise rather than racing to create the same table. Exported so the
+ * test that proves the lock is taken and released asks about this key and not
+ * about a copy of it.
+ */
+export const LOCK_KEY = 81402026;
 
 /**
  * Applies every unapplied file in `dir`, in filename order, each in its own
  * transaction. Returns the filenames it applied, empty on a second run.
  *
- * A file whose recorded hash no longer matches its content stops the run. An
- * edited migration is a different migration, and finding that out in
- * production is worse than a failed start.
+ * A recorded file whose hash no longer matches its content stops the run
+ * before anything is applied. An edited migration is a different migration,
+ * and finding that out in production is worse than a failed start.
  *
  * A file is sent to the server whole. It is never split on semicolons: a
  * `$$`-quoted function body contains semicolons that are not statement
@@ -50,25 +54,31 @@ export async function migrate(db: Db, dir: string): Promise<string[]> {
         ),
       );
 
-      const applied: string[] = [];
-
+      // Drift is checked for every recorded file before any file is applied.
+      // Checked inside the applying loop instead, a new file sorting before
+      // the edited one would land on top of a ledger that is already wrong.
+      const pending: { filename: string; body: string; digest: string }[] = [];
       for (const filename of files) {
         const body = readFileSync(join(dir, filename), "utf8");
         const digest = createHash("sha256").update(body).digest("hex");
         const seen = recorded.get(filename);
-        if (seen !== undefined) {
-          if (seen !== digest) {
-            throw new MigrationDrift(
-              `${filename} was applied with different content (recorded ${seen}, found ${digest}). ` +
-                "An edited migration is a different migration; add a new file instead.",
-            );
-          }
-          continue;
+        if (seen === undefined) {
+          pending.push({ filename, body, digest });
+        } else if (seen !== digest) {
+          throw new MigrationDrift(
+            `${filename} was applied with different content (recorded ${seen}, found ${digest}). ` +
+              "An edited migration is a different migration; add a new file instead.",
+          );
         }
+      }
+
+      const applied: string[] = [];
+      for (const { filename, body, digest } of pending) {
         // The file runs first and the record is written second, both under one
-        // transaction, so a failing file leaves no record. `applied_at` is the
-        // column default: the ledger's timestamp is the database's, and this
-        // package reads no wall clock of its own.
+        // transaction, so a failing file leaves no record and a failing record
+        // leaves no file. `applied_at` is the column default: the ledger's
+        // timestamp is the database's, and this package reads no wall clock
+        // of its own.
         await conn.transaction().execute(async (trx) => {
           await sql.raw(body).execute(trx);
           await trx.insertInto("schema_migration").values({ filename, sha256: digest }).execute();

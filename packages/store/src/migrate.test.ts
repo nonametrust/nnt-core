@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { sql } from "kysely";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { openDb, type Db } from "./db.js";
-import { migrate } from "./migrate.js";
+import { LOCK_KEY, migrate } from "./migrate.js";
 import { MigrationDrift } from "./errors.js";
 import { requireTestUrl, urlForSchema } from "./testing/harness.js";
 
@@ -47,6 +47,15 @@ function put(name: string, sql: string): void {
   writeFileSync(join(dir, name), sql, "utf8");
 }
 
+async function tableExists(name: string): Promise<boolean> {
+  const r = await sql<{ t: string | null }>`select to_regclass(${name})::text as t`.execute(db);
+  return r.rows[0]?.t != null;
+}
+
+async function recordFor(filename: string) {
+  return db.selectFrom("schema_migration").selectAll().where("filename", "=", filename).executeTakeFirst();
+}
+
 describe("migrate", () => {
   it("applies files in filename order and reports what it applied", async () => {
     put("0001_a.sql", "create table a (id int);");
@@ -60,44 +69,79 @@ describe("migrate", () => {
     expect(applied).toEqual([]);
   });
 
-  it("holds no advisory lock once it has returned, so the next runner is not blocked", async () => {
-    // Failure here would also look like a hang in the test above, so the
-    // check is direct: no session in this database still holds the key.
-    const held = await sql<{ n: string }>`
-      select count(*)::text as n from pg_locks
-      where locktype = 'advisory' and objid = 81402026 and database = (
-        select oid from pg_database where datname = current_database()
-      )
-    `.execute(db);
-    expect(held.rows[0]?.n).toBe("0");
+  it("waits on LOCK_KEY while another session holds it, and holds nothing once it has returned", async () => {
+    // Two halves, each of which fails on its own. If the runner locked under
+    // some other key it would finish while this session still holds LOCK_KEY;
+    // if it never unlocked, a lock would survive its return. The key is the
+    // runner's own export, so the test cannot drift onto a stale copy of it.
+    const admin = openDb(url);
+    try {
+      await admin.connection().execute(async (holder) => {
+        await sql`select pg_advisory_lock(${LOCK_KEY})`.execute(holder);
+        let settled = false;
+        const run = migrate(db, dir).then((r) => {
+          settled = true;
+          return r;
+        });
+        await new Promise((r) => setTimeout(r, 300));
+        expect(settled, "migrate returned while another session held LOCK_KEY").toBe(false);
+        await sql`select pg_advisory_unlock(${LOCK_KEY})`.execute(holder);
+        expect(await run).toEqual([]);
+      });
+      const held = await sql<{ n: string }>`
+        select count(*)::text as n from pg_locks
+        where locktype = 'advisory' and objid = ${LOCK_KEY} and database = (
+          select oid from pg_database where datname = current_database()
+        )
+      `.execute(db);
+      expect(held.rows[0]?.n).toBe("0");
+    } finally {
+      await admin.destroy();
+    }
   });
 
-  it("refuses to run when an applied file's content has changed", async () => {
-    put("0001_a.sql", "create table a (id int); -- edited");
+  it("refuses the whole run when any recorded file has changed, applying nothing new first", async () => {
+    // The new file sorts before the edited one. Drift checked file by file
+    // would apply it and then stop, leaving a fresh entry on a ledger that is
+    // already wrong.
+    put("0002_a_new.sql", "create table a_new (id int);");
+    put("0002_b.sql", "create table b (id int); -- edited");
     await expect(migrate(db, dir)).rejects.toBeInstanceOf(MigrationDrift);
-    put("0001_a.sql", "create table a (id int);");
+    expect(await recordFor("0002_a_new.sql")).toBeUndefined();
+    expect(await tableExists("a_new")).toBe(false);
+    put("0002_b.sql", "create table b (id int);");
+    rmSync(join(dir, "0002_a_new.sql"));
   });
 
   it("records the sha256 of each file it applied", async () => {
-    const row = await db
-      .selectFrom("schema_migration")
-      .selectAll()
-      .where("filename", "=", "0002_b.sql")
-      .executeTakeFirstOrThrow();
+    const row = await recordFor("0002_b.sql");
     const expected = createHash("sha256").update("create table b (id int);").digest("hex");
-    expect(row.sha256).toBe(expected);
+    expect(row?.sha256).toBe(expected);
   });
 
-  it("leaves nothing recorded when a file fails, so a half-applied file is not marked done", async () => {
+  it("leaves nothing recorded when a file does not parse", async () => {
     put("0003_bad.sql", "this is not sql;");
     await expect(migrate(db, dir)).rejects.toThrow();
-    const row = await db
-      .selectFrom("schema_migration")
-      .selectAll()
-      .where("filename", "=", "0003_bad.sql")
-      .executeTakeFirst();
-    expect(row).toBeUndefined();
+    expect(await recordFor("0003_bad.sql")).toBeUndefined();
     rmSync(join(dir, "0003_bad.sql"));
+  });
+
+  it("rolls the file back when its record cannot be written, so nothing is half-applied", async () => {
+    // Within one file nothing can half-apply on its own: Postgres parses the
+    // whole file before running any of it, and runs a multi-statement simple
+    // query as one implicit transaction. The gap the explicit transaction
+    // closes is between the file and its ledger record, so the fixture is a
+    // file that succeeds and then makes its own record fail: it forges a
+    // ledger row under its own name and the runner's insert collides with it.
+    put(
+      "0003_half.sql",
+      "create table half (id int);\n" +
+        "insert into schema_migration (filename, sha256) values ('0003_half.sql', 'forged');",
+    );
+    await expect(migrate(db, dir)).rejects.toThrow();
+    expect(await tableExists("half")).toBe(false);
+    expect(await recordFor("0003_half.sql")).toBeUndefined();
+    rmSync(join(dir, "0003_half.sql"));
   });
 
   it("applies a file holding a table and a $$-quoted function together, unsplit", async () => {
