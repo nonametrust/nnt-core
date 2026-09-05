@@ -19,6 +19,11 @@ import { describe, it, expect } from "vitest";
 // Exemptions are paths relative to packages/, never basenames: a later
 // store/src/timing.ts must not inherit schema/src/timing.ts's exemption.
 //
+// The match is lexical. A line that names one of the fields anywhere, in a
+// comment or a string literal as much as in code, is an offender: `o["validFrom"]`
+// is a genuine read, and a gate with no tokenizer stays conservative rather
+// than guess at which mentions are reads. A comment that trips it is reworded.
+//
 // Unlike the address gate beside this one, files come from the filesystem and
 // not from `git ls-files`, so an untracked module is scanned too. That is what
 // lets a probe file prove the gate fires without ever being committed.
@@ -75,7 +80,7 @@ describe("dates on an observation", () => {
     }
     expect(
       offenders,
-      "these lines read a date field off an observation; go through datedAt() in packages/schema/src/timing.ts instead:\n" +
+      "these lines name a date field of an observation; go through datedAt() in packages/schema/src/timing.ts instead:\n" +
         offenders.join("\n"),
     ).toEqual([]);
   });

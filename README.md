@@ -18,7 +18,7 @@ Private until the `v0` tag, then public. Apache-2.0.
 | `packages/schema` | The observation schema: seven channels, the event/state distinction, namespace and source, per-channel payload validators, the deterministic idempotency key, and one golden fixture per channel. **This is the only package the indexer depends on.** |
 | `docs/observation-contract.md` | The contract for the indexer developer, in Turkish: what an observation is, what each field means, which rules the schema enforces and which it does not yet. Start there if you are writing a producer. |
 | `docs/superpowers/specs/`, `docs/superpowers/plans/` | The v0 design and the milestone plan the code follows. |
-| `gates/` | Repository-wide gates that are not about one package. Today: no tracked file may contain a Stellar-shaped account id. |
+| `gates/` | Repository-wide gates that are not about one package. Today: no tracked file may contain a Stellar-shaped account id, and only `datedAt` reads a date off an observation. |
 
 The engine packages named in the design (`store`, `tagging`, `engine`,
 `nonametrust`) arrive in later milestones and will depend on `schema`; `schema`
@@ -57,10 +57,12 @@ true. The ones worth knowing before you add a file:
   at run time and never writes it to disk.
 - **No test file in `dist`**, `*.test.*` or `*.spec.*` (CI, after `pnpm build`).
 - **Only `datedAt` reads a date off an observation**
-  (`packages/schema/src/timing.test.ts`), so a state can never be credited as
-  a dated event. The gate scans `packages/schema/src` and nothing else today;
-  it extends to the engine packages when they land, and until then the claim
-  holds for this package only.
+  (`gates/single-date-reader.test.ts`), so a state can never be credited as
+  a dated event. The gate scans every `packages/*/src` tree and exempts only
+  the module that defines the fields and the one that reads them, keyed by
+  path relative to `packages/` rather than by basename, so a new package
+  enters under it on the day it is created, with no exemption. Refuses to
+  report green if it finds no package to scan.
 - **The schema version is checked exactly** on every observation
   (`packages/schema/src/payloads.test.ts`), and the golden fixtures must all
   validate (`packages/schema/src/fixtures.test.ts`).

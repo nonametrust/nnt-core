@@ -398,14 +398,15 @@ dondurduğumuzda enum olacak ve o gün yazımı değiştirmek göç demek; o yü
 ## 13. Repoya dosya eklerken
 
 Kökte bir kapı var: izlenen hiçbir dosyada Stellar hesap adresi şeklinde bir
-şey olamaz, G ile başlayan 56 ya da M ile başlayan 69 karakter, checksum
-geçerli olsun olmasın, küçük harfe çevrilmiş ya da başına sonuna bir şey
-yapışmış olsa da. Kapı yolları git index'inden, içeriği çalışma ağacından
-okur: `git add` ettiğin dosya commit'ten önce taranır, ama stage'leyip sonra
-yerelde temizlediğin bir adres yerelde geçer, onu commit edilmiş ağaç üzerinde
-koşan CI yakalar. Senin paketin de kapsamda. Test fixture'larında kısa, belli
-ki sahte kimlikler kullan (`GOLDADDRESS` gibi); gerçek biçimli bir anahtara
-ihtiyacın olan test onu çalışma anında üretir ve dosyaya yazmaz. Bu kural
+şey olamaz, G ile başlayan 56 ya da M ile başlayan 69 karakterlik base32
+dizi, checksum geçerli olsun olmasın, küçük harfe çevrilmiş ya da başına
+sonuna bir şey yapışmış olsa da. Kapı yolları git index'inden, içeriği çalışma
+ağacından okur: `git add` ettiğin dosya commit'ten önce taranır, ama
+stage'leyip sonra yerelde temizlediğin bir adres yerelde geçer, onu commit
+edilmiş ağaç üzerinde koşan CI yakalar. Senin paketin de kapsamda. Test
+fixture'larında kısa, belli ki sahte kimlikler kullan (`GOLDADDRESS` gibi);
+gerçek biçimli bir anahtara ihtiyacın olan test onu çalışma anında üretir ve
+dosyaya yazmaz. Bu kural
 pazarlık dışı; repo v0'da public oluyor ve bu projenin arkasındaki veri
 dolandırılmış hesapları tanımlıyor.
 
