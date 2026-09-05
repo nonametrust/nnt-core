@@ -1,4 +1,8 @@
 {
+  // Typecheck-only view of the package: every file under src, tests included.
+  // "exclude" must be reset here because "extends" inherits the build
+  // config's exclusion of *.test.ts, which would silently drop the tests
+  // from typechecking.
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true
