@@ -12,12 +12,17 @@ const common = {
   /** What happened at the source, for example "payment". Not the channel. */
   kind: z.string().min(1),
   source: sourceSchema,
-  payload: z.unknown(),
+  /**
+   * Required, and an object. `z.unknown()` would infer an optional key and
+   * let a missing payload through; `observation.test.ts` gates both.
+   */
+  payload: z.record(z.string(), z.unknown()),
   salienceHints: z
     .object({
       amount: z.string().optional(),
       latencyMs: z.number().nonnegative().optional(),
     })
+    .strict()
     .optional(),
   /** Present from v0 so that enabling verification is not a migration. */
   signature: z.string().nullable().optional(),

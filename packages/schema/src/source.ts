@@ -22,5 +22,9 @@ export const sourceSchema = z.object({
   network: z.string().min(1).optional(),
   ref: z.string().min(1),
   fetchedAt: z.string().datetime(),
-});
+})
+  // Strict: an unknown key is rejected rather than stripped, because a
+  // stripped key tells the indexer a field is flowing when it is not. Gated in
+  // source.test.ts.
+  .strict();
 export type Source = z.infer<typeof sourceSchema>;

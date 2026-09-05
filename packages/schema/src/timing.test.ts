@@ -1,3 +1,6 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 import { datedAt } from "./timing.js";
 
@@ -40,5 +43,33 @@ describe("datedAt", () => {
       validFrom: "2026-09-01T00:00:00.000Z", validUntil: "2026-09-03T00:00:00.000Z",
       source: src, payload: {},
     })).toBeNull();
+  });
+
+  // The claim in channel.ts and timing.ts is that datedAt is the only reader
+  // of a date off an observation. After narrowing on evidenceKind, observedAt
+  // and validFrom are both readable with full type support, and reading
+  // validFrom where a date was meant is the substitution that produced the S3
+  // defect. This test is the gate for that claim: every module in this package
+  // other than the type definition and the reader must not name those fields.
+  it("no module outside timing.ts reads a date off an observation", () => {
+    const srcDir = dirname(fileURLToPath(import.meta.url));
+    const exempt = new Set(["observation.ts", "timing.ts"]);
+    const dateFields = /\b(observedAt|validFrom|validUntil)\b/;
+    const offenders: string[] = [];
+    for (const entry of readdirSync(srcDir, { recursive: true, withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")) continue;
+      if (exempt.has(entry.name)) continue;
+      const file = join(entry.parentPath, entry.name);
+      readFileSync(file, "utf8").split("\n").forEach((line, i) => {
+        if (dateFields.test(line)) {
+          offenders.push(`${relative(srcDir, file)}:${i + 1}: ${line.trim()}`);
+        }
+      });
+    }
+    expect(
+      offenders,
+      "these lines read a date field off an observation; go through datedAt() in timing.ts instead:\n" +
+        offenders.join("\n"),
+    ).toEqual([]);
   });
 });

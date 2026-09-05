@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { observationSchema } from "./observation.js";
+import { EVIDENCE_KINDS } from "./channel.js";
 
 const base = {
   schemaVersion: "0.1.0",
@@ -122,5 +123,45 @@ describe("observation", () => {
     });
     expect(event.success).toBe(false);
     expect(state.success).toBe(false);
+  });
+
+  // The payload is required and is an object. Zod infers an optional key for
+  // z.unknown(), so the type would otherwise promise a case the runtime never
+  // produces once ingest is in place.
+  it("rejects an observation with no payload", () => {
+    const { payload: _omitted, ...rest } = base;
+    const r = observationSchema.safeParse({
+      ...rest, evidenceKind: "event", observedAt: "2026-09-05T09:00:00.000Z",
+    });
+    expect(r.success).toBe(false);
+    expect(r.success ? [] : r.error.issues.map((i) => i.path)).toContainEqual(["payload"]);
+  });
+
+  it("rejects a payload that is not an object", () => {
+    for (const payload of [null, "GNEW", 42, ["GOLD", "GNEW"]]) {
+      const r = observationSchema.safeParse({
+        ...base, payload, evidenceKind: "event", observedAt: "2026-09-05T09:00:00.000Z",
+      });
+      expect(r.success, `payload ${JSON.stringify(payload)} should be rejected`).toBe(false);
+    }
+  });
+
+  // channel.ts owns the list of evidence kinds; the union's discriminant
+  // literals must be that list and nothing else, so a third kind added in one
+  // place fails here instead of going silently unhandled.
+  it("uses exactly EVIDENCE_KINDS as its discriminant values", () => {
+    const discriminants = [...observationSchema.innerType().optionsMap.keys()].sort();
+    expect(discriminants).toEqual([...EVIDENCE_KINDS].sort());
+  });
+
+  // Strictness must not stop at the top level. A nested unknown key that is
+  // silently stripped tells the indexer its data is flowing when it is not.
+  it("rejects an unknown key inside salienceHints", () => {
+    const r = observationSchema.safeParse({
+      ...base, evidenceKind: "event", observedAt: "2026-09-05T09:00:00.000Z",
+      salienceHints: { amount: "10", weight: 3 },
+    });
+    expect(r.success).toBe(false);
+    expect(r.success ? [] : r.error.issues.map((i) => i.path)).toContainEqual(["salienceHints"]);
   });
 });

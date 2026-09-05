@@ -52,4 +52,10 @@ describe("source", () => {
     expect(r.success).toBe(false);
     expect(issues(r).map(([path]) => path)).toEqual(["fetchedAt"]);
   });
+
+  it("rejects an unknown key on the source; nothing is stripped silently", () => {
+    const r = sourceSchema.safeParse({ ...valid, ledger: 5 });
+    expect(r.success).toBe(false);
+    expect(issues(r).map(([path]) => path)).toEqual([""]);
+  });
 });

@@ -83,4 +83,22 @@ describe("namespace reference", () => {
   it("rejects an unknown namespace kind", () => {
     expect(namespaceRefSchema.safeParse({ kind: "email", id: "a@b" }).success).toBe(false);
   });
+
+  // Unknown keys are rejected rather than stripped. Stripping tells the
+  // integrator a field is flowing when it is not.
+  it("rejects an unknown key on the namespace reference", () => {
+    const r = namespaceRefSchema.safeParse({ kind: "wallet", id: "GABC", label: "acme" });
+    expect(r.success).toBe(false);
+    expect(issuePaths(r)).toEqual([""]);
+  });
+
+  it("rejects an unknown key inside the continuity assertion", () => {
+    const r = namespaceRefSchema.safeParse({
+      kind: "wallet",
+      id: "GABC",
+      continuity: { ...continuity, confidence: 0.9 },
+    });
+    expect(r.success).toBe(false);
+    expect(issuePaths(r)).toEqual(["continuity"]);
+  });
 });
