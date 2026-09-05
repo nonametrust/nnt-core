@@ -261,11 +261,17 @@ muxed alıcı varsa `to_muxed` (M...) ve `to_muxed_id` ayrıca gelir. `id`'ye
 iki muxed kimliğine giden iki ödeme aynı karşı taraf hakkındadır (bölüm 9).
 İki ayrı `muxedId` var, karıştırma: **namespace'teki** gözlemin öznesinin
 kimliği, **`address_integrity` payload'ındaki** ise bir geçişin içinde ilan
-edilen adresin muxed kimliği; ikincisini sen üretmiyorsun. **Şema `id`'nin
-biçimine v0'da bakmıyor**: `id`'ye M ile başlayan 69 karakter yazarsan geçer.
-Kural senin uyacağın kural; M1'de kapısı eklenecek. Brief'in 7. bölümündeki
-"muxed adres payı" ölçümü de tam bu noktada sayılır: kaç ödeme muxed alıcı
-taşıdı, kaçını çözdün.
+edilen adresin muxed kimliği; ikincisini sen üretmiyorsun. **Şema muxed
+biçimi `id`'de reddediyor** (`@nonametrust/schema` 0.2.0'dan itibaren):
+`kind: "wallet"` bir namespace'in `id`'sine M ile başlayan 69 karakter
+yazarsan gözlem düşer ve `validateObservation`'dan şu gelir:
+`namespace.id: a wallet id is the base address: resolve the muxed address and carry its subaccount in muxedId`.
+Küçük harfe çevrilmiş hâli de düşer; kapısı `namespace.test.ts`'de. Kapı
+bilerek tek yönlü: muxed biçimi reddediyor, taban adresin neye benzediğine
+bakmıyor. Yani **`id`'nin checksum'ı geçerli bir Stellar hesabı olduğunu şema
+kontrol etmiyor**; `GABC` de geçer, yanlış kopyalanmış bir G... de. O kural
+senin uyacağın kural (bölüm 11). Brief'in 7. bölümündeki "muxed adres payı"
+ölçümü de tam bu noktada sayılır: kaç ödeme muxed alıcı taşıdı, kaçını çözdün.
 
 `continuity`: iki adresin aynı karşı taraf olduğunu söyleyen bir **beyandır**,
 çıkarım değil. Motor kimlik çözmez, sessizce birleştirmez. Yazarsan `assertedBy`,
@@ -326,9 +332,11 @@ Bunlar doğru olmak zorunda ve bugün doğruluğunu sadece sen sağlıyorsun. He
 birini kendi tarafında bir teste bağla; "cümle olarak değersiz, test olarak
 değerli" burada geçerli.
 
-1. **Muxed → taban adres, muxed kimlik `muxedId`'de** (bölüm 7). Şema `id`'nin
-   biçimine bakmıyor ve `muxedId`'nin gerçekten o adresin kimliği olduğunu
-   bilemez. M1'de kapı.
+1. **Cüzdan `id`'sinin checksum'ı geçerli bir Stellar hesabı olması, ve
+   `muxedId`'nin gerçekten o adresin kimliği olması** (bölüm 7). Şema M ile
+   başlayan 69 karakteri `id`'de reddediyor, o kadar; taban adresin biçimine
+   bakmıyor, checksum hesaplamıyor, `muxedId`'yi adresle karşılaştıramaz.
+   Yanlış kopyalanmış bir G... geçer.
 2. **`kind` sözlüğü** (bölüm 12). Şema `kind`'ın boş olmadığına bakıyor, başka
    hiçbir şeye.
 3. **`direction`'ın doğru tarafta olması.** Şema `"in"`/`"out"` olduğuna bakar,

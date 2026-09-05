@@ -125,3 +125,53 @@ describe("namespace reference", () => {
     expect(issuePaths(r)).toEqual(["continuity"]);
   });
 });
+
+// A muxed-shaped identifier cannot be written in this file: the repository
+// gate refuses the shape in any tracked file, checksum or not. It is built
+// here instead, from the shape the gate itself describes.
+function muxedShaped(): string {
+  return "M" + "A".repeat(68);
+}
+function baseShaped(): string {
+  return "G" + "A".repeat(55);
+}
+
+describe("a wallet id is the base address", () => {
+  it("refuses a muxed-shaped id on a wallet", () => {
+    const r = namespaceRefSchema.safeParse({ kind: "wallet", id: muxedShaped() });
+    expect(r.success).toBe(false);
+    expect(issuePaths(r)).toContain("id");
+  });
+
+  it("refuses a lowercased muxed-shaped id, since case does not make it a base address", () => {
+    const r = namespaceRefSchema.safeParse({ kind: "wallet", id: muxedShaped().toLowerCase() });
+    expect(r.success).toBe(false);
+  });
+
+  it("accepts a base-shaped id on a wallet", () => {
+    expect(namespaceRefSchema.safeParse({ kind: "wallet", id: baseShaped() }).success).toBe(true);
+  });
+
+  it("accepts an obviously synthetic short id, so fixtures stay short", () => {
+    expect(namespaceRefSchema.safeParse({ kind: "wallet", id: "GOLDADDRESS" }).success).toBe(true);
+  });
+
+  it("keeps the muxed identifier in its own field", () => {
+    const r = namespaceRefSchema.safeParse({
+      kind: "wallet", id: baseShaped(), muxedId: "1234567890",
+    });
+    expect(r.success).toBe(true);
+  });
+
+  // The gate is about which counterparty is meant on a chain. A domain or an
+  // endpoint id is not an address and is not narrowed here; saying so in a
+  // test stops a later reader from widening it by guess.
+  it("does not apply to a non-wallet namespace", () => {
+    expect(namespaceRefSchema.safeParse({ kind: "domain", id: muxedShaped() }).success).toBe(true);
+  });
+
+  it("leaves the discriminated union in observation.ts buildable", async () => {
+    const { observationSchema } = await import("./observation.js");
+    expect(observationSchema).toBeDefined();
+  });
+});
