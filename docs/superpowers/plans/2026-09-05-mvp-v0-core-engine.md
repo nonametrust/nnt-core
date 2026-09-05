@@ -12,7 +12,12 @@
 
 ## Global Constraints
 
-- Node 22 LTS. pnpm workspaces. TypeScript strict mode on.
+- Node 22 LTS. pnpm workspaces. TypeScript strict mode on, with
+  `isolatedModules` (amended after the Task 1 review: vitest transpiles per
+  file and cannot tell a type re-export from a value one, so the flag turns a
+  module-link failure into a compile error).
+- The build config excludes `src/**/*.test.ts` so tests never reach `dist/`;
+  a second config typechecks them. Added in Task 2 for the same reason.
 - Licence Apache-2.0 on every package, matching D1.1.
 - `Date.now()` never appears inside `packages/engine`, `packages/tagging` or `packages/store`. Time enters through an injected `Clock`.
 - Tag strength is never persisted. It is derived from `g0`, elapsed time and the channel half-life.
