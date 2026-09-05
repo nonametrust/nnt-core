@@ -42,7 +42,7 @@ describe("strengthAt", () => {
   // below what a double can hold; see the boundary test below. Sixty days at
   // the same factor is 0.5^857, around 1e-258, and is the same claim at a
   // point the arithmetic can represent.
-  it("never reaches zero, so suppression is decay and not deletion", () => {
+  it("is still positive at a factor of 100 over sixty days, which is 0.5^857", () => {
     expect(
       strengthAt({ ...base, suppressionFactor: 100 }, new Date("2026-11-11T00:00:00.000Z"), 7 * DAY),
     ).toBeGreaterThan(0);

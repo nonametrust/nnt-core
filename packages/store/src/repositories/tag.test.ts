@@ -106,9 +106,73 @@ describe("what the table refuses to hold", () => {
     ]);
   });
 
-  it("offers no way to delete a tag by identifier, because suppression is not deletion", () => {
-    const surface = Object.getOwnPropertyNames(TagRepository.prototype);
-    expect(surface.filter((m) => /delete|remove|drop/i.test(m))).toEqual([]);
+  // The same gate as the column list, applied to the code: the surface is
+  // exactly the five methods the brief names. A name list of forbidden verbs
+  // (delete, remove, drop) would let `retire`, `purge` or `expire` through,
+  // and a static method or a second module-level export would not be on the
+  // prototype at all. Types are erased, so the module's runtime keys are its
+  // real surface.
+  it("offers no way to delete a tag by identifier, because suppression is not deletion", async () => {
+    expect(Object.getOwnPropertyNames(TagRepository.prototype).sort()).toEqual([
+      "constructor", "get", "listLive", "open", "refresh", "suppress",
+    ]);
+    expect(Object.getOwnPropertyNames(TagRepository).sort()).toEqual(["length", "name", "prototype"]);
+    expect(Object.keys(await import("./tag.js")).sort()).toEqual(["TagRepository"]);
+  });
+
+  // The column gate above is about `tag`. This one is the cheap part of the
+  // wider claim: no table in this schema carries a column whose name says it
+  // caches a strength. It cannot catch a column of any name, which is why
+  // the full claim is the nightly job's determinism test and not this; it
+  // does catch a `tag_strength` cache table for nothing. The allowlist is for
+  // a column that legitimately matches one day, and it is empty on purpose.
+  it("has no strength-like column on any table in the schema, beyond an explicit allowlist", async () => {
+    const allowed = new Set<string>([]);
+    const rows = await sql<{ t: string; c: string }>`
+      select table_name as t, column_name as c from information_schema.columns
+      where table_schema = current_schema()
+    `.execute(db);
+    const offenders = rows.rows
+      .map((r) => `${r.t}.${r.c}`)
+      .filter((tc) => /strength|score|decayed|current_g|weight/i.test(tc.split(".")[1]!))
+      .filter((tc) => !allowed.has(tc));
+    expect(offenders, `a column outside tag looks like a stored strength: ${offenders.join(", ")}`)
+      .toEqual([]);
+  });
+
+  // The repository refuses NaN and Infinity before any statement, and the
+  // database holds the same rule on its own, because a rule that lives only
+  // in application code is one a backfill or a raw session can go around,
+  // and one NaN row poisons every later refresh through greatest().
+  it("refuses NaN and Infinity in g0 and the factor from a raw writer, by check constraint", async () => {
+    const cases: Array<[string, string]> = [
+      ["'NaN'::float8", "1"], ["'Infinity'::float8", "1"],
+      ["1", "'NaN'::float8"], ["1", "'Infinity'::float8"],
+    ];
+    for (const [g0, factor] of cases) {
+      await expect(
+        sql`insert into tag (tag_id, namespace_id, observation_id, channel, g0, tagged_at, suppression_factor)
+            values (${randomUUID()}, ${ns}, ${obs}, 'volume', ${sql.raw(g0)}, ${clock.now()}, ${sql.raw(factor)})`
+          .execute(db),
+      ).rejects.toMatchObject({ code: "23514" });
+    }
+    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", g0: 0.5 });
+    await expect(
+      sql`update tag set g0 = 'NaN'::float8 where tag_id = ${t.tagId}`.execute(db),
+    ).rejects.toMatchObject({ code: "23514" });
+    expect((await repo.get(t.tagId)).g0).toBe(0.5);
+  });
+
+  // A tag says "this observation, about this counterparty". Two independent
+  // foreign keys would let it name a counterparty the observation is not
+  // about, and listLive would then surface it under the wrong namespace,
+  // which is the one query the nightly job runs. The pair is one key.
+  it("refuses a tag whose namespace is not the observation's, by foreign key", async () => {
+    const stranger = (await namespaces.ensure({ kind: "wallet", id: "STRANGER" })).namespaceId;
+    await expect(
+      repo.open({ namespaceId: stranger, observationId: obs, channel: "volume", g0: 0.5 }),
+    ).rejects.toMatchObject({ code: "23503" });
+    expect(await repo.listLive(stranger)).toEqual([]);
   });
 });
 
