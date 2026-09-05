@@ -26,7 +26,11 @@ export type ContinuityAssertion = z.infer<typeof continuityAssertionSchema>;
  */
 export const namespaceRefSchema = z.object({
   kind: z.enum(["wallet", "domain", "endpoint", "merchant"]),
-  id: z.string().min(1),
+  // The id is a part of the idempotency key, which joins its parts on a NUL,
+  // so it may not contain one. Gated in namespace.test.ts.
+  id: z.string().min(1).regex(/^[^\u0000]*$/, {
+    message: "must not contain NUL, the idempotency key separator",
+  }),
   continuity: continuityAssertionSchema.optional(),
 }).strict();
 export type NamespaceRef = z.infer<typeof namespaceRefSchema>;

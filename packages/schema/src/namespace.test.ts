@@ -80,6 +80,15 @@ describe("namespace reference", () => {
     expect(issuePaths(r)).toEqual(["continuity.assertedAt"]);
   });
 
+  // The idempotency key joins its parts on a NUL and the namespace id is one
+  // of them, so the id may not contain one. Gated here; the derivation itself
+  // is gated in idempotency.test.ts.
+  it("rejects a namespace id containing a NUL, the idempotency key separator", () => {
+    const r = namespaceRefSchema.safeParse({ kind: "wallet", id: "GABC\u0000D" });
+    expect(r.success).toBe(false);
+    expect(issuePaths(r)).toEqual(["id"]);
+  });
+
   it("rejects an unknown namespace kind", () => {
     expect(namespaceRefSchema.safeParse({ kind: "email", id: "a@b" }).success).toBe(false);
   });
