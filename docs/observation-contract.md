@@ -35,8 +35,8 @@ var mı, `schemaVersion` tam eşleşiyor mu, zarf, kanalın payload'ı, varsa
 
 Örnekler `packages/schema/fixtures/` altında, kanal başına bir dosya. Yedisi tek
 hikâye: bir x402 veri sağlayıcısı, 20 Ağustos–12 Eylül 2026. Eşleyicinin
-ürettiğini bu dosyalarla yan yana koy; alan adı ve biçim farkı varsa yanlış
-taraf büyük ihtimalle senin taraf değil, ama fixture da olabilir, söyle.
+ürettiğini bu dosyalarla yan yana koy; alan adı ya da biçim farkı varsa büyük
+ihtimalle senin taraf yanlış, ama fixture da yanlış olabilir, söyle.
 
 Testler: repo kökünde `pnpm test`. Kendi paketini eklediğinde `pnpm -r test` onu
 da koşar.
@@ -46,13 +46,13 @@ da koşar.
 | Alan | Tip | Kural |
 |---|---|---|
 | `schemaVersion` | string | Şimdilik `"0.1.0"`. Tam eşleşme; başka değer reddedilir. |
-| `namespace` | `{ kind, id, continuity? }` | Gözlemin **kim hakkında** olduğu. Bölüm 6. |
+| `namespace` | `{ kind, id, continuity? }` | Gözlemin **kim hakkında** olduğu. Bölüm 7. |
 | `channel` | enum | Yedi kanaldan biri. Bölüm 3. |
 | `evidenceKind` | `"event"` \| `"state"` | Anlık olay mı, süren durum mu. Bölüm 4. |
-| `kind` | string | Kaynakta ne oldu: `payment`, `memo`, `trustline_open`. Kanal değil. Serbest metin; bölüm 10. |
+| `kind` | string | Kaynakta ne oldu: `payment`, `memo`, `trustline_open`. Kanal değil. Serbest metin; bölüm 12. |
 | `observedAt` | UTC zaman | Sadece event'te, zorunlu. |
 | `validFrom`, `validUntil` | UTC zaman, `validUntil` null olabilir | Sadece state'te. `validUntil` yazılmazsa null sayılır, "hâlâ sürüyor" demek. `validUntil < validFrom` reddedilir. |
-| `source` | obje | Bunu kim, nereden, ne zaman okudu. Bölüm 7. |
+| `source` | obje | Bunu kim, nereden, ne zaman okudu. Bölüm 8. |
 | `payload` | obje | Kanala özgü, zorunlu, boş obje bile olsa obje. Bölüm 3. |
 | `salienceHints` | `{ amount?, latencyMs? }` | İsteğe bağlı. Payload depoda şifreli duracak; önem hesabı payload'ı açmadan bu ipuçlarını okuyor. `volume` yazıyorsan `amount`'ı, `latency` yazıyorsan `latencyMs`'i buraya da yaz. |
 | `signature` | string \| null | İsteğe bağlı, v0'da doğrulanmıyor. Alan şimdiden var ki sonra açmak şema göçü olmasın. Yazma. |
@@ -135,7 +135,7 @@ geçerli: bir durum değiştiyse değişimi yaz, bayrak koyma.
 `direction` **namespace'e göre**dir, ödeyene göre değil. `"in"`: değer karşı
 tarafa ulaştı. `"out"`: karşı taraftan çıktı. Bir zincir ödemesi iki gözlem
 üretir: alıcının namespace'i için `"in"`, gönderenin namespace'i için `"out"`.
-Anahtar namespace'i kapsıyor, ikisi de yaşar (bölüm 8).
+Anahtar namespace'i kapsıyor, ikisi de yaşar (bölüm 9).
 
 Horizon `payment` kaydından kural:
 
@@ -209,7 +209,7 @@ Pratikte anlamı:
   namespace)` üçlüsünden en fazla bir gözlem üret; ikincisi kopya sayılır. Aynı
   op'tan aynı kanalda aynı karşı taraf için iki şey söyleyeceksen ref'i ayır
   (`op:<id>#2` gibi) ya da tek gözleme sığdır; hangisi olacağına birlikte karar
-  verelim, bölüm 12.
+  verelim, bölüm 14.
 
 Anahtarı önceden hesaplamak istersen `deriveIdempotencyKey(source, channel,
 namespace)` export edilmiş; kendi tekilleştirmeni motorla aynı anahtar
@@ -220,6 +220,9 @@ namespace)` export edilmiş; kendi tekilleştirmeni motorla aynı anahtar
 `observationId`, `ingestedAt`, `idempotencyKey` motorun. İlk ikisi telde
 **görünmez**; görünürse, değeri ne olursa olsun (`null` bile), gözlem reddedilir:
 `observationId: assigned by the engine on ingest and must not appear on the wire`.
+Kontrol `in` ile, değere bakmıyor; TypeScript'ten doğrudan çağırıyorsan
+`observationId: undefined` bile reddedilir. Motor tarafındaki bir objeyi
+spread'leyip tele geri yazdığında olur bu, çözümü de aynı: anahtarı düşür.
 `idempotencyKey`'i yazabilirsin ama türetilenle aynı olması şart; farklıysa
 reddedilir ve mesaj türetilen anahtarı gösterir. Sessizce düzeltmiyoruz, çünkü o
 zaman sen ve motor "kopya nedir" konusunda farklı düşünür ve kimse öğrenmez.
@@ -243,6 +246,9 @@ değerli" burada geçerli.
 6. **Bir `(ref, channel, namespace)` → en fazla bir gözlem** (bölüm 9).
 7. **`salienceHints`'in payload ile aynı değeri taşıması.** Şema iki alanı ayrı
    ayrı doğrular, birbirine bakmaz.
+8. **`network`'ün indexer'da her zaman dolu olması** (bölüm 8). Şemada isteğe
+   bağlı, çünkü gateway'in ağı yok; sen boş bırakırsan pubnet ve testnet
+   operasyonları aynı anahtara düşer ve biri sessizce kaybolur.
 
 Şemanın kontrol **ettiği** şeyleri saymıyorum; onlar zaten hata mesajı olarak
 sana gelir.
