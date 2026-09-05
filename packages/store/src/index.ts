@@ -5,3 +5,4 @@
 export * from "./clock.js";
 export * from "./errors.js";
 export { migrate } from "./migrate.js";
+export * from "./crypto.js";
