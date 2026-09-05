@@ -53,6 +53,21 @@ describe("source", () => {
     expect(issues(r).map(([path]) => path)).toEqual(["fetchedAt"]);
   });
 
+  // The idempotency key joins its parts on a NUL, which is unambiguous only
+  // while no part contains one. The producer regex already excludes it; these
+  // two pin the exclusion on the two free-form fields.
+  it("rejects a reference containing a NUL, the idempotency key separator", () => {
+    const r = sourceSchema.safeParse({ ...valid, ref: "op:1\u0000x" });
+    expect(r.success).toBe(false);
+    expect(issues(r).map(([path]) => path)).toEqual(["ref"]);
+  });
+
+  it("rejects a network containing a NUL, the idempotency key separator", () => {
+    const r = sourceSchema.safeParse({ ...valid, network: "stellar\u0000pubnet" });
+    expect(r.success).toBe(false);
+    expect(issues(r).map(([path]) => path)).toEqual(["network"]);
+  });
+
   it("rejects an unknown key on the source; nothing is stripped silently", () => {
     const r = sourceSchema.safeParse({ ...valid, ledger: 5 });
     expect(r.success).toBe(false);

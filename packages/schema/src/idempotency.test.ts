@@ -56,4 +56,18 @@ describe("idempotency key", () => {
     const b = { ...src, network: "a b", ref: "c" };
     expect(deriveIdempotencyKey(a, "volume")).not.toBe(deriveIdempotencyKey(b, "volume"));
   });
+
+  it("refuses a field that contains the separator itself", () => {
+    // The NUL join is unambiguous only while no field contains a NUL.
+    // sourceSchema rejects one; this is the gate for a source that skipped
+    // validation. The two pairs below would otherwise concatenate identically.
+    const a = { ...src, network: "a", ref: "\u0000b" };
+    const b = { ...src, network: "a\u0000", ref: "b" };
+    expect(() => deriveIdempotencyKey(a, "volume")).toThrow(/NUL/);
+    expect(() => deriveIdempotencyKey(b, "volume")).toThrow(/NUL/);
+  });
+
+  it("is a lowercase hex SHA-256 digest, so it fits a fixed-width unique column", () => {
+    expect(deriveIdempotencyKey(src, "volume")).toMatch(/^[0-9a-f]{64}$/);
+  });
 });
