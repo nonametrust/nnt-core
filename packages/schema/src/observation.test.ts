@@ -81,10 +81,9 @@ describe("observation", () => {
     const r = observationSchema.safeParse({
       ...base, evidenceKind: "state", validFrom: "2026-09-01T00:00:00.000Z",
     });
-    expect(r.success).toBe(true);
-    if (r.success && r.data.evidenceKind === "state") {
-      expect(r.data.validUntil).toBeNull();
-    }
+    // Assert on the whole result so that a wrong evidenceKind or a failed
+    // parse cannot slip past as an unrun assertion.
+    expect(r.success && r.data.evidenceKind === "state" ? r.data.validUntil : "unreached").toBeNull();
   });
 
   it("accepts a state whose interval closes at the instant it opened", () => {
@@ -102,10 +101,7 @@ describe("observation", () => {
       validFrom: "2026-09-05T00:00:00.000Z",
       validUntil: "2026-09-01T00:00:00.000Z",
     });
-    expect(r.success).toBe(false);
-    if (!r.success) {
-      expect(r.error.issues.map((i) => i.path)).toContainEqual(["validUntil"]);
-    }
+    expect(r.success ? [] : r.error.issues.map((i) => i.path)).toContainEqual(["validUntil"]);
   });
 
   it("rejects an evidence kind that is neither event nor state", () => {
