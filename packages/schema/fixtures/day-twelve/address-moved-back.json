@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "0.1.0",
+  "namespace": { "kind": "endpoint", "id": "https://data.example/x402" },
+  "channel": "address_integrity",
+  "evidenceKind": "event",
+  "kind": "payment_address_changed",
+  "observedAt": "2026-09-12T16:47:00.000Z",
+  "source": {
+    "producer": "x402-gateway",
+    "producerVersion": "0.1.0",
+    "ref": "req:01J9SN7C2D",
+    "fetchedAt": "2026-09-12T16:47:00.000Z"
+  },
+  "payload": { "previous": "GNEWADDRESS", "current": "GOLDADDRESS" }
+}

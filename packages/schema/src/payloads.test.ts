@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { CHANNELS } from "./channel.js";
+import type { z } from "zod";
 import {
   payloadSchemaFor,
   validateObservation,
@@ -35,13 +36,20 @@ const state = {
   payload: { event: "trustline_established", assetCode: "USDC", issuerKnown: true },
 };
 
-// Type-level gate, checked by `pnpm typecheck`: the documented VolumePayload
-// and the payload the volume validator infers are the same type in both
-// directions, so the field documentation cannot drift from the validator.
-const _documentedVolume: VolumePayload = {} as PayloadByChannel["volume"];
-const _inferredVolume: PayloadByChannel["volume"] = {} as VolumePayload;
-void _documentedVolume;
-void _inferredVolume;
+// Type-level gates, checked by `pnpm typecheck`. The documented VolumePayload
+// and the type the volume validator infers must be identical, not merely
+// mutually assignable: two-way assignment misses an optional field added on
+// either side, since optional extras assign both ways. The conditional-type
+// form below compares the two under the compiler's identity relation, so an
+// optional field, a widened or narrowed literal, or a renamed key all fail.
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
+type Assert<T extends true> = T;
+type InferredVolume = z.output<ReturnType<typeof payloadSchemaFor<"volume">>>;
+type _volumeDocumentedMatchesValidator = Assert<Equal<VolumePayload, InferredVolume>>;
+// The map a mapper author indexes must hand back the documented interface, so
+// the direction convention rides along on both routes.
+type _mapResolvesToDocumented = Assert<Equal<PayloadByChannel["volume"], VolumePayload>>;
 
 describe("payload validators", () => {
   it("has a validator for every channel", () => {
@@ -244,6 +252,30 @@ describe("payload validators", () => {
       expect(r.errors).toHaveLength(1);
       expect(r.errors[0]).toMatch(/^observationId: /);
       expect(r.errors[0]).toMatch(/assigned by the engine/);
+    }
+  });
+
+  // The presence check runs on the raw input before the envelope parses, so a
+  // malformed or null value for an engine field gets the remove-this-field
+  // message and not a format complaint that sends the developer to fix the
+  // field's shape when the fix is to delete it.
+  it("tells a producer to remove a malformed observationId, not to fix its format", () => {
+    const r = validateObservation({ ...volume, observationId: "obs-1" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.errors).toHaveLength(1);
+      expect(r.errors[0]).toMatch(/^observationId: assigned by the engine/);
+      expect(r.errors[0]).not.toMatch(/uuid/i);
+    }
+  });
+
+  it("tells a producer to remove a null ingestedAt, not to fix its type", () => {
+    const r = validateObservation({ ...volume, ingestedAt: null });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.errors).toHaveLength(1);
+      expect(r.errors[0]).toMatch(/^ingestedAt: assigned by the engine/);
+      expect(r.errors[0]).not.toMatch(/Expected string/);
     }
   });
 

@@ -83,6 +83,40 @@ describe("golden fixtures", () => {
     expect(Object.keys(f.payload as object).sort()).toEqual(["current", "previous"]);
   });
 
+  // The day-twelve scenario is two observations, not one with a flag: the
+  // advertised address moves away in the morning and moves back the same day,
+  // each seen by the gateway under its own request reference. The anomaly the
+  // engine looks for is exactly that pair within one day.
+  describe("day twelve", () => {
+    const dayTwelve = join(dir, "day-twelve");
+    const away = JSON.parse(readFileSync(join(dayTwelve, "address-moved-away.json"), "utf8"));
+    const back = JSON.parse(readFileSync(join(dayTwelve, "address-moved-back.json"), "utf8"));
+
+    it("both observations validate", () => {
+      expect(validateObservation(away).ok, "moved-away failed").toBe(true);
+      expect(validateObservation(back).ok, "moved-back failed").toBe(true);
+    });
+
+    it("the move back reverses the move away", () => {
+      expect(back.payload.previous).toBe(away.payload.current);
+      expect(back.payload.current).toBe(away.payload.previous);
+    });
+
+    it("the two carry different source references and derive different keys", () => {
+      expect(back.source.ref).not.toBe(away.source.ref);
+      const a = validateObservation(away);
+      const b = validateObservation(back);
+      if (a.ok && b.ok) expect(a.value.idempotencyKey).not.toBe(b.value.idempotencyKey);
+      else expect.fail("one of the day-twelve observations did not validate");
+    });
+
+    it("both happen on day twelve, and the move back comes after the move away", () => {
+      expect(away.observedAt).toMatch(/^2026-09-12T/);
+      expect(back.observedAt).toMatch(/^2026-09-12T/);
+      expect(Date.parse(back.observedAt)).toBeGreaterThan(Date.parse(away.observedAt));
+    });
+  });
+
   // No tracked file in this package may contain a real Stellar address. The
   // study this engine comes from shipped five real addresses in fixtures that
   // its README called synthetic, and its compiled artefacts identify defrauded

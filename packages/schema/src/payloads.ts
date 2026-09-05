@@ -106,8 +106,15 @@ const BY_CHANNEL = {
   content,
 } satisfies Record<Channel, z.ZodTypeAny>;
 
-/** The payload type each channel carries, for a mapper that builds one. */
-export type PayloadByChannel = { [C in Channel]: z.infer<(typeof BY_CHANNEL)[C]> };
+/**
+ * The payload type each channel carries, for a mapper that builds one. The
+ * volume entry resolves to the documented interface rather than to the
+ * validator's inferred type, so the direction convention reaches a reader on
+ * this route as well; `payloads.test.ts` holds the two identical.
+ */
+export type PayloadByChannel = {
+  [C in Channel]: C extends "volume" ? VolumePayload : z.infer<(typeof BY_CHANNEL)[C]>;
+};
 export type AddressIntegrityPayload = PayloadByChannel["address_integrity"];
 export type LatencyPayload = PayloadByChannel["latency"];
 export type PricePayload = PayloadByChannel["price"];
@@ -138,9 +145,9 @@ function formatIssue(issue: z.ZodIssue, root: string, prefix: string[] = []): st
 const ENGINE_ASSIGNED = ["observationId", "ingestedAt"] as const;
 
 /**
- * Validates that the input is an object, then the schema version, then the
- * envelope, then the channel-specific payload, then that no engine-assigned
- * field arrived on the wire, then assigns the deterministic idempotency key.
+ * Validates that the input is an object, then that no engine-assigned field
+ * arrived on the wire, then the schema version, then the envelope, then the
+ * channel-specific payload, then assigns the deterministic idempotency key.
  * Every layer must pass; a valid envelope with a malformed payload is a
  * rejection, because a half-understood observation that reaches the tagging
  * pipeline is worse than one that never arrives.
@@ -148,6 +155,11 @@ const ENGINE_ASSIGNED = ["observationId", "ingestedAt"] as const;
  * The object check comes first because an unparsed JSON string is the first
  * mistake a caller makes, and blaming `schemaVersion` for it sends them to the
  * wrong place.
+ *
+ * The engine-field check runs on the raw input, before the envelope parses,
+ * because the envelope would otherwise complain about the field's format, an
+ * invalid uuid or a null where a string was expected, and send the producer
+ * to fix a field whose correct fix is to delete it.
  *
  * The version is checked next and exactly. Both sides of this contract live in
  * one repository and move together, so a producer declaring a version we do not
@@ -172,6 +184,15 @@ export function validateObservation(input: unknown): ValidationResult {
       errors: [`observation: expected a parsed JSON object, received ${received}`],
     };
   }
+  const supplied = ENGINE_ASSIGNED.filter((field) => field in input);
+  if (supplied.length > 0) {
+    return {
+      ok: false,
+      errors: supplied.map(
+        (field) => `${field}: assigned by the engine on ingest and must not appear on the wire`,
+      ),
+    };
+  }
   const declared = (input as { schemaVersion?: unknown }).schemaVersion;
   if (declared !== OBSERVATION_SCHEMA_VERSION) {
     return {
@@ -194,15 +215,6 @@ export function validateObservation(input: unknown): ValidationResult {
     return {
       ok: false,
       errors: payload.error.issues.map((i) => formatIssue(i, "payload", ["payload"])),
-    };
-  }
-  const supplied = ENGINE_ASSIGNED.filter((field) => o[field] !== undefined);
-  if (supplied.length > 0) {
-    return {
-      ok: false,
-      errors: supplied.map(
-        (field) => `${field}: assigned by the engine on ingest and must not appear on the wire`,
-      ),
     };
   }
   const idempotencyKey = deriveIdempotencyKey(o.source, o.channel, o.namespace);
