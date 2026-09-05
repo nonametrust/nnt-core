@@ -43,8 +43,8 @@ export interface Schema {
     saturation_state: "open" | "saturated";
     suppression_factor: number;
   };
-  // rescued_by is a plain uuid here; the foreign key to trigger_event arrives
-  // with that table in 0006, and the type does not change when it does.
+  // rescued_by is a plain uuid here; the foreign key arrives with the
+  // migration that creates trigger_event, and the type does not change then.
   permanent_record: {
     record_id: string;
     observation_id: string;

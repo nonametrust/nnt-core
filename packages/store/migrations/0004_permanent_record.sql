@@ -22,8 +22,8 @@ create table permanent_record (
   namespace_id      uuid not null references namespace (namespace_id),
   original_dated_at timestamptz not null,
   promoted_at       timestamptz not null,
-  -- References trigger_event, which migration 0006 creates. The constraint is
-  -- added there and nowhere else.
+  -- References trigger_event. The migration that creates that table adds the
+  -- constraint, and nowhere else does.
   rescued_by        uuid,
   -- The confidence at promotion: a historical fact, not a cached strength,
   -- which is why tag's no-strength-column gate stops at tag. `<= 1` refuses
@@ -45,6 +45,11 @@ create table permanent_record (
 -- says now. That the source cannot change is observation's append-only
 -- trigger's job; this one only has to look.
 --
+-- The update leg is defence in depth. The table is append-only, below, and
+-- that trigger sorts first and refuses every update before this one runs.
+-- This leg is for the day that trigger is disabled, and the test proves it
+-- by doing exactly that inside a transaction it rolls back.
+--
 -- A source that does not exist is left to the foreign key. Refusing it here
 -- would report a nonexistent observation as an altered timestamp, and a
 -- caller debugging the wrong problem is worse than one refused twice.
@@ -55,10 +60,12 @@ create table permanent_record (
 -- state exists, which is the point: a standing condition has no instant to
 -- preserve, and inventing one is how a state ends up credited to a window.
 --
--- What this trigger does not hold: an update that repoints observation_id at
--- a different observation carrying the same instant passes, because the pair
--- still agrees. Whether a record may be repointed at all is a property of
--- the record's identity, not of its instant, and is not decided here.
+-- What no trigger holds: a promotion into a shredded namespace. The
+-- observation row survives a shred and its instant is still readable, so
+-- the database sees nothing wrong with the record. The repository refuses
+-- it, because a promotion exists to make evidence surface in a later brief,
+-- and evidence whose content can never be read again can only produce a
+-- reason nobody can explain.
 create function permanent_record_keeps_its_date() returns trigger language plpgsql as $$
 declare source_dated timestamptz;
 begin
@@ -78,3 +85,28 @@ $$;
 create trigger permanent_record_date_preserved
   before insert or update on permanent_record
   for each row execute function permanent_record_keeps_its_date();
+
+-- Append-only, held by the database, as observation is. Every column is
+-- fixed at promotion time and has no designed writer afterwards: the
+-- confidence is the confidence at promotion, a historical fact, and a fact
+-- with an UPDATE path is not one. What breaks otherwise is concrete: any
+-- session could move promoted_at, rewrite confidence, repoint a record at
+-- another observation carrying the same instant, which the date trigger
+-- above cannot see, or DELETE a record and remove evidence from a day-21
+-- brief with no trace. Nothing is lost by refusing: erasure is by key
+-- shredding, and a promotion that must be reversed is a new fact, not a
+-- rewrite of this one.
+--
+-- NNT01 is shared with observation, since it is one concept; the table name
+-- is in the message so the two are told apart.
+create function permanent_record_append_only() returns trigger language plpgsql as $$
+begin
+  raise exception using
+    errcode = 'NNT01',
+    message = tg_table_name || ' is append-only: ' || tg_op || ' is refused';
+end
+$$;
+
+create trigger permanent_record_append_only
+  before update or delete on permanent_record
+  for each row execute function permanent_record_append_only();

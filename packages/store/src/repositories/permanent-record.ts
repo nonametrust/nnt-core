@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Clock } from "../clock.js";
 import type { Db, Schema } from "../db.js";
 import {
-  ObservationNotFound, PermanentRecordNotFound, StateNotPromotable, mapPgError,
+  NamespaceShredded, ObservationNotFound, PermanentRecordNotFound, StateNotPromotable, mapPgError,
 } from "../errors.js";
 
 /**
@@ -34,6 +34,12 @@ const COLUMNS = [
   "promoted_at", "rescued_by", "confidence",
 ] as const;
 
+/**
+ * The permanent record repository. Its prototype carries `promote` and `get`
+ * and nothing that updates or deletes, and the table refuses both from any
+ * session: a record is fixed at promotion, and a promotion that must be
+ * reversed is a new fact rather than a rewrite. The test pins the absence.
+ */
 export class PermanentRecordRepository {
   constructor(
     private readonly db: Db,
@@ -41,27 +47,39 @@ export class PermanentRecordRepository {
   ) {}
 
   /**
-   * Promotes an observation. The instant is read off the observation row and
-   * written to the record inside one transaction, on one connection, so the
-   * copy and the write are a single unit and nothing can be copied from one
-   * session and written in another. What actually makes the copied value
-   * stable is that observation accepts no UPDATE; what makes the copy
-   * checked is the trigger, which compares the written value against the
-   * live source row at the moment of the insert and raises NNT04, which
-   * `mapPgError` turns into TimestampAltered. The repository cannot reach
-   * that refusal on its own, and that is the trigger's point: it is there
-   * for the writer that is not this one.
+   * Promotes an observation. The instant is copied from the observation row
+   * to the record by the insert itself, as `insert ... select dated_at from
+   * observation`, so it never leaves the database: a copy that round-tripped
+   * through a JavaScript Date would be exact only while the writer of that
+   * column happened to write whole milliseconds. The pre-read that precedes
+   * it is for the refusals named below, and both statements run inside one
+   * transaction on one connection, so they are a single unit. What makes
+   * the copied value stable is that observation accepts no UPDATE; what
+   * makes the copy checked is the trigger, which compares the written value
+   * against the live source row at the moment of the insert and raises
+   * NNT04, which `mapPgError` turns into TimestampAltered. The repository
+   * cannot reach that refusal on its own, and that is the trigger's point:
+   * it is there for the writer that is not this one.
    *
-   * Two refusals are named here rather than left to the database. A source
-   * that does not exist is ObservationNotFound, because the row was looked
-   * for and the identifier is known. A state is StateNotPromotable: its
-   * dated_at is null and original_dated_at is not null, so the column would
-   * refuse it as a 23502, and a caller could not tell a promoted state from
-   * a broken disk. A namespace the observation does not belong to, a second
-   * promotion of the same observation and a confidence outside the unit
-   * interval are constraint violations and come back as the driver's error,
-   * with the constraint name on it, as tag's `open` does for the same kinds
-   * of caller defect.
+   * Three refusals are named here rather than left to the database. A
+   * source that does not exist is ObservationNotFound, because the row was
+   * looked for and the identifier is known. A state is StateNotPromotable:
+   * its dated_at is null and original_dated_at is not null, so the column
+   * would refuse it as a 23502, and a caller could not tell a promoted
+   * state from a broken disk. A source in a shredded namespace is
+   * NamespaceShredded, and here the database would not refuse at all: the
+   * observation row survives a shred and its instant is still readable. A
+   * promotion exists to make evidence surface in a later brief, and evidence
+   * whose content can never be read again can only produce a reason nobody
+   * can explain, so it is refused for the price of the join. The namespace
+   * read is the observation's own, not the caller's; whether the caller's
+   * agrees with it is the composite foreign key's question.
+   *
+   * A namespace the observation does not belong to, a second promotion of
+   * the same observation and a confidence outside the unit interval are
+   * constraint violations and come back as the driver's error, with the
+   * constraint name on it, as tag's `open` does for the same kinds of
+   * caller defect.
    *
    * The row comes back from `returning`, so what is reported is what was
    * stored and not what was meant to be.
@@ -73,26 +91,43 @@ export class PermanentRecordRepository {
       return await this.db.transaction().execute(async (trx) => {
         const source = await trx
           .selectFrom("observation")
-          .select(["dated_at"])
-          .where("observation_id", "=", input.observationId)
+          .innerJoin("namespace", "namespace.namespace_id", "observation.namespace_id")
+          .select(["observation.dated_at", "namespace.key_shredded_at"])
+          .where("observation.observation_id", "=", input.observationId)
           .executeTakeFirst();
         if (!source) throw new ObservationNotFound(`no observation ${input.observationId} to promote`);
+        if (source.key_shredded_at !== null) {
+          throw new NamespaceShredded(
+            `observation ${input.observationId} is in a namespace shredded at ${source.key_shredded_at.toISOString()}`,
+          );
+        }
         if (source.dated_at === null) {
           throw new StateNotPromotable(
             `observation ${input.observationId} is a state, and a state has no instant to preserve`,
           );
         }
+        // An insert from a select is positional: the aliases below are for
+        // the reader, and it is the order that binds each value to its
+        // column, so the select list is in COLUMNS' order. The parameters
+        // need no casts; Postgres types each from the column it lands in,
+        // verified on 17.7 through pg_prepared_statements.
         const row = await trx
           .insertInto("permanent_record")
-          .values({
-            record_id: recordId,
-            observation_id: input.observationId,
-            namespace_id: input.namespaceId,
-            original_dated_at: source.dated_at,
-            promoted_at: promotedAt,
-            rescued_by: input.rescuedBy,
-            confidence: input.confidence,
-          })
+          .columns(COLUMNS)
+          .expression((eb) =>
+            eb
+              .selectFrom("observation")
+              .select([
+                eb.val(recordId).as("record_id"),
+                "observation_id",
+                eb.val(input.namespaceId).as("namespace_id"),
+                "dated_at as original_dated_at",
+                eb.val(promotedAt).as("promoted_at"),
+                eb.val(input.rescuedBy).as("rescued_by"),
+                eb.val(input.confidence).as("confidence"),
+              ])
+              .where("observation_id", "=", input.observationId),
+          )
           .returning(COLUMNS)
           .executeTakeFirstOrThrow();
         return toStored(row);
