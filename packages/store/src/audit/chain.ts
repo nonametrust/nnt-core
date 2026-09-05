@@ -3,7 +3,7 @@ import { sql, type Selectable } from "kysely";
 import type { Clock } from "../clock.js";
 import type { KeyRing } from "../crypto.js";
 import type { Db, Schema } from "../db.js";
-import { NothingToSeal, mapPgError } from "../errors.js";
+import { DayNotClosed, NothingToSeal, SealMismatch, mapPgError } from "../errors.js";
 
 /**
  * The audit chain. Each entry is hashed over the one before it, so that a
@@ -50,15 +50,19 @@ export interface StoredAuditEntry {
 }
 
 /**
- * Which of the verifier's three checks a row failed. `linkage`: its
+ * Which of the verifier's four checks a row failed. `linkage`: its
  * prev_sha256 is not the preceding entry's hash, or the genesis constant for
  * the first row. `entry_hash`: its entry_sha256 is not sha256 over its
  * prev_sha256 and its stored canonical string; the database's half. `canonical`:
- * its stored canonical string is not the rendering of its own fields; the
- * verifier's half. The checks run in that order, so a rewritten canonical
- * reports as a hash break and a rewritten body as a fidelity break.
+ * its stored canonical string is not the rendering of its own fields as this
+ * side reads them; the verifier's half. `body`: the stored body is not, as a
+ * jsonb value, the body inside its canonical string; the verifier's half
+ * again, asked of the database, for a rewrite below the precision a
+ * JavaScript number carries. The checks run in that order, so a rewritten
+ * canonical reports as a hash break and a rewritten body as a fidelity
+ * break, and a rewrite only SQL can see is named as such.
  */
-export type VerifyFailure = "linkage" | "entry_hash" | "canonical";
+export type VerifyFailure = "linkage" | "entry_hash" | "canonical" | "body";
 
 export type VerifyResult = { ok: true } | { ok: false; brokenAt: string; reason: VerifyFailure };
 
@@ -144,6 +148,7 @@ function render(e: {
     if (value.includes(SEPARATOR)) {
       throw new RangeError(`an audit entry's ${name} contains a newline, the canonical form's separator`);
     }
+    refuseUnstorable(value, `an audit entry's ${name}`);
   }
   const bodyJson = canonicalJson(e.body);
   if (bodyJson === undefined) {
@@ -184,6 +189,7 @@ function canonicalJson(value: unknown): string | undefined {
     case "boolean":
       return v ? "true" : "false";
     case "string":
+      refuseUnstorable(v, "an audit entry's body string");
       return JSON.stringify(v);
     case "number":
       if (!Number.isFinite(v)) {
@@ -203,9 +209,30 @@ function canonicalJson(value: unknown): string | undefined {
   const members: string[] = [];
   for (const key of Object.keys(record).sort()) {
     const rendered = canonicalJson(record[key]);
-    if (rendered !== undefined) members.push(`${JSON.stringify(key)}:${rendered}`);
+    if (rendered === undefined) continue;
+    refuseUnstorable(key, "an audit entry's body key");
+    members.push(`${JSON.stringify(key)}:${rendered}`);
   }
   return `{${members.join(",")}}`;
+}
+
+// A high surrogate with no low one after it, or a low one with no high one
+// before it.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+// Two things a JavaScript string can hold that the row cannot: a NUL, which
+// neither a text column nor a jsonb string accepts, and a lone surrogate,
+// which jsonb refuses and which the wire encoding would otherwise replace
+// with U+FFFD, storing a string the writer did not give. Either would come
+// back from `append` as the driver's error; the refusal belongs here, as a
+// RangeError this package owns, before anything is hashed.
+function refuseUnstorable(s: string, what: string): void {
+  if (s.includes("\u0000")) {
+    throw new RangeError(`${what} contains NUL, which the database cannot store`);
+  }
+  if (LONE_SURROGATE.test(s)) {
+    throw new RangeError(`${what} contains a lone surrogate, which is not a character`);
+  }
 }
 
 /**
@@ -277,9 +304,23 @@ export class AuditChain {
    * Walks the table in sequence order and returns the first entry that
    * disagrees with the chain, with which check it failed. Each row is
    * checked for linkage to the one before it, for its hash over its stored
-   * canonical string, and for that string being the rendering of its own
-   * fields; the first two are what the trigger held at the insert, the third
-   * is what only this side can hold.
+   * canonical string, for that string being the rendering of its own fields,
+   * and for its body being, as a jsonb value, the body inside that string;
+   * the first two are what the trigger held at the insert, the last two are
+   * what only this side can hold.
+   *
+   * The fourth check is asked of the database, and it is the one place SQL
+   * touches the canonical form. jsonb keeps more numeric precision than a
+   * JavaScript double, so a rewrite of `0.1` to `0.10000000000000000001`
+   * re-derives to the same canonical string here and the third check cannot
+   * see it, while a SQL reader can. The comparison is jsonb *equality*, a
+   * value comparison that is stable across versions in the way a `::text`
+   * rendering is not, so it does not reintroduce the dependency the boundary
+   * exists to avoid: nothing here asks Postgres to render JSON, only to say
+   * whether two values are the same. The cast is guarded, since a canonical
+   * string rewritten into something that is not JSON would otherwise fail
+   * the whole page instead of naming its row; the hash check names that row
+   * first in any case.
    *
    * An empty table verifies. There is nothing in it to be wrong, and a fresh
    * deployment passes its first audit rather than failing it for having no
@@ -294,7 +335,18 @@ export class AuditChain {
     let prev = GENESIS_SHA256;
     let after: string | null = null;
     for (;;) {
-      let query = this.db.selectFrom("audit_entry").select(COLUMNS).orderBy("seq").limit(PAGE);
+      let query = this.db
+        .selectFrom("audit_entry")
+        .select([
+          ...COLUMNS,
+          sql<boolean>`case
+            when pg_input_is_valid(split_part(canonical, E'\\n', 5), 'jsonb')
+            then body = split_part(canonical, E'\\n', 5)::jsonb
+            else false
+          end`.as("body_matches"),
+        ])
+        .orderBy("seq")
+        .limit(PAGE);
       if (after !== null) query = query.where("seq", ">", after);
       const rows = await query.execute();
       for (const row of rows) {
@@ -309,6 +361,9 @@ export class AuditChain {
         });
         if (row.canonical !== expected) {
           return { ok: false, brokenAt: row.seq, reason: "canonical" };
+        }
+        if (!row.body_matches) {
+          return { ok: false, brokenAt: row.seq, reason: "body" };
         }
         prev = row.entry_sha256;
         after = row.seq;
@@ -328,11 +383,40 @@ export class AuditChain {
    *
    * The head as of the close, not the last entry that occurred on the day:
    * a day on which nothing was decided is still a day the chain stood at
-   * some head, and a seal for every day is what an auditor walks. A day
-   * before the first entry has no head to seal and is refused by class.
+   * some head, and a seal for every day is what an auditor walks. The head
+   * at close is the entry with the highest sequence number whose instant
+   * precedes the close. That is the tie rule under writer clock skew: an
+   * entry with a higher sequence but an earlier instant is under the seal,
+   * and one with a lower sequence but a later instant is not; the seal
+   * follows the instants the entries themselves carry, which is what the
+   * chain hashes over. A day before the first entry has no head to seal and
+   * is refused by class.
+   *
+   * A day that has not closed on the clock is refused. A seal fixes a head
+   * that later entries of an open day would contradict, and the table
+   * refuses rewrites, so it could not be corrected.
+   *
+   * Re-running is the normal case for a nightly job, not an error. A day
+   * already sealed over the same head returns; one whose head at close has
+   * moved since is SealMismatch, since that difference is the signal the
+   * seal exists to give, and it is raised rather than overwritten. Two runs
+   * arriving at once both find no seal and both insert; the loser's unique
+   * violation is caught once and it re-reads, so it too returns or raises
+   * by the same comparison.
+   *
+   * This does not verify the chain first. The seal states what the head
+   * was; `verify` states that the chain is internally consistent. A seal
+   * over a broken chain does not hide the break, and refusing to seal would
+   * remove the auditor's means of bounding when the break happened, since
+   * the last good seal is that evidence. A walk of the whole table inside
+   * every seal would also grow with the table for no gain. The nightly job
+   * calls `verify` first and refuses to seal when it fails.
    */
   async sealDay(day: string): Promise<void> {
     const close = dayClose(day);
+    if (this.clock.now().getTime() < close.getTime()) {
+      throw new DayNotClosed(`${day} has not closed; it cannot be sealed before ${close.toISOString()}`);
+    }
     const terminal = await this.db
       .selectFrom("audit_entry")
       .select(["seq", "entry_sha256"])
@@ -347,17 +431,39 @@ export class AuditChain {
       .update(Buffer.from(day, "utf8"))
       .update(terminal.entry_sha256)
       .digest();
-    await this.db
-      .insertInto("audit_day")
-      .values({
-        day,
-        terminal_seq: terminal.seq,
-        terminal_sha256: terminal.entry_sha256,
-        hmac,
-        sealed_at: this.clock.now(),
-      })
-      .execute();
+    for (let attempt = 0; ; attempt++) {
+      const existing = await this.db
+        .selectFrom("audit_day")
+        .select(["terminal_sha256", "hmac"])
+        .where(sql<boolean>`day = ${day}::date`)
+        .executeTakeFirst();
+      if (existing) {
+        if (existing.terminal_sha256.equals(terminal.entry_sha256) && existing.hmac.equals(hmac)) return;
+        throw new SealMismatch(
+          `${day} is already sealed over a different head; the head at its close is now entry ${terminal.seq}`,
+        );
+      }
+      try {
+        await this.db
+          .insertInto("audit_day")
+          .values({
+            day,
+            terminal_seq: terminal.seq,
+            terminal_sha256: terminal.entry_sha256,
+            hmac,
+            sealed_at: this.clock.now(),
+          })
+          .execute();
+        return;
+      } catch (err) {
+        if (attempt > 0 || !isUniqueViolation(err)) throw err;
+      }
+    }
   }
+}
+
+function isUniqueViolation(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { code?: unknown }).code === "23505";
 }
 
 // The instant at which `day`, a calendar date in UTC, ends: the first

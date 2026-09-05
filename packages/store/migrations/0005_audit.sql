@@ -64,19 +64,31 @@ create table audit_day (
 -- the transaction and cannot leak.
 --
 -- new.seq is already assigned when a BEFORE INSERT trigger runs, verified on
--- 17.7; the predecessor is the highest sequence below it.
+-- 17.7, and it was drawn by nextval before the lock above was taken. So the
+-- head is read with no filter on seq. A writer that drew N and then queued
+-- behind a transaction already holding the lock, which drew N+1 and
+-- committed following the same head, must find N+1 as the head and be
+-- refused. Filtered to `seq < N`, it would find the old head, pass, and two
+-- committed rows would claim one predecessor: a permanent linkage break at
+-- N+1 that no verifier could tell from a tamper. A BEFORE ROW trigger cannot
+-- see its own row and can see the rows inserted earlier in its own
+-- statement, verified on 17.7 with a two-row insert whose second row
+-- followed its first; that is the visibility this wants. The head's sequence
+-- must also be below the new row's, so that sequence order is chain order
+-- as a property the database holds rather than an accident of scheduling.
 create function audit_entry_chain() returns trigger language plpgsql as $$
-declare prev bytea; expected bytea;
+declare head_seq bigint; prev bytea; expected bytea;
 begin
   -- Two concurrent appends would otherwise read the same predecessor and both
   -- claim to follow it. The lock serialises them for the transaction.
   perform pg_advisory_xact_lock(8140202601);
 
-  select entry_sha256 into prev from audit_entry where seq < new.seq order by seq desc limit 1;
+  select seq, entry_sha256 into head_seq, prev from audit_entry order by seq desc limit 1;
   if prev is null then
     prev := decode(repeat('00', 32), 'hex');
   end if;
-  if new.prev_sha256 is distinct from prev then
+  if new.prev_sha256 is distinct from prev
+     or (head_seq is not null and head_seq >= new.seq) then
     raise exception using
       errcode = 'NNT02',
       message = 'audit entry does not follow the chain head';
@@ -102,7 +114,15 @@ create trigger audit_entry_chained
 -- rewrite the verifier exists to find, and a DELETE of the head leaves
 -- nothing behind it to disagree. NNT01 is shared with the other append-only
 -- tables, since it is one concept; the table name is in the message.
-create function audit_entry_append_only() returns trigger language plpgsql as $$
+--
+-- audit_day is under the same function. Without the derived key a seal
+-- cannot be forged, but with UPDATE and DELETE open the seals after a
+-- rewrite point could be removed and leave a gap where the evidence of when
+-- the rewrite happened used to be. With the trigger, removing a seal costs
+-- the same privilege as removing a chain row. A re-run of the nightly job
+-- over the same head finds its own seal and returns, so nothing legitimate
+-- ever needs to write a seal twice.
+create function audit_append_only() returns trigger language plpgsql as $$
 begin
   raise exception using
     errcode = 'NNT01',
@@ -112,4 +132,8 @@ $$;
 
 create trigger audit_entry_no_rewrite
   before update or delete on audit_entry
-  for each row execute function audit_entry_append_only();
+  for each row execute function audit_append_only();
+
+create trigger audit_day_no_rewrite
+  before update or delete on audit_day
+  for each row execute function audit_append_only();

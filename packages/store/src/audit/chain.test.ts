@@ -5,10 +5,14 @@ import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
-import { ChainBroken, NothingToSeal, StoreError, mapPgError } from "../errors.js";
 import {
-  AUDIT_DAY_SEAL_LABEL, AuditChain, canonicalForm, entrySha256, type VerifyResult,
+  ChainBroken, DayNotClosed, NothingToSeal, SealMismatch, StoreError, mapPgError,
+} from "../errors.js";
+import {
+  AUDIT_DAY_SEAL_LABEL, AuditChain, CHAIN_LOCK_KEY, canonicalForm, entrySha256, type VerifyResult,
 } from "./chain.js";
+
+const ONE_DAY_MS = 86_400_000;
 
 let db: Db;
 let done: () => Promise<void>;
@@ -205,6 +209,50 @@ describe("the chain", () => {
     expect(row.body).toEqual({ i: 99 });
   });
 
+  // jsonb keeps more numeric precision than a JavaScript double, so a rewrite
+  // below that precision re-derives to the same canonical form and the check
+  // above cannot see it. No JavaScript reader can either, but a SQL reader
+  // can, and the fidelity claim is about the row, not about one reader of
+  // it. The fourth check compares the body to the canonical form's body as
+  // jsonb values, in SQL, and it is the one that names this row.
+  it("localises a rewrite below double precision, which no JavaScript reader can see", async () => {
+    const stored = await chain.append({
+      policyVersion: "v0", kind: "precise", body: { x: 0.1, n: 9007199254740992 },
+    });
+    const result = await tampered(async (trx) => {
+      await sql`update audit_entry
+                set body = '{"x":0.10000000000000000001,"n":9007199254740993}'::jsonb
+                where seq = ${stored.seq}`.execute(trx);
+    });
+    expect(result).toEqual({ ok: false, brokenAt: stored.seq, reason: "body" });
+    await guardIsBack(stored.seq);
+  });
+
+  // The boundary itself, pinned as designed rather than inferred. A row
+  // whose predecessor and hash are right but whose canonical form is not a
+  // rendering of its own body passes the live trigger, because the database
+  // holds linkage and hash integrity and nothing else; only the verifier
+  // holds fidelity, and only it refuses the row.
+  it("accepts, by design, a row the trigger cannot fault and the verifier alone rejects", async () => {
+    const head = (await chain.head())!;
+    const at = clock.now();
+    const canonical = canonicalForm({ occurredAt: at, policyVersion: "v0", kind: "unfaithful", body: { i: 1 } });
+    let result: VerifyResult | undefined;
+    let planted: string | undefined;
+    await db.transaction().execute(async (trx) => {
+      const row = await trx.insertInto("audit_entry").values({
+        occurred_at: at, policy_version: "v0", kind: "unfaithful", body: '{"i":2}',
+        canonical, prev_sha256: head.entrySha256, entry_sha256: entrySha256(head.entrySha256, canonical),
+      }).returning(["seq"]).executeTakeFirstOrThrow();
+      planted = row.seq;
+      result = await new AuditChain(trx, clock, ring).verify();
+      throw ROLLBACK;
+    }).catch((e: unknown) => { if (e !== ROLLBACK) throw e; });
+    expect(planted).toMatch(/^\d+$/);
+    expect(result).toEqual({ ok: false, brokenAt: planted, reason: "canonical" });
+    expect(await chain.verify()).toEqual({ ok: true });
+  });
+
   it("localises a rewritten canonical form to its sequence number, as a hash break", async () => {
     const rows = await db.selectFrom("audit_entry").select(["seq"]).orderBy("seq", "desc").limit(3).execute();
     const target = rows[2]!;
@@ -247,6 +295,19 @@ describe("the chain", () => {
     await guardIsBack(first.seq);
   });
 
+  // The clock stands at the opening instant of 2026-09-07. A seal fixes the
+  // head as of a day's close, and a day that has not closed has no such
+  // head yet: later entries of that day would contradict the seal, and once
+  // the table refuses rewrites the seal could not be corrected.
+  it("refuses to seal a day that has not closed, by class, and seals nothing", async () => {
+    await expect(chain.sealDay("2026-09-07")).rejects.toBeInstanceOf(DayNotClosed);
+    await expect(chain.sealDay("2026-09-08")).rejects.toBeInstanceOf(DayNotClosed);
+    await expect(chain.sealDay("2026-09-07")).rejects.toBeInstanceOf(StoreError);
+    expect(await db.selectFrom("audit_day").selectAll().execute()).toEqual([]);
+    // 2026-09-09T00:00Z: the seventh and the eighth have closed.
+    clock.advance(2 * ONE_DAY_MS);
+  });
+
   it("seals a day over its terminal hash", async () => {
     await chain.sealDay("2026-09-07");
     const row = await db.selectFrom("audit_day").selectAll().executeTakeFirstOrThrow();
@@ -262,7 +323,7 @@ describe("the chain", () => {
     expect(row.day).toBe("2026-09-07");
     expect(row.terminal_seq).toBe(head.seq);
     expect(row.terminal_sha256.equals(head.entrySha256)).toBe(true);
-    expect(row.sealed_at.toISOString()).toBe("2026-09-07T00:00:00.000Z");
+    expect(row.sealed_at.toISOString()).toBe("2026-09-09T00:00:00.000Z");
     const expected = createHmac("sha256", ring.deriveKey(AUDIT_DAY_SEAL_LABEL))
       .update(Buffer.concat([Buffer.from("2026-09-07", "utf8"), head.entrySha256]))
       .digest();
@@ -288,10 +349,52 @@ describe("the chain", () => {
     await expect(chain.sealDay("2026-09-06")).rejects.toBeInstanceOf(StoreError);
   });
 
-  it("refuses a second seal of the same day, and a day that is not one", async () => {
-    await expect(chain.sealDay("2026-09-07")).rejects.toMatchObject({ code: "23505" });
+  // A nightly job re-runs; that is the normal case, not an error. Over the
+  // same head the second run finds its own seal and returns.
+  it("returns quietly when re-run over the same head, and writes nothing", async () => {
+    const before = await db.selectFrom("audit_day").selectAll().orderBy("day").execute();
+    await chain.sealDay("2026-09-07");
+    await chain.sealDay("2026-09-08");
+    expect(await db.selectFrom("audit_day").selectAll().orderBy("day").execute()).toEqual(before);
+  });
+
+  it("refuses a day that is not one", async () => {
     await expect(chain.sealDay("2026-09-07T00:00:00Z")).rejects.toBeInstanceOf(RangeError);
     await expect(chain.sealDay("yesterday")).rejects.toBeInstanceOf(RangeError);
+  });
+
+  // Without the key a seal cannot be forged, but with UPDATE and DELETE open
+  // the seals after a rewrite point could be removed and leave a gap. With
+  // the trigger, removing a seal costs the same privilege as removing a row.
+  it("refuses a rewrite or removal of a seal, by SQLSTATE", async () => {
+    await expect(sql`update audit_day set hmac = decode(repeat('00',32),'hex')`.execute(db))
+      .rejects.toMatchObject({ code: "NNT01" });
+    await expect(sql`delete from audit_day`.execute(db)).rejects.toMatchObject({ code: "NNT01" });
+    expect((await db.selectFrom("audit_day").selectAll().execute()).length).toBe(2);
+  });
+
+  // The seal states what the head was; verify states that the chain is
+  // consistent. A seal over a broken chain does not hide the break, and a
+  // refusal would remove the auditor's means of bounding when it happened,
+  // since the last good seal is that evidence. The nightly job verifies
+  // first; sealDay does not walk the table.
+  it("seals over a broken chain rather than verify first, so the last good seal bounds the break", async () => {
+    // 2026-09-10T00:00Z, so the ninth has closed and is unsealed.
+    clock.advance(ONE_DAY_MS);
+    const first = await db.selectFrom("audit_entry").select(["seq"]).orderBy("seq").executeTakeFirstOrThrow();
+    let sealed: string | undefined;
+    await db.transaction().execute(async (trx) => {
+      await sql`alter table audit_entry disable trigger audit_entry_no_rewrite`.execute(trx);
+      await sql`update audit_entry set body = '{"n":999}'::jsonb where seq = ${first.seq}`.execute(trx);
+      const inside = new AuditChain(trx, clock, ring);
+      expect((await inside.verify()).ok).toBe(false);
+      await inside.sealDay("2026-09-09");
+      sealed = (await trx.selectFrom("audit_day").select(sql<string>`day::text`.as("day"))
+        .orderBy("day", "desc").executeTakeFirstOrThrow()).day;
+      throw ROLLBACK;
+    }).catch((e: unknown) => { if (e !== ROLLBACK) throw e; });
+    expect(sealed).toBe("2026-09-09");
+    await guardIsBack(first.seq);
   });
 });
 
@@ -327,6 +430,46 @@ describe("the lock", () => {
     });
     await expect(second).rejects.toMatchObject({ code: "NNT02" });
     expect((await chain.head())!.entrySha256.equals(winner.hash)).toBe(true);
+    expect(await chain.verify()).toEqual({ ok: true });
+  });
+
+  // The sequence number is drawn by nextval before the trigger takes the
+  // lock. A raw writer that drew N and then queued behind a transaction
+  // already holding the lock, which draws N+1 and commits, must not be
+  // allowed to follow the head N+1 already followed. A predecessor query
+  // filtered to `seq < N` would let it, and two committed rows would claim
+  // one head: a permanent linkage break at N+1 that looks like a tamper.
+  it("refuses a writer that drew its sequence number before queueing, so two rows never share a head", async () => {
+    await chain.append({ policyVersion: "v0", kind: "anchor", body: null });
+    const at = clock.now();
+    const forge = (head: Buffer, n: number) => {
+      const canonical = canonicalForm({ occurredAt: at, policyVersion: "v0", kind: "queued", body: { n } });
+      return { n, canonical, hash: entrySha256(head, canonical) };
+    };
+    const insert = (trx: Db, prev: Buffer, e: ReturnType<typeof forge>) =>
+      sql`insert into audit_entry
+            (occurred_at, policy_version, kind, body, canonical, prev_sha256, entry_sha256)
+          values (${at}, 'v0', 'queued', ${JSON.stringify({ n: e.n })}::jsonb, ${e.canonical}, ${prev}, ${e.hash})`
+        .execute(trx);
+    let queued: Promise<unknown> | undefined;
+    let settled = false;
+    let head: Buffer | undefined;
+    await db.transaction().execute(async (holder) => {
+      await sql`select pg_advisory_xact_lock(${sql.lit(CHAIN_LOCK_KEY)})`.execute(holder);
+      head = (await new AuditChain(holder, clock, ring).head())!.entrySha256;
+      // Draws its sequence number now, then blocks in its trigger.
+      queued = insert(db, head, forge(head, 1));
+      queued.catch(() => undefined).finally(() => { settled = true; });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(settled, "the queued writer got through while the lock was held").toBe(false);
+      // Draws the next sequence number, follows the same head, commits.
+      await insert(holder, head, forge(head, 2));
+    });
+    const outcome = await queued!.then(() => "accepted", (e: unknown) => e);
+    const onHead = await db.selectFrom("audit_entry").select(["seq"])
+      .where("prev_sha256", "=", head!).execute();
+    expect(onHead.length, "two committed rows claim one head").toBe(1);
+    expect(outcome).toMatchObject({ code: "NNT02" });
     expect(await chain.verify()).toEqual({ ok: true });
   });
 
@@ -377,6 +520,14 @@ describe("verify at scale", () => {
     });
     expect(result).toEqual({ ok: false, brokenAt: deep, reason: "canonical" });
     await guardIsBack(deep);
+  });
+
+  // The bulk rows above carry the seventh's instant under higher sequence
+  // numbers, so the head at that day's close is no longer the one sealed.
+  // A re-run over a moved head is the signal the seal exists to give.
+  it("refuses to re-seal a day whose head at close has moved, by class", async () => {
+    await expect(chain.sealDay("2026-09-07")).rejects.toBeInstanceOf(SealMismatch);
+    await expect(chain.sealDay("2026-09-07")).rejects.toBeInstanceOf(StoreError);
   });
 });
 
@@ -472,6 +623,21 @@ describe("canonicalForm", () => {
     const a = canonicalForm({ occurredAt: at, policyVersion: "v0", kind: "k", body: { when } });
     const b = canonicalForm({ occurredAt: at, policyVersion: "v0", kind: "k", body: { when: when.toISOString() } });
     expect(a).toBe(b);
+  });
+
+  // jsonb refuses both, later, as the driver's error out of `append`. The
+  // refusal belongs here, where it is a RangeError this package owns.
+  it("refuses a NUL or a lone surrogate in a body string or key", () => {
+    const bodies: unknown[] = [
+      { s: "a\u0000b" }, { "k\u0000": 1 }, { s: "\ud800" }, ["x\udc00"], { k: ["\ud83d"] },
+    ];
+    for (const body of bodies) {
+      expect(() => canonicalForm({ occurredAt: at, policyVersion: "v0", kind: "k", body })).toThrow(RangeError);
+    }
+    expect(() => canonicalForm({ occurredAt: at, policyVersion: "v0", kind: "k\u0000", body: null }))
+      .toThrow(RangeError);
+    expect(() => canonicalForm({ occurredAt: at, policyVersion: "v0", kind: "k", body: { s: "🙂 paired" } }))
+      .not.toThrow();
   });
 
   it("distinguishes a nested null from an absent key", () => {

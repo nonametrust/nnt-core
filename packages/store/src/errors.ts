@@ -39,6 +39,15 @@ export class PermanentRecordNotFound extends StoreError {}
 // close of the day named. There is no chain head to seal, and a seal row
 // pointing at nothing would be a claim about a history that did not exist.
 export class NothingToSeal extends StoreError {}
+// Also raised in TypeScript, from `sealDay`, for a day whose close is not yet
+// past on the clock. A seal fixes a head that later entries of an open day
+// would contradict, and once sealed it cannot be corrected.
+export class DayNotClosed extends StoreError {}
+// Also raised in TypeScript, from `sealDay`, when the day already carries a
+// seal and the head at its close is no longer the one that was sealed. A
+// re-run over the same head returns quietly; this difference is the signal
+// the seal exists to give, and it is raised rather than overwritten.
+export class SealMismatch extends StoreError {}
 export class MigrationDrift extends StoreError {}
 
 const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreError> = {
