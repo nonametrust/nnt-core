@@ -24,12 +24,21 @@ export type Channel = (typeof CHANNELS)[number];
 export const channelSchema = z.enum(CHANNELS);
 
 /**
- * An event happened at an instant and decays from it. A state holds over an
- * interval, is refreshed while it holds, and never enters a timing
- * computation. The distinction exists because the study's S3 signal is a
- * standing condition that was credited to every window including the
- * seven-day one, while controls could not measure it at all, which inflated
- * the headline in one direction by three points.
+ * An event happened at an instant. A state holds over an interval. The
+ * distinction exists because the study's S3 signal is a standing condition
+ * that was credited to every window including the seven-day one, while
+ * controls could not measure it at all, which inflated the headline in one
+ * direction by three points.
+ *
+ * What is enforced: a state never enters a timing computation. `datedAt` in
+ * `./timing.ts` is the single reader of a date off an observation and returns
+ * null for a state; `timing.test.ts` is the gate. The shape itself, an
+ * instant with no interval or an interval with no instant, is gated by
+ * `observation.test.ts`.
+ *
+ * Not yet enforced: that an event decays from its instant, and that a state
+ * is refreshed while it holds. Both belong to a later milestone and nothing
+ * in this package implements them.
  */
 export const EVIDENCE_KINDS = ["event", "state"] as const;
 export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
