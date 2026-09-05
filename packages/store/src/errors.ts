@@ -19,6 +19,10 @@ export class NamespaceNotFound extends StoreError {}
 // caller's condition, not the store's defect, and a generic Error would make
 // the two indistinguishable at the call site.
 export class ObservationNotFound extends StoreError {}
+// Also raised in TypeScript, and from `suppress` and `refresh` as well as from
+// `get`: an update that matched no row would otherwise resolve as success
+// about a tag that was never touched.
+export class TagNotFound extends StoreError {}
 // Raised in TypeScript, before anything is read or written. A caller-supplied
 // idempotency key that differs from the derived one is refused rather than
 // replaced: replaced, the caller would later ask for the key it wrote and be

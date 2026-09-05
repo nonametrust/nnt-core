@@ -29,6 +29,20 @@ export interface Schema {
     payload_tag: Buffer;
     payload_ciphertext: Buffer;
   };
+  // What a tag stores and nothing more. There is deliberately no strength,
+  // score or decayed column here or in 0003_tag.sql; strength is derived by
+  // strength.ts, and tag.test.ts reads the live catalogue to hold that.
+  tag: {
+    tag_id: string;
+    namespace_id: string;
+    observation_id: string;
+    channel: string;
+    g0: number;
+    tagged_at: Date;
+    refresh_count: number;
+    saturation_state: string;
+    suppression_factor: number;
+  };
 }
 
 export type Db = Kysely<Schema>;

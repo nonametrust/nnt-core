@@ -8,3 +8,5 @@ export { migrate } from "./migrate.js";
 export * from "./crypto.js";
 export * from "./repositories/namespace.js";
 export * from "./repositories/observation.js";
+export * from "./repositories/tag.js";
+export * from "./strength.js";
