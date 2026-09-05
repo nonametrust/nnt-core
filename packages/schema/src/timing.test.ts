@@ -1,6 +1,3 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 import { datedAt } from "./timing.js";
 
@@ -9,6 +6,9 @@ const src = {
   ref: "op:1", fetchedAt: "2026-09-05T10:00:00.000Z",
 };
 
+// The gate for the claim that datedAt is the only reader of a date off an
+// observation is gates/single-date-reader.test.ts at the repository root. It
+// used to live here, and so scanned this package alone.
 describe("datedAt", () => {
   it("returns the instant for an event", () => {
     expect(datedAt({
@@ -43,43 +43,5 @@ describe("datedAt", () => {
       validFrom: "2026-09-01T00:00:00.000Z", validUntil: "2026-09-03T00:00:00.000Z",
       source: src, payload: {},
     })).toBeNull();
-  });
-
-  // The claim in channel.ts and timing.ts is that datedAt is the only reader
-  // of a date off an observation. After narrowing on evidenceKind, observedAt
-  // and validFrom are both readable with full type support, and reading
-  // validFrom where a date was meant is the substitution that produced the S3
-  // defect. This test is the gate for that claim: every module in this package
-  // other than the type definition and the reader must not name those fields.
-  it("no module outside timing.ts reads a date off an observation", () => {
-    const srcDir = dirname(fileURLToPath(import.meta.url));
-    // Exempt by path relative to src, not by basename: a later
-    // src/windows/timing.ts must not inherit the exemption for free.
-    const exempt = new Set(["observation.ts", "timing.ts"]);
-    // Every extension the tsconfig admits, so none of them is a way past, and
-    // both suffixes vitest collects, matching the build exclusion.
-    const source = /\.(ts|mts|cts|tsx)$/;
-    const test = /\.(test|spec)\.(ts|mts|cts|tsx)$/;
-    const dateFields = /\b(observedAt|validFrom|validUntil)\b/;
-    const offenders: string[] = [];
-    for (const entry of readdirSync(srcDir, { recursive: true, withFileTypes: true })) {
-      if (!source.test(entry.name) || test.test(entry.name)) continue;
-      const file = join(entry.parentPath, entry.name);
-      // stat follows a symlink; the dirent's own isFile() is false for one,
-      // which let a symlinked module ship through tsc while this gate skipped it.
-      if (!statSync(file).isFile()) continue;
-      const rel = relative(srcDir, file);
-      if (exempt.has(rel)) continue;
-      readFileSync(file, "utf8").split("\n").forEach((line, i) => {
-        if (dateFields.test(line)) {
-          offenders.push(`${rel}:${i + 1}: ${line.trim()}`);
-        }
-      });
-    }
-    expect(
-      offenders,
-      "these lines read a date field off an observation; go through datedAt() in timing.ts instead:\n" +
-        offenders.join("\n"),
-    ).toEqual([]);
   });
 });

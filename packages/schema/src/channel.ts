@@ -32,9 +32,9 @@ export const channelSchema = z.enum(CHANNELS);
  *
  * What is enforced: a state never enters a timing computation. `datedAt` in
  * `./timing.ts` is the single reader of a date off an observation and returns
- * null for a state; `timing.test.ts` is the gate. The shape itself, an
- * instant with no interval or an interval with no instant, is gated by
- * `observation.test.ts`.
+ * null for a state; `gates/single-date-reader.test.ts` at the repository root
+ * is the gate. The shape itself, an instant with no interval or an interval
+ * with no instant, is gated by `observation.test.ts`.
  *
  * Not yet enforced: that an event decays from its instant, and that a state
  * is refreshed while it holds. Both belong to a later milestone and nothing

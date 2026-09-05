@@ -7,8 +7,8 @@ import { validateObservation } from "./payloads.js";
 
 // fileURLToPath, not URL.pathname: pathname is percent-encoded, so a checkout
 // under a directory with a space or a non-ASCII character in its name (this
-// team has several) made this suite alone fail with ENOENT. timing.test.ts and
-// the root gate already convert this way.
+// team has several) made this suite alone fail with ENOENT. The root gates
+// already convert this way.
 const dir = fileURLToPath(new URL("../fixtures/", import.meta.url));
 
 function fixture(channel: string): Record<string, unknown> {
