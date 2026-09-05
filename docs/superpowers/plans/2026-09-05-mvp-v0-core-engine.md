@@ -1055,13 +1055,30 @@ git commit -m "Schema: per-channel payload validators, golden fixtures, and the 
 
 - [ ] **Step 1: Write the contract document**
 
-One page, in Turkish, addressed to the indexer developer. It covers the seven
-channels and what belongs in each; the event and state distinction and why a
-state must never carry a date; the namespace rules including muxed resolution
-to the base address; the source fields and why the producer version is
-separate; how the idempotency key is derived and what the re-run guarantee
-means in practice; and one worked example per channel pointing at its golden
-fixture.
+One page, in Turkish, addressed to the indexer developer. Every rule below came
+out of a review and several of them cost a round to find, so none is optional.
+
+- The seven channels and what belongs in each, plus which producer observes
+  which: the chain indexer populates volume, protocol, cluster proximity and
+  content; the gateway populates latency, price and address integrity.
+- Event against state, and why a state carries an interval and never an
+  instant: it is the defect the study's undated signal produced, credited to
+  every window while the control arm could not measure it at all.
+- One transition per address observation. A change and a revert are two
+  observations with two source references, and that pair is the signal, not a
+  flag on a single record.
+- Direction on the volume channel is relative to the namespace, so `in` means
+  value reached the counterparty. Give the mapping rule from a Horizon record.
+- The namespace rules, including that a muxed address must be resolved to its
+  base address, and stated plainly: **that rule is the indexer's to follow and
+  the schema does not yet check it.** M1 adds the gate.
+- The source fields, why the producer version is a separate field, and that
+  timestamps are UTC ending in Z.
+- How the key is derived, what the re-run guarantee means in practice, and that
+  the key covers the namespace so both sides of one payment survive.
+- That `observationId`, `ingestedAt` and `idempotencyKey` are assigned by the
+  engine and rejected if they appear on the wire.
+- One worked example per channel, pointing at its golden fixture.
 
 - [ ] **Step 2: Write the repository README**
 
@@ -1083,6 +1100,12 @@ pushes and therefore first runs CI.
   `.cts` and `.tsx` as well. The date-field gate already skips every test
   extension, so a `.test.mts` would today be compiled into `dist` while the gate
   correctly ignored it.
+- Move the checksum gate on Stellar account ids to the repository root and scan
+  every tracked file, not only `packages/schema`. It works and it scans its own
+  file, which the equivalent gate in the sibling repository failed to do on the
+  day it was added, but a second package or a root document is unscanned today.
+  This repository goes public at the v0 tag and the artefacts behind this
+  project identify defrauded accounts, so the gate has to cover everything.
 - Close the one bypass the date-field gate has. It calls `isFile()` on the
   directory entry, which is false for a symlink, so a symlinked module inside
   `src` is skipped by the gate while the compiler still includes it and it
