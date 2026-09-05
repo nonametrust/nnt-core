@@ -184,7 +184,14 @@ Envelope encryption, two levels.
   a fallback key is a key that reaches production.
 - **Data key.** 32 random bytes per namespace, generated when the namespace row
   is created, encrypted with AES-256-GCM under the master key, stored in
-  `data_key_wrapped`.
+  `data_key_wrapped`. **The wrap carries the namespace identifier as its own
+  associated data**, so a wrapped key copied into another namespace's row does
+  not unwrap there. Without that binding, copying A's wrapped key into B's row
+  *before* A is shredded leaves a live copy of A's data key behind the shred,
+  while A's observation rows stay in place by design and their associated data
+  is reconstructible from the rows themselves. Anyone later holding the master
+  key and the database recovers A's evidence. That is shred-evasion, and
+  crypto-shredding is the only erasure this design has.
 - **Payload.** The full validated observation is serialised to JSON and
   encrypted with AES-256-GCM under that namespace's data key.
 
