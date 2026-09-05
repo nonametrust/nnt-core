@@ -1,2 +1,2 @@
-// Placeholder entry point. Task 2 replaces this with the observation schema.
+// Placeholder entry point. Task 6 replaces this with the observation schema.
 export {};
