@@ -1056,20 +1056,41 @@ State what the repository holds, that the engine and the indexer share it
 because the observation schema must live in one place, that `packages/schema`
 is the only package the indexer depends on, and how to run the tests.
 
-- [ ] **Step 3: Verify the whole suite and the build**
+- [ ] **Step 3: Harden the three gates the reviews left open**
+
+Each of these is a property the repository already states and nothing yet
+enforces. All three are one-liners and they belong here, in the task that first
+pushes and therefore first runs CI.
+
+- Add `pnpm build` to the CI workflow, after `typecheck` and before or after
+  `test`, and follow it with a step that fails if any file under
+  `packages/*/dist` matches `*.test.*`. Until now "the build emits no test
+  files" has been checked only by hand.
+- Widen the build config's exclusion from `src/**/*.test.ts` to cover `.mts`,
+  `.cts` and `.tsx` as well. The date-field gate already skips every test
+  extension, so a `.test.mts` would today be compiled into `dist` while the gate
+  correctly ignored it.
+- Close the one bypass the date-field gate has. It calls `isFile()` on the
+  directory entry, which is false for a symlink, so a symlinked module inside
+  `src` is skipped by the gate while the compiler still includes it and it
+  still ships. Use a stat that follows the link instead. Prove it: create a
+  symlink in `src` pointing at a file that reads one of the three date fields,
+  show the gate now reports it, remove the symlink, and paste both runs.
+
+- [ ] **Step 4: Verify the whole suite and the build**
 
 Run: `pnpm install && pnpm typecheck && pnpm test && pnpm build`
 Expected: all green.
 
-- [ ] **Step 4: Commit and push**
+- [ ] **Step 5: Commit and push**
 
 ```bash
 git add -A
 git commit -m "Contract: the observation schema, written for the indexer"
-git push -u origin main
+git push -u origin feature/mvp-v0
 ```
 
-- [ ] **Step 5: Move A0 to Done on the board and tell the developer**
+- [ ] **Step 6: Move A0 to Done on the board and tell the developer**
 
 Move the A0 item to Done, write into its body what the schema finally settled
 on, and send the developer a message naming the package, the contract document
