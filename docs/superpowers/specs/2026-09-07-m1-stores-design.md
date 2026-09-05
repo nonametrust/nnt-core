@@ -437,13 +437,14 @@ and would let a test pass through a path production cannot use.
 
 Every enforced invariant raises a distinct SQLSTATE, and `errors.ts` maps each to
 a named error class: `AppendOnlyViolation`, `ChainBroken`, `TimestampAltered`,
-`NamespaceShredded`, `DuplicateObservation`, `MigrationDrift`. Tests assert on
+`NamespaceShredded`, `MigrationDrift`. Tests assert on
 the class, never on the message text, so a reworded message is not a red suite
 and a swallowed violation is not a green one.
 
-`DuplicateObservation` is the one that is not a defect: writing the same source
-event twice is the indexer's normal retry path. The repository's `append()`
-returns the existing observation rather than raising, and reports that it did.
+There is deliberately no duplicate-observation error, because writing the same source
+event twice is the indexer's normal retry path, not a defect. The repository's
+`append()` returns the existing observation rather than raising, and reports
+that it did.
 The distinction between "already stored" and "conflicting" is drawn on the
 idempotency key alone, which is what the key exists for.
 
