@@ -1,0 +1,27 @@
+import { z } from "zod";
+
+/**
+ * Continuity is an integration assertion, never an inference. The engine does
+ * not resolve entities and never silently merges identities, so a claim that
+ * two addresses are the same counterparty arrives with an asserter and a
+ * reason, and is stored as provenance.
+ */
+export const continuityAssertionSchema = z.object({
+  assertedBy: z.string().min(1),
+  assertedAt: z.string().datetime(),
+  reason: z.string().min(1),
+});
+export type ContinuityAssertion = z.infer<typeof continuityAssertionSchema>;
+
+/**
+ * Addresses, domains and endpoints are attributes of a namespace, not the
+ * namespace itself. Where the integration supplies nothing richer, a wallet
+ * address is the anchor. Muxed addresses resolve to the base address before
+ * they reach this type; the muxed identifier is an attribute.
+ */
+export const namespaceRefSchema = z.object({
+  kind: z.enum(["wallet", "domain", "endpoint", "merchant"]),
+  id: z.string().min(1),
+  continuity: continuityAssertionSchema.optional(),
+});
+export type NamespaceRef = z.infer<typeof namespaceRefSchema>;
