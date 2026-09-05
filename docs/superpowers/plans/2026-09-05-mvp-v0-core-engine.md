@@ -782,6 +782,21 @@ describe("payload validators", () => {
     expect(r.ok).toBe(false);
   });
 
+  it("rejects an observation declaring an unsupported schema version", () => {
+    const r = validateObservation({
+      schemaVersion: "0.0.1",
+      namespace: { kind: "wallet", id: "GABC" },
+      channel: "volume",
+      evidenceKind: "event",
+      kind: "payment",
+      observedAt: "2026-09-05T09:00:00.000Z",
+      source: src,
+      payload: { amount: "1", assetCode: "XLM", direction: "in" },
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errors[0]).toContain("schemaVersion");
+  });
+
   it("assigns an idempotency key when the observation is valid", () => {
     const r = validateObservation({
       schemaVersion: "0.1.0",
@@ -846,7 +861,11 @@ Expected: FAIL, cannot resolve `./payloads.js`, and the fixtures directory is mi
 ```ts
 import { z } from "zod";
 import { type Channel } from "./channel.js";
-import { observationSchema, type Observation } from "./observation.js";
+import {
+  OBSERVATION_SCHEMA_VERSION,
+  observationSchema,
+  type Observation,
+} from "./observation.js";
 import { deriveIdempotencyKey } from "./idempotency.js";
 
 const addressIntegrity = z.object({
@@ -903,12 +922,28 @@ export type ValidationResult =
   | { ok: false; errors: string[] };
 
 /**
- * Validates the envelope, then the channel-specific payload, then assigns the
- * deterministic idempotency key. Both layers must pass; a valid envelope with
- * a malformed payload is a rejection, because a half-understood observation
- * that reaches the tagging pipeline is worse than one that never arrives.
+ * Validates the schema version, then the envelope, then the channel-specific
+ * payload, then assigns the deterministic idempotency key. Every layer must
+ * pass; a valid envelope with a malformed payload is a rejection, because a
+ * half-understood observation that reaches the tagging pipeline is worse than
+ * one that never arrives.
+ *
+ * The version is checked first and exactly. Both sides of this contract live in
+ * one repository and move together, so a producer declaring a version we do not
+ * implement is telling us its shape was written against a different schema, and
+ * accepting it half-understood is the worse failure. The check exists because
+ * an exported version constant that nothing reads is a claim with no gate.
  */
 export function validateObservation(input: unknown): ValidationResult {
+  const declared = (input as { schemaVersion?: unknown } | null)?.schemaVersion;
+  if (declared !== OBSERVATION_SCHEMA_VERSION) {
+    return {
+      ok: false,
+      errors: [
+        `schemaVersion: expected ${OBSERVATION_SCHEMA_VERSION}, received ${String(declared)}`,
+      ],
+    };
+  }
   const envelope = observationSchema.safeParse(input);
   if (!envelope.success) {
     return {
@@ -975,6 +1010,11 @@ export * from "./timing.js";
 export * from "./idempotency.js";
 export * from "./payloads.js";
 ```
+
+Two constraints on this file. Under `isolatedModules` a type re-export needs
+`export type`, and `export *` is fine. And the single-reader gate added in Task
+4 scans every non-test source file in the package, so `index.ts` must not name
+`observedAt`, `validFrom` or `validUntil`, in code or in a comment.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
