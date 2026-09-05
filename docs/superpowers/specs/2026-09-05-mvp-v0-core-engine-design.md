@@ -134,6 +134,7 @@ envelope does not know the shape, the per-channel validator does.
 interface NamespaceRef {
   kind: "wallet" | "domain" | "endpoint" | "merchant";
   id: string;
+  muxedId?: string;   // an attribute of the namespace, never the namespace
   continuity?: ContinuityAssertion;
 }
 
