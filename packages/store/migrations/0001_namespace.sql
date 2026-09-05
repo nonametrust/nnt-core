@@ -15,7 +15,7 @@
 -- database default, "und" and even "und-u-ks-level2", because a deterministic
 -- collation breaks its ties bytewise. With the column under a nondeterministic
 -- ICU collation, the case test fails exactly as described above, and passes
--- again once the clause is put back beside that collation. Postgres 17 has no
+-- again once the column is put back under "C". Postgres 17 has no
 -- way to make a nondeterministic collation a database default, so on this
 -- major the clause guards against no cluster that can be initialised. It
 -- stays because the column's identity must not depend on how a later cluster,
@@ -34,5 +34,12 @@ create table namespace (
   created_at       timestamptz not null,
   constraint namespace_identity unique (kind, ns_id),
   constraint namespace_shred_consistent
-    check ((data_key_wrapped is null) = (key_shredded_at is not null))
+    check ((data_key_wrapped is null) = (key_shredded_at is not null)),
+  -- 29 is the wrapped-key header crypto.ts writes: one version byte, a
+  -- twelve-byte nonce, a sixteen-byte tag. A value no longer than that holds
+  -- no key, and without this check an empty bytea would count as "live" under
+  -- the consistency check above. namespace.test.ts pins the number against
+  -- what the key ring actually produces.
+  constraint namespace_key_present
+    check (data_key_wrapped is null or octet_length(data_key_wrapped) > 29)
 );

@@ -1,10 +1,11 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { namespaceRefSchema } from "@nonametrust/schema";
 import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv, newDataKey } from "../crypto.js";
 import { fixedClock } from "../clock.js";
-import { NamespaceShredded } from "../errors.js";
+import { NamespaceNotFound, NamespaceShredded, StoreError } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 
 let db: Db;
@@ -43,6 +44,19 @@ describe("identity is byte-exact", () => {
     const w = await repo.ensure({ kind: "wallet", id: "SHARED" });
     const d = await repo.ensure({ kind: "domain", id: "SHARED" });
     expect(w.namespaceId).not.toBe(d.namespaceId);
+  });
+
+  // The kind vocabulary lives in the schema's enum and again in the
+  // migration's check constraint. A kind added to the enum alone would fail
+  // in production at the first ensure of that kind while this suite stayed
+  // green; ensuring one namespace per enum member makes it fail here.
+  it("accepts every kind the schema's enum admits", async () => {
+    const kinds = namespaceRefSchema.innerType().shape.kind.options;
+    expect(kinds.length).toBeGreaterThan(0);
+    for (const kind of kinds) {
+      const n = await repo.ensure({ kind, id: `KIND-${kind}` });
+      expect(n.kind).toBe(kind);
+    }
   });
 
   it("returns the same row for a repeated ensure", async () => {
@@ -103,6 +117,27 @@ describe("keys and shredding", () => {
     expect(shouted.equals(canonical)).toBe(true);
   });
 
+  it("names a namespace that does not exist, by class", async () => {
+    await expect(repo.dataKey(randomUUID())).rejects.toBeInstanceOf(NamespaceNotFound);
+  });
+
+  // The header alone, with no key inside it, is what the key ring produces
+  // for an empty data key. It is also the exact boundary the migration's
+  // octet_length check names, so this pins the SQL literal to crypto.ts.
+  it("refuses a stored wrapped key that holds no key", async () => {
+    const id = randomUUID();
+    const headerOnly = ring.wrap(Buffer.alloc(0), id);
+    const insert = db.insertInto("namespace").values({
+      namespace_id: id,
+      kind: "wallet",
+      ns_id: "EMPTYKEY",
+      data_key_wrapped: headerOnly,
+      key_shredded_at: null,
+      created_at: clock.now(),
+    }).execute();
+    await expect(insert).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_present" });
+  });
+
   it("makes the key unrecoverable once shredded, and says so by class", async () => {
     const n = await repo.ensure({ kind: "wallet", id: "SHREDME" });
     await repo.shred(n.namespaceId);
@@ -123,6 +158,26 @@ describe("keys and shredding", () => {
     await expect(repo.shred(n.namespaceId)).resolves.toBeUndefined();
   });
 
+  // The first erasure's timestamp is the compliance record. The clock has to
+  // move between the two requests, or a second shred that rewrote the
+  // timestamp would be invisible under a fixed clock.
+  it("keeps the first erasure's timestamp across a repeat", async () => {
+    const n = await repo.ensure({ kind: "wallet", id: "SHREDFIRST" });
+    await repo.shred(n.namespaceId);
+    const first = (await repo.find("wallet", "SHREDFIRST"))?.shreddedAt;
+    expect(first).not.toBeNull();
+    clock.advance(60_000);
+    await repo.shred(n.namespaceId);
+    const after = (await repo.find("wallet", "SHREDFIRST"))?.shreddedAt;
+    expect(after?.getTime()).toBe(first?.getTime());
+  });
+
+  // Success here would tell an operator the data is gone when no row was
+  // examined, on the one privacy-critical path this design has.
+  it("refuses to shred an identifier that has no row, by class", async () => {
+    await expect(repo.shred(randomUUID())).rejects.toBeInstanceOf(NamespaceNotFound);
+  });
+
   // The wrap is bound to the namespace id, so a wrapped key copied into
   // another namespace's row does not unwrap there. Without that binding, a
   // copy taken before a shred outlives the shred and the erasure is undone.
@@ -133,7 +188,10 @@ describe("keys and shredding", () => {
       .where("namespace_id", "=", a.namespaceId).executeTakeFirstOrThrow();
     await db.updateTable("namespace").set({ data_key_wrapped: rowA.data_key_wrapped })
       .where("namespace_id", "=", b.namespaceId).execute();
-    await expect(repo.dataKey(b.namespaceId)).rejects.toThrow();
+    // The refusal must come from the unwrap. A store error of any class
+    // would mean the row was missing or shredded, which it is not.
+    await expect(repo.dataKey(b.namespaceId)).rejects.not.toBeInstanceOf(StoreError);
+    expect((await repo.find("wallet", "WRAPB"))?.shreddedAt).toBeNull();
   });
 
   // The one that matters most: an `ensure` written as a blind upsert would
@@ -142,6 +200,7 @@ describe("keys and shredding", () => {
     const n = await repo.ensure({ kind: "wallet", id: "NORESURRECT" });
     await repo.shred(n.namespaceId);
     await repo.ensure({ kind: "wallet", id: "NORESURRECT" });
+    expect((await repo.find("wallet", "NORESURRECT"))?.shreddedAt).not.toBeNull();
     await expect(repo.dataKey(n.namespaceId)).rejects.toBeInstanceOf(NamespaceShredded);
   });
 });

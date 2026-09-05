@@ -10,6 +10,11 @@ export class AppendOnlyViolation extends StoreError {}
 export class ChainBroken extends StoreError {}
 export class TimestampAltered extends StoreError {}
 export class NamespaceShredded extends StoreError {}
+// Raised in TypeScript, like NamespaceShredded, so it carries no SQLSTATE. It
+// exists because an erasure request naming a subject that has no row must not
+// resolve as success: nothing was examined, and "the data is gone" would be
+// reported to an operator about data that was never looked for.
+export class NamespaceNotFound extends StoreError {}
 export class MigrationDrift extends StoreError {}
 
 const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreError> = {

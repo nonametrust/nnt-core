@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { sql } from "kysely";
 import type { NamespaceRef } from "@nonametrust/schema";
 import type { Clock } from "../clock.js";
 import type { Db } from "../db.js";
 import { newDataKey, type KeyRing } from "../crypto.js";
-import { NamespaceShredded } from "../errors.js";
+import { NamespaceNotFound, NamespaceShredded } from "../errors.js";
 
 export interface StoredNamespace {
   namespaceId: string;
@@ -80,7 +81,7 @@ export class NamespaceRepository {
       .select(["namespace_id", "data_key_wrapped"])
       .where("namespace_id", "=", namespaceId)
       .executeTakeFirst();
-    if (!row) throw new Error(`no namespace ${namespaceId}`);
+    if (!row) throw new NamespaceNotFound(`no namespace ${namespaceId}`);
     if (row.data_key_wrapped === null) {
       throw new NamespaceShredded(
         `namespace ${namespaceId} was shredded; its payloads are unreadable`,
@@ -99,14 +100,27 @@ export class NamespaceRepository {
    * timestamps and the audit chain remain intact and verifiable. That is the
    * correct shape for an erasure request against an append-only ledger.
    *
-   * Idempotent: a repeated erasure request is not an error.
+   * A repeated erasure request is not an error, and the first erasure's
+   * timestamp is the one that survives it: that timestamp is the compliance
+   * record, so the `coalesce` keeps it rather than moving it to the latest
+   * request. An erasure request for an identifier with no row is an error,
+   * and a named one. Resolving it as success would tell an operator the data
+   * is gone when nothing was examined.
+   *
+   * One statement for all three cases, and the affected row count tells the
+   * missing row apart from the repeat.
    */
   async shred(namespaceId: string): Promise<void> {
-    await this.db
+    const result = await this.db
       .updateTable("namespace")
-      .set({ data_key_wrapped: null, key_shredded_at: this.clock.now() })
+      .set({
+        data_key_wrapped: null,
+        key_shredded_at: sql<Date>`coalesce(key_shredded_at, ${this.clock.now()})`,
+      })
       .where("namespace_id", "=", namespaceId)
-      .where("data_key_wrapped", "is not", null)
-      .execute();
+      .executeTakeFirst();
+    if (result.numUpdatedRows === 0n) {
+      throw new NamespaceNotFound(`no namespace ${namespaceId} to shred`);
+    }
   }
 }
