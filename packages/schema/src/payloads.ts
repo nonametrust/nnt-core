@@ -108,7 +108,8 @@ export type VolumePayload = PayloadByChannel["volume"];
 export type ClusterProximityPayload = PayloadByChannel["cluster_proximity"];
 export type ContentPayload = PayloadByChannel["content"];
 
-export function payloadSchemaFor(channel: Channel): z.ZodTypeAny {
+/** The validator for one channel, typed to that channel's payload. */
+export function payloadSchemaFor<C extends Channel>(channel: C): (typeof BY_CHANNEL)[C] {
   return BY_CHANNEL[channel];
 }
 
@@ -116,11 +117,14 @@ export type ValidationResult =
   | { ok: true; value: Observation & { idempotencyKey: string } }
   | { ok: false; errors: string[] };
 
-/** "path: message", with a name for the root so no error starts with a colon. */
-function describe(root: string, issue: z.ZodIssue): string {
-  const path = issue.path.join(".");
-  const where = path === "" ? root : root === "observation" ? path : `${root}.${path}`;
-  return `${where}: ${issue.message}`;
+/**
+ * "path: message". An issue with no path, such as an unknown key on a strict
+ * object, is reported at `root` so no error starts with a bare colon. Payload
+ * issues are prefixed with the key they sit under in the envelope.
+ */
+function formatIssue(issue: z.ZodIssue, root: string, prefix: string[] = []): string {
+  const path = [...prefix, ...issue.path].join(".");
+  return `${path || root}: ${issue.message}`;
 }
 
 /**
@@ -155,7 +159,7 @@ export function validateObservation(input: unknown): ValidationResult {
   if (!envelope.success) {
     return {
       ok: false,
-      errors: envelope.error.issues.map((i) => describe("observation", i)),
+      errors: envelope.error.issues.map((i) => formatIssue(i, "observation")),
     };
   }
   const o = envelope.data;
@@ -163,7 +167,7 @@ export function validateObservation(input: unknown): ValidationResult {
   if (!payload.success) {
     return {
       ok: false,
-      errors: payload.error.issues.map((i) => describe("payload", i)),
+      errors: payload.error.issues.map((i) => formatIssue(i, "payload", ["payload"])),
     };
   }
   const idempotencyKey = deriveIdempotencyKey(o.source, o.channel, o.namespace);
