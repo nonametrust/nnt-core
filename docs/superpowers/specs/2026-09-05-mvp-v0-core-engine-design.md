@@ -125,9 +125,10 @@ interface NamespaceRef {
 }
 
 interface Source {
-  producer: string;   // "stellar-indexer@0.1.0"
-  network?: string;   // "stellar:pubnet"
-  ref: string;        // Horizon operation id or paging token
+  producer: string;         // bare name, "stellar-indexer"
+  producerVersion: string;  // "0.1.0", deliberately a separate field
+  network?: string;         // "stellar:pubnet"
+  ref: string;              // Horizon operation id or paging token
   fetchedAt: string;
 }
 ```
@@ -167,12 +168,15 @@ required signed observations; the September brief dropped the topic. The field
 opens now so that enabling verification later is not a schema migration. In v0
 the indexer runs in the same trust domain.
 
-**`idempotencyKey` is deterministic from the source.** For Stellar it is the
-Horizon operation or effect identifier combined with the channel. Reprocessing
-the same range yields zero new observations, which is the indexer's own
-acceptance criterion, and it is a correctness requirement rather than a
-performance one: a duplicated trace makes the tagging pipeline believe the
-evidence is twice as strong.
+**`idempotencyKey` is deterministic from the source, and the producer version
+is not part of it.** The key is derived from the producer's bare name, the
+source reference and the channel. Reprocessing the same range yields zero new
+observations, which is the indexer's own acceptance criterion, and it is a
+correctness requirement rather than a performance one: a duplicated trace makes
+the tagging pipeline believe the evidence is twice as strong. The version is a
+separate field because folding it into the producer name would change every key
+the moment the indexer is upgraded, silently minting a duplicate of everything
+already stored. The fetch time is excluded for the same reason.
 
 **The engine never infers identity.** Continuity is an integration assertion,
 recorded as provenance. Where no continuity is supplied, a new address opens a
