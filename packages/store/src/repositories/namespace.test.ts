@@ -1,11 +1,14 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { namespaceRefSchema } from "@nonametrust/schema";
+import { sql } from "kysely";
 import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv, newDataKey } from "../crypto.js";
 import { fixedClock } from "../clock.js";
-import { NamespaceNotFound, NamespaceShredded, StoreError } from "../errors.js";
+import {
+  CiphertextRejected, NamespaceAltered, NamespaceNotFound, NamespaceShredded, StoreError, mapPgError,
+} from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 
 let db: Db;
@@ -188,9 +191,10 @@ describe("keys and shredding", () => {
       .where("namespace_id", "=", a.namespaceId).executeTakeFirstOrThrow();
     await db.updateTable("namespace").set({ data_key_wrapped: rowA.data_key_wrapped })
       .where("namespace_id", "=", b.namespaceId).execute();
-    // The refusal must come from the unwrap. A store error of any class
-    // would mean the row was missing or shredded, which it is not.
-    await expect(repo.dataKey(b.namespaceId)).rejects.not.toBeInstanceOf(StoreError);
+    // The refusal must come from the unwrap, and that is the class the
+    // unwrap raises; NamespaceNotFound or NamespaceShredded here would mean
+    // the row was missing or shredded, which it is not.
+    await expect(repo.dataKey(b.namespaceId)).rejects.toBeInstanceOf(CiphertextRejected);
     expect((await repo.find("wallet", "WRAPB"))?.shreddedAt).toBeNull();
   });
 
@@ -202,5 +206,86 @@ describe("keys and shredding", () => {
     await repo.ensure({ kind: "wallet", id: "NORESURRECT" });
     expect((await repo.find("wallet", "NORESURRECT"))?.shreddedAt).not.toBeNull();
     await expect(repo.dataKey(n.namespaceId)).rejects.toBeInstanceOf(NamespaceShredded);
+  });
+});
+
+// The identity row is the one row every other table hangs from, and until
+// this trigger it was the one table with no guard of its own. Observation
+// rows are append-only, but the row they hang from was not: one UPDATE of
+// kind and ns_id re-attributes every observation, tag, record, trigger and
+// baseline of one counterparty to another, and every payload still opens,
+// because the wrap is bound to namespace_id and not to the identity pair.
+// And a shred could be undone by putting back a copy of the wrapped key
+// taken before it, which the consistency check alone admits. `ensure` uses
+// `do nothing` so that it never undoes a shred; that closed one path while
+// the table left the rest open.
+describe("what the table refuses on its own", () => {
+  const CODE = "NNT05";
+
+  it("refuses a DELETE, by SQLSTATE and by class", async () => {
+    const n = await repo.ensure({ kind: "wallet", id: "NODELETE" });
+    const attempt = sql`delete from namespace where namespace_id = ${n.namespaceId}`.execute(db);
+    await expect(attempt).rejects.toMatchObject({ code: CODE });
+    const mapped = mapPgError(await attempt.catch((e: unknown) => e));
+    expect(mapped).toBeInstanceOf(NamespaceAltered);
+    expect(mapped).toBeInstanceOf(StoreError);
+    expect((await repo.find("wallet", "NODELETE"))?.namespaceId).toBe(n.namespaceId);
+  });
+
+  it("refuses a change to the identity, so evidence cannot be re-attributed", async () => {
+    const n = await repo.ensure({ kind: "wallet", id: "FIXEDID" });
+    const changes = [
+      sql`kind = 'domain'`,
+      sql`ns_id = 'FIXEDID2'`,
+      sql`namespace_id = ${randomUUID()}`,
+      sql`created_at = created_at + interval '1 second'`,
+      sql`kind = 'merchant', ns_id = 'SOMEONE-ELSE'`,
+    ];
+    for (const change of changes) {
+      await expect(
+        sql`update namespace set ${change} where namespace_id = ${n.namespaceId}`.execute(db),
+      ).rejects.toMatchObject({ code: CODE });
+    }
+    const row = await db.selectFrom("namespace").select(["kind", "ns_id", "created_at"])
+      .where("namespace_id", "=", n.namespaceId).executeTakeFirstOrThrow();
+    expect(row).toEqual({ kind: "wallet", ns_id: "FIXEDID", created_at: clock.now() });
+  });
+
+  // The copy is taken before the shred, which is the only time it can be.
+  // Written back afterwards, with or without the timestamp cleared, it
+  // satisfies the consistency check and would make every payload readable
+  // again. Erasure is the only deletion this ledger has, and an erasure a
+  // row copy can reverse is not one.
+  it("refuses to un-shred, whether the key is put back, the timestamp cleared, or both", async () => {
+    const n = await repo.ensure({ kind: "wallet", id: "STAYSHRED" });
+    const before = await db.selectFrom("namespace").select(["data_key_wrapped"])
+      .where("namespace_id", "=", n.namespaceId).executeTakeFirstOrThrow();
+    await repo.shred(n.namespaceId);
+    const shreddedAt = (await repo.find("wallet", "STAYSHRED"))?.shreddedAt;
+    expect(shreddedAt).not.toBeNull();
+    const reversals = [
+      sql`key_shredded_at = null, data_key_wrapped = ${before.data_key_wrapped}`,
+      sql`data_key_wrapped = ${before.data_key_wrapped}`,
+      sql`key_shredded_at = null`,
+      sql`key_shredded_at = key_shredded_at + interval '1 day'`,
+    ];
+    for (const change of reversals) {
+      await expect(
+        sql`update namespace set ${change} where namespace_id = ${n.namespaceId}`.execute(db),
+      ).rejects.toMatchObject({ code: CODE });
+    }
+    await expect(repo.dataKey(n.namespaceId)).rejects.toBeInstanceOf(NamespaceShredded);
+    expect((await repo.find("wallet", "STAYSHRED"))?.shreddedAt?.getTime()).toBe(shreddedAt?.getTime());
+  });
+
+  // A re-wrap under a rotated master key is an UPDATE of data_key_wrapped on
+  // a live row, and the guard must leave that open or rotation becomes a
+  // migration. The key inside does not change; only its wrapping does.
+  it("admits a re-wrap of a live row's key", async () => {
+    const n = await repo.ensure({ kind: "wallet", id: "REWRAP" });
+    const key = await repo.dataKey(n.namespaceId);
+    await db.updateTable("namespace").set({ data_key_wrapped: ring.wrap(key, n.namespaceId) })
+      .where("namespace_id", "=", n.namespaceId).execute();
+    expect((await repo.dataKey(n.namespaceId)).equals(key)).toBe(true);
   });
 });

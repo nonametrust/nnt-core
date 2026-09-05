@@ -35,8 +35,8 @@ export class HotWindowRepository {
    * Opens a window. One that closes at or before it opens, or whose scale is
    * not a finite positive number, is refused by the check constraints; one
    * filed under a namespace its trigger is not about is refused by the
-   * foreign key. Each comes back as the driver's error with the SQLSTATE and
-   * the constraint's name on it.
+   * foreign key. Each is raised as ConstraintViolation with the SQLSTATE
+   * and the constraint's name on it.
    */
   async open(input: OpenHotWindow): Promise<StoredHotWindow> {
     try {

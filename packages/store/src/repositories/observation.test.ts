@@ -6,7 +6,10 @@ import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv, newDataKey } from "../crypto.js";
 import { fixedClock } from "../clock.js";
-import { IdempotencyKeyMismatch, NamespaceShredded, ObservationNotFound, StoreError } from "../errors.js";
+import {
+  CiphertextRejected, ConstraintViolation, IdempotencyKeyMismatch, NamespaceShredded,
+  ObservationNotFound, StoreError,
+} from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
 
@@ -229,7 +232,8 @@ describe("idempotency", () => {
   // fails on the foreign key and not on the key; and the reads after the
   // first hand back a stand-in row, as they would if a concurrent writer had
   // stored the key meanwhile. A catch that re-read after any failure would
-  // return that stand-in with `created: false`. This one must rethrow 23503.
+  // return that stand-in with `created: false`. This one must rethrow the
+  // foreign-key violation, mapped to its class.
   it("does not report a failed insert as already stored", async () => {
     const orphan = {
       ensure: async () => ({ namespaceId: randomUUID(), kind: "wallet", nsId: "ORPHAN", shreddedAt: null }),
@@ -243,7 +247,9 @@ describe("idempotency", () => {
       return standIn;
     };
     const input = anEvent({ source: { ...src, ref: "op:orphan:1" }, namespace: { kind: "wallet", id: "ORPHAN" } });
-    await expect(broken.append(input)).rejects.toMatchObject({ code: "23503" });
+    const attempt = broken.append(input);
+    await expect(attempt).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(attempt).rejects.toMatchObject({ sqlstate: "23503" });
     expect(await observations.byIdempotencyKey(
       deriveIdempotencyKey(input.source, input.channel, input.namespace),
     )).toBeNull();
@@ -275,6 +281,44 @@ describe("append-only", () => {
   it("exposes no update or delete on the repository surface at all", () => {
     const surface = Object.getOwnPropertyNames(ObservationRepository.prototype);
     expect(surface.filter((m) => /update|delete|remove/i.test(m))).toEqual([]);
+  });
+});
+
+// The associated data names its own threat model: an attacker with write
+// access to the table. Under that model the append-only trigger is already
+// assumed bypassed, since a swap needs an UPDATE too, and so a column beside
+// the payload can be moved while the payload still opens. dated_at is the
+// one that matters most: the promotion trigger measures a record against
+// that column, so a moved instant would be carried into a permanent record
+// with nothing in the store able to tell. Every derived column is therefore
+// inside the envelope, and this plants each move with the trigger off, inside
+// a transaction it rolls back, and reads through the repository.
+describe("the columns beside the payload", () => {
+  it("are bound to it: a rewritten column refuses the read, even with append-only off", async () => {
+    const { observation } = await observations.append(anEvent({ source: { ...src, ref: "op:aad:1" } }));
+    const id = observation.observationId!;
+    const moves = [
+      sql`dated_at = dated_at + interval '1 day'`,
+      sql`channel = 'latency'`,
+      sql`kind = 'tampered'`,
+      sql`evidence_kind = 'state', dated_at = null`,
+    ];
+    for (const move of moves) {
+      await expect(
+        db.transaction().execute(async (trx) => {
+          await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+          await sql`update observation set ${move} where observation_id = ${id}`.execute(trx);
+          const inside = new ObservationRepository(trx, new NamespaceRepository(trx, ring, clock), clock);
+          await inside.get(id);
+        }),
+      ).rejects.toBeInstanceOf(CiphertextRejected);
+    }
+    // The rollback put the trigger back, and the row reads as it was written.
+    await expect(sql`update observation set channel = 'latency' where observation_id = ${id}`.execute(db))
+      .rejects.toMatchObject({ code: "NNT01" });
+    const again = await observations.get(id);
+    expect(again.channel).toBe("volume");
+    expect(again.kind).toBe("payment");
   });
 });
 

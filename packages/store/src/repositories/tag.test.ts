@@ -6,7 +6,7 @@ import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
-import { StoreError, TagNotFound } from "../errors.js";
+import { ConstraintViolation, StoreError, TagNotFound } from "../errors.js";
 import { strengthAt } from "../strength.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
@@ -169,9 +169,9 @@ describe("what the table refuses to hold", () => {
   // which is the one query the nightly job runs. The pair is one key.
   it("refuses a tag whose namespace is not the observation's, by foreign key", async () => {
     const stranger = (await namespaces.ensure({ kind: "wallet", id: "STRANGER" })).namespaceId;
-    await expect(
-      repo.open({ namespaceId: stranger, observationId: obs, channel: "volume", g0: 0.5 }),
-    ).rejects.toMatchObject({ code: "23503" });
+    const opened = repo.open({ namespaceId: stranger, observationId: obs, channel: "volume", g0: 0.5 });
+    await expect(opened).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(opened).rejects.toMatchObject({ sqlstate: "23503", constraint: "tag_observation_in_namespace" });
     expect(await repo.listLive(stranger)).toEqual([]);
   });
 });
@@ -199,9 +199,9 @@ describe("opening and reading", () => {
   });
 
   it("refuses a tag on an observation that does not exist, on the foreign key", async () => {
-    await expect(
-      repo.open({ namespaceId: ns, observationId: randomUUID(), channel: "volume", g0: 0.5 }),
-    ).rejects.toMatchObject({ code: "23503" });
+    const opened = repo.open({ namespaceId: ns, observationId: randomUUID(), channel: "volume", g0: 0.5 });
+    await expect(opened).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(opened).rejects.toMatchObject({ sqlstate: "23503" });
   });
 
   // NaN and Infinity are accepted by a double precision column and NaN sorts

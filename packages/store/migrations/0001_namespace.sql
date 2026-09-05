@@ -43,3 +43,62 @@ create table namespace (
   constraint namespace_key_present
     check (data_key_wrapped is null or octet_length(data_key_wrapped) > 29)
 );
+
+-- The identity row is the one row every other table hangs from, and this is
+-- the guard that makes it as fixed as the rows beneath it. observation is
+-- append-only, but the row it hangs from was not: one UPDATE of kind and
+-- ns_id re-attributes every observation, tag, permanent record, trigger and
+-- baseline of one counterparty to another identity, and every payload still
+-- opens under the new name, because the wrap is bound to namespace_id and
+-- not to the identity pair. And a shred could be undone: a copy of the
+-- wrapped key taken before it, written back with key_shredded_at cleared,
+-- satisfies the consistency check above. NamespaceRepository.ensure uses
+-- `do nothing` on conflict so that it never undoes a shred; that closed one
+-- path in application code while the table left the rest open, which is the
+-- shape the design says to avoid.
+--
+-- Three refusals, one SQLSTATE. No DELETE, ever: the row is what every
+-- foreign key points at, and erasure is by shredding, which keeps it. No
+-- change to namespace_id, kind, ns_id or created_at: the identity and the
+-- moment it was first seen are facts, not state. And no way back from a
+-- shred: once key_shredded_at is set it does not move and no wrapped key is
+-- accepted beside it, whatever the consistency check would say.
+--
+-- What stays open, on purpose: data_key_wrapped on a live row. A re-wrap
+-- under a rotated master key is exactly that UPDATE, and closing it would
+-- make rotation a migration. The first shred passes because old.key_shredded_at
+-- is null then; a repeated shred passes because the repository's coalesce
+-- keeps the first timestamp and writes a null key.
+--
+-- NNT05 rather than NNT01: this table is meant to be updated, so a refusal
+-- here is not an append-only violation, and an operator reading the class
+-- must not be told that it is. The application maps it to NamespaceAltered.
+create function namespace_guard() returns trigger language plpgsql as $$
+begin
+  if tg_op = 'DELETE' then
+    raise exception using
+      errcode = 'NNT05',
+      message = 'namespace is never deleted; erasure is by shredding the key';
+  end if;
+  if new.namespace_id is distinct from old.namespace_id
+     or new.kind is distinct from old.kind
+     or new.ns_id is distinct from old.ns_id
+     or new.created_at is distinct from old.created_at then
+    raise exception using
+      errcode = 'NNT05',
+      message = 'namespace identity is fixed: namespace_id, kind, ns_id and created_at do not change';
+  end if;
+  if old.key_shredded_at is not null
+     and (new.key_shredded_at is distinct from old.key_shredded_at
+          or new.data_key_wrapped is not null) then
+    raise exception using
+      errcode = 'NNT05',
+      message = 'a shredded namespace stays shredded: the timestamp does not move and no key is put back';
+  end if;
+  return new;
+end
+$$;
+
+create trigger namespace_guarded
+  before update or delete on namespace
+  for each row execute function namespace_guard();

@@ -28,7 +28,7 @@ export class VolatilityRepository {
   /**
    * Writes the namespace's estimate, replacing what was there, stamped at
    * the clock's instant. A value the table does not admit is refused by its
-   * check constraint and comes back as the driver's error, SQLSTATE 23514.
+   * check constraint and raised as ConstraintViolation under SQLSTATE 23514.
    */
   async upsert(state: VolatilityState): Promise<StoredVolatility> {
     const values = { q_hat: state.qHat, updated_at: this.clock.now() };

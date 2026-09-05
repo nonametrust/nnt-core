@@ -18,7 +18,10 @@ export interface AppendResult {
 // unique_violation, on the constraint 0002_observation.sql names for the key.
 // The constraint is matched by name and not by SQLSTATE alone because the
 // primary key is unique too, and a collision there would be a different
-// problem wearing the same code.
+// problem wearing the same code. It is looked at on the driver's raw error,
+// before `mapPgError` runs: mapped, the same failure is a ConstraintViolation,
+// and to this repository a duplicate is the retry it exists for, not a
+// failure.
 const UNIQUE_VIOLATION = "23505";
 const IDEMPOTENCY_CONSTRAINT = "observation_idempotency";
 
@@ -71,14 +74,26 @@ export class ObservationRepository {
       ingestedAt: ingestedAt.toISOString(),
     } as Observation;
 
-    const dataKey = await this.namespaces.dataKey(ns.namespaceId);
-    const sealed = seal(dataKey, JSON.stringify(stored), payloadAad(ns.namespaceId, key));
     // datedAt is the single reader of a date off an observation, and calling
     // it here is why this package needs no exemption in the repository's
     // single-date-reader gate. Note that the gate matches those field names
     // inside comments too, so this one describes the rule without naming
     // them.
     const dated = datedAt(stored);
+    const datedColumn = dated === null ? null : new Date(dated);
+
+    // The payload is bound to every column written beside it, as the Date
+    // the column will hold, so that a column rewritten afterwards refuses
+    // the read. `read` rebuilds the same binding from the same columns.
+    const dataKey = await this.namespaces.dataKey(ns.namespaceId);
+    const sealed = seal(dataKey, JSON.stringify(stored), payloadAad({
+      namespaceId: ns.namespaceId,
+      idempotencyKey: key,
+      evidenceKind: stored.evidenceKind,
+      channel: stored.channel,
+      kind: stored.kind,
+      datedAt: datedColumn,
+    }));
 
     try {
       await this.db
@@ -90,7 +105,7 @@ export class ObservationRepository {
           channel: stored.channel,
           kind: stored.kind,
           evidence_kind: stored.evidenceKind,
-          dated_at: dated === null ? null : new Date(dated),
+          dated_at: datedColumn,
           ingested_at: ingestedAt,
           payload_nonce: sealed.nonce,
           payload_tag: sealed.tag,
@@ -125,10 +140,11 @@ export class ObservationRepository {
 
   /**
    * The one read path. Both public reads go through it because both must
-   * rebuild the associated data from the same two columns the write bound it
+   * rebuild the associated data from the same six columns the write bound it
    * to; two hand-copied selects are how those inputs would eventually diverge,
    * and the failure would be a payload that opens on one path and not the
-   * other.
+   * other. The payload is not compared to the columns after it opens: a
+   * column that disagrees with it does not open at all.
    */
   private async read(
     column: "observation_id" | "idempotency_key",
@@ -137,7 +153,7 @@ export class ObservationRepository {
     const row = await this.db
       .selectFrom("observation")
       .select([
-        "namespace_id", "idempotency_key",
+        "namespace_id", "idempotency_key", "evidence_kind", "channel", "kind", "dated_at",
         "payload_nonce", "payload_tag", "payload_ciphertext",
       ])
       .where(column, "=", value)
@@ -149,7 +165,14 @@ export class ObservationRepository {
     const json = open(
       dataKey,
       { nonce: row.payload_nonce, tag: row.payload_tag, ciphertext: row.payload_ciphertext },
-      payloadAad(row.namespace_id, row.idempotency_key),
+      payloadAad({
+        namespaceId: row.namespace_id,
+        idempotencyKey: row.idempotency_key,
+        evidenceKind: row.evidence_kind,
+        channel: row.channel,
+        kind: row.kind,
+        datedAt: row.dated_at,
+      }),
     );
     return observationSchema.parse(JSON.parse(json)) as Observation;
   }

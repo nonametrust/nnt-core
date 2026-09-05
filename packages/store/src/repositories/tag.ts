@@ -61,10 +61,10 @@ export class TagRepository {
   /**
    * Opens a tag at the clock's instant with the defaults a fresh tag carries.
    * A missing namespace or observation, or an observation that does not
-   * belong to the namespace, is refused by the foreign keys and the driver's
-   * error is rethrown as it is, with SQLSTATE 23503 in `.code`: an unknown
-   * identifier at this layer is a caller's defect, and a store error wrapping
-   * it would hide which key.
+   * belong to the namespace, is refused by the foreign keys and raised as
+   * ConstraintViolation with SQLSTATE 23503 and the key's name on it: an
+   * unknown identifier at this layer is a caller's defect, and the name
+   * says which key, with the driver's error kept as cause.
    */
   async open(input: OpenTag): Promise<StoredTag> {
     requireFinite("g0", input.g0, 0);

@@ -153,12 +153,17 @@ describe("migrate", () => {
     // closes is between the file and its ledger record, so the fixture is a
     // file that succeeds and then makes its own record fail: it forges a
     // ledger row under its own name and the runner's insert collides with it.
+    //
+    // The rejection must be that collision, the ledger's own primary key by
+    // SQLSTATE and constraint name. Any rejection would also accept a
+    // fixture that failed before it reached the ledger, and the rollback
+    // this proves would then have been proved by the wrong failure.
     put(
       "0003_half.sql",
       "create table half (id int);\n" +
         "insert into schema_migration (filename, sha256) values ('0003_half.sql', 'forged');",
     );
-    await expect(migrate(db, dir)).rejects.toThrow();
+    await expect(migrate(db, dir)).rejects.toMatchObject({ code: "23505", constraint: "schema_migration_pkey" });
     expect(await tableExists("half")).toBe(false);
     expect(await recordFor("0003_half.sql")).toBeUndefined();
     rmSync(join(dir, "0003_half.sql"));

@@ -523,11 +523,83 @@ describe("verify at scale", () => {
   });
 
   // The bulk rows above carry the seventh's instant under higher sequence
-  // numbers, so the head at that day's close is no longer the one sealed.
-  // A re-run over a moved head is the signal the seal exists to give.
-  it("refuses to re-seal a day whose head at close has moved, by class", async () => {
-    await expect(chain.sealDay("2026-09-07")).rejects.toBeInstanceOf(SealMismatch);
-    await expect(chain.sealDay("2026-09-07")).rejects.toBeInstanceOf(StoreError);
+  // numbers: the chain grew backwards in time, which a stepped-back wall
+  // clock, a restored virtual machine or a fixed clock all produce through
+  // the ordinary append path. The seal states that at the seventh's close
+  // the head was a particular entry with a particular hash, and a later
+  // backdated entry does not falsify that statement. A re-run finds the
+  // sealed entry still there, still under its hash, and returns; raising
+  // would leave a day that can never be re-run again, since the seal table
+  // refuses rewrites.
+  it("leaves a seal standing when the chain grew backwards in time, and writes nothing", async () => {
+    const before = await db.selectFrom("audit_day").selectAll().orderBy("day").execute();
+    await expect(chain.sealDay("2026-09-07")).resolves.toBeUndefined();
+    expect(await db.selectFrom("audit_day").selectAll().orderBy("day").execute()).toEqual(before);
+  });
+
+  // What the seal does refuse: the entry it sealed no longer carrying the
+  // hash it was sealed under. That is a rewrite, and it is planted as one,
+  // with the trigger off inside a transaction that is rolled back.
+  it("refuses to re-seal a day whose sealed entry was rewritten, by class", async () => {
+    const seal = await db.selectFrom("audit_day").select(["terminal_seq"])
+      .where(sql`day::text`, "=", "2026-09-07").executeTakeFirstOrThrow();
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table audit_entry disable trigger audit_entry_no_rewrite`.execute(trx);
+        await sql`update audit_entry set entry_sha256 = ${randomBytes(32)} where seq = ${seal.terminal_seq}`
+          .execute(trx);
+        await new AuditChain(trx, clock, ring).sealDay("2026-09-07");
+      }),
+    ).rejects.toBeInstanceOf(SealMismatch);
+    await expect(chain.sealDay("2026-09-07")).resolves.toBeUndefined();
+    await guardIsBack(seal.terminal_seq);
+  });
+
+  // The other half of the check: the seal's own HMAC no longer verifying
+  // over the hash it names. A seal rewritten without the derived key is the
+  // forgery the HMAC exists to refuse.
+  it("refuses to re-seal a day whose seal no longer verifies, by class", async () => {
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table audit_day disable trigger audit_day_no_rewrite`.execute(trx);
+        await sql`update audit_day set hmac = ${randomBytes(32)} where day = '2026-09-07'::date`.execute(trx);
+        const inside = new AuditChain(trx, clock, ring);
+        await expect(inside.sealDay("2026-09-07")).rejects.toBeInstanceOf(StoreError);
+        await inside.sealDay("2026-09-07");
+      }),
+    ).rejects.toBeInstanceOf(SealMismatch);
+    await expect(chain.sealDay("2026-09-07")).resolves.toBeUndefined();
+    await expect(sql`update audit_day set hmac = ${randomBytes(32)} where day = '2026-09-07'::date`.execute(db))
+      .rejects.toMatchObject({ code: "NNT01" });
+  });
+
+  // Two nightly runs arriving at once both find no seal and both insert.
+  // The loser's insert waits on the unique index until the winner commits,
+  // then fails with the driver's 23505, which sealDay recognises before any
+  // mapping to a class and answers by re-reading. This holds the winner's
+  // row uncommitted on one connection while the loser runs on another, so
+  // the collision is forced rather than hoped for, and the loser must not
+  // return while the winner is still open.
+  it("returns quietly when another run's seal lands first, by re-reading rather than raising", async () => {
+    const day = "2026-09-09";
+    const head = (await chain.head())!;
+    const hmac = createHmac("sha256", ring.deriveKey(AUDIT_DAY_SEAL_LABEL))
+      .update(Buffer.from(day, "utf8")).update(head.entrySha256).digest();
+    let loser: Promise<void> | undefined;
+    await db.transaction().execute(async (trx) => {
+      await trx.insertInto("audit_day").values({
+        day, terminal_seq: head.seq, terminal_sha256: head.entrySha256, hmac, sealed_at: clock.now(),
+      }).execute();
+      let settled = false;
+      loser = chain.sealDay(day);
+      loser.then(() => { settled = true; }, () => { settled = true; });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(settled, "sealDay returned while the competing seal was uncommitted").toBe(false);
+    });
+    await expect(loser!).resolves.toBeUndefined();
+    const rows = await db.selectFrom("audit_day").select(["terminal_seq"])
+      .where(sql`day::text`, "=", day).execute();
+    expect(rows).toEqual([{ terminal_seq: head.seq }]);
   });
 });
 

@@ -52,9 +52,10 @@ export class BaselineRepository {
    * `returning`, so what is reported is what was stored.
    *
    * A value outside what the table admits, NaN and the infinities among
-   * them, is refused by the check constraints and comes back as the driver's
-   * error with SQLSTATE 23514 and the constraint's name on it, as tag's raw
-   * refusals do; a namespace with no row is 23503.
+   * them, is refused by the check constraints and raised as
+   * ConstraintViolation with SQLSTATE 23514 and the constraint's name on
+   * it, as tag's refusals are; a namespace with no row is the same class
+   * under 23503.
    */
   async upsert(state: BaselineState): Promise<StoredBaseline> {
     const values = {

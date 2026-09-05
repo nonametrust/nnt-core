@@ -6,7 +6,7 @@ import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
-import { HotWindowNotFound, StoreError, TriggerEventNotFound } from "../errors.js";
+import { ConstraintViolation, HotWindowNotFound, StoreError, TriggerEventNotFound } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
 import { PermanentRecordRepository } from "./permanent-record.js";
@@ -118,9 +118,10 @@ describe("baseline", () => {
     expect(await baselines.forNamespace(other)).toEqual([]);
   });
 
-  it("refuses a negative count", async () => {
-    await expect(baselines.upsert(aBaseline({ aspect: "neg", count: -1 })))
-      .rejects.toMatchObject({ code: "23514" });
+  it("refuses a negative count, by class", async () => {
+    const written = baselines.upsert(aBaseline({ aspect: "neg", count: -1 }));
+    await expect(written).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(written).rejects.toMatchObject({ sqlstate: "23514", constraint: "baseline_n_check" });
   });
 
   // A NaN in a running mean is permanent: every later update is NaN plus
@@ -154,10 +155,11 @@ describe("baseline", () => {
 
   it("refuses the same through the repository, and leaves the stored state as it was", async () => {
     await baselines.upsert(aBaseline({ aspect: "poison", mean: 1 }));
-    await expect(baselines.upsert(aBaseline({ aspect: "poison", mean: Number.NaN })))
-      .rejects.toMatchObject({ code: "23514" });
-    await expect(baselines.upsert(aBaseline({ aspect: "poison", m2: -1 })))
-      .rejects.toMatchObject({ code: "23514" });
+    for (const poison of [{ mean: Number.NaN }, { m2: -1 }]) {
+      const written = baselines.upsert(aBaseline({ aspect: "poison", ...poison }));
+      await expect(written).rejects.toBeInstanceOf(ConstraintViolation);
+      await expect(written).rejects.toMatchObject({ sqlstate: "23514" });
+    }
     const read = (await baselines.forNamespace(ns)).find((b) => b.aspect === "poison");
     expect(read?.mean).toBe(1);
   });
@@ -190,9 +192,11 @@ describe("trigger_event", () => {
   // else; a candidate with a tier would read as graded evidence in a brief.
   it("refuses a tier on a status that is not harm-confirmed", async () => {
     for (const status of ["candidate", "verified"] as const) {
-      await expect(triggers.record({
+      const recorded = triggers.record({
         namespaceId: ns, observationId: obs, status, tier: "high", surprise: 3.2,
-      })).rejects.toMatchObject({ code: "23514", constraint: "trigger_event_tier_needs_harm" });
+      });
+      await expect(recorded).rejects.toBeInstanceOf(ConstraintViolation);
+      await expect(recorded).rejects.toMatchObject({ sqlstate: "23514", constraint: "trigger_event_tier_needs_harm" });
     }
   });
 
@@ -212,8 +216,9 @@ describe("trigger_event", () => {
 
   it("refuses a surprise that is NaN or infinite", async () => {
     for (const surprise of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
-      await expect(triggers.record({ namespaceId: ns, observationId: obs, status: "candidate", surprise }))
-        .rejects.toMatchObject({ code: "23514" });
+      const recorded = triggers.record({ namespaceId: ns, observationId: obs, status: "candidate", surprise });
+      await expect(recorded).rejects.toBeInstanceOf(ConstraintViolation);
+      await expect(recorded).rejects.toMatchObject({ sqlstate: "23514" });
     }
   });
 
@@ -222,8 +227,9 @@ describe("trigger_event", () => {
   // the nightly job would then scale the wrong counterparty's window.
   it("refuses a trigger filed under a namespace its observation does not belong to", async () => {
     const other = (await namespaces.ensure({ kind: "wallet", id: "SOMEONEELSE" })).namespaceId;
-    await expect(triggers.record({ namespaceId: other, observationId: obs, status: "candidate", surprise: 1 }))
-      .rejects.toMatchObject({ code: "23503", constraint: "trigger_event_observation_in_namespace" });
+    const recorded = triggers.record({ namespaceId: other, observationId: obs, status: "candidate", surprise: 1 });
+    await expect(recorded).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(recorded).rejects.toMatchObject({ sqlstate: "23503", constraint: "trigger_event_observation_in_namespace" });
   });
 
   it("names a missing trigger by class, so a bad id is not mistaken for a bug", async () => {
@@ -255,7 +261,9 @@ describe("volatility", () => {
 
   it("refuses a q_hat that is negative, NaN or infinite", async () => {
     for (const qHat of [-0.1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      await expect(volatilities.upsert({ namespaceId: ns, qHat })).rejects.toMatchObject({ code: "23514" });
+      const written = volatilities.upsert({ namespaceId: ns, qHat });
+      await expect(written).rejects.toBeInstanceOf(ConstraintViolation);
+      await expect(written).rejects.toMatchObject({ sqlstate: "23514", constraint: "volatility_q_hat_check" });
     }
   });
 });
@@ -284,42 +292,50 @@ describe("hot_window", () => {
   });
 
   it("refuses a window that closes before it opens", async () => {
-    await expect(windows.open({
+    const opened = windows.open({
       namespaceId: ns, triggerId: trig,
       opensAt: new Date("2026-09-21T00:00:00.000Z"),
       closesAt: new Date("2026-09-12T00:00:00.000Z"),
       scale: 1,
-    })).rejects.toMatchObject({ code: "23514", constraint: "hot_window_ordered" });
+    });
+    await expect(opened).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(opened).rejects.toMatchObject({ sqlstate: "23514", constraint: "hot_window_ordered" });
   });
 
   it("refuses a window that closes the instant it opens, because an empty window captures nothing", async () => {
-    await expect(windows.open({
+    const opened = windows.open({
       namespaceId: ns, triggerId: trig,
       opensAt: new Date("2026-09-12T00:00:00.000Z"),
       closesAt: new Date("2026-09-12T00:00:00.000Z"),
       scale: 1,
-    })).rejects.toMatchObject({ code: "23514", constraint: "hot_window_ordered" });
+    });
+    await expect(opened).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(opened).rejects.toMatchObject({ sqlstate: "23514", constraint: "hot_window_ordered" });
   });
 
   it("refuses a scale that is zero, negative, NaN or infinite", async () => {
     for (const scale of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      await expect(windows.open({
+      const opened = windows.open({
         namespaceId: ns, triggerId: trig,
         opensAt: new Date("2026-09-12T00:00:00.000Z"),
         closesAt: new Date("2026-09-21T00:00:00.000Z"),
         scale,
-      })).rejects.toMatchObject({ code: "23514" });
+      });
+      await expect(opened).rejects.toBeInstanceOf(ConstraintViolation);
+      await expect(opened).rejects.toMatchObject({ sqlstate: "23514", constraint: "hot_window_scale_check" });
     }
   });
 
   it("refuses a window filed under a namespace its trigger is not about", async () => {
     const other = (await namespaces.ensure({ kind: "wallet", id: "SOMEONEELSE" })).namespaceId;
-    await expect(windows.open({
+    const opened = windows.open({
       namespaceId: other, triggerId: trig,
       opensAt: new Date("2026-09-12T00:00:00.000Z"),
       closesAt: new Date("2026-09-21T00:00:00.000Z"),
       scale: 1,
-    })).rejects.toMatchObject({ code: "23503", constraint: "hot_window_trigger_in_namespace" });
+    });
+    await expect(opened).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(opened).rejects.toMatchObject({ sqlstate: "23503", constraint: "hot_window_trigger_in_namespace" });
   });
 
   it("names a missing window by class", async () => {
@@ -382,9 +398,11 @@ describe("permanent_record.rescued_by, now that trigger_event exists", () => {
       namespaceId: other, observationId: theirs, status: "verified", surprise: 5,
     })).triggerId;
     const source = await appendUnder("GOLDADDRESS");
-    await expect(records.promote({
+    const promoted = records.promote({
       observationId: source, namespaceId: ns, rescuedBy: theirTrigger, confidence: 0.7,
-    })).rejects.toMatchObject({ code: "23503", constraint: "permanent_record_rescued_by_fk" });
+    });
+    await expect(promoted).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(promoted).rejects.toMatchObject({ sqlstate: "23503", constraint: "permanent_record_rescued_by_fk" });
     const rows = await db.selectFrom("permanent_record").select(["record_id"])
       .where("observation_id", "=", source).execute();
     expect(rows).toEqual([]);
@@ -392,9 +410,11 @@ describe("permanent_record.rescued_by, now that trigger_event exists", () => {
 
   it("refuses a rescued_by that names no trigger, by foreign key", async () => {
     const source = await appendUnder("GOLDADDRESS");
-    await expect(records.promote({
+    const promoted = records.promote({
       observationId: source, namespaceId: ns, rescuedBy: randomUUID(), confidence: 0.7,
-    })).rejects.toMatchObject({ code: "23503", constraint: "permanent_record_rescued_by_fk" });
+    });
+    await expect(promoted).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(promoted).rejects.toMatchObject({ sqlstate: "23503", constraint: "permanent_record_rescued_by_fk" });
     const rows = await db.selectFrom("permanent_record").select(["record_id"])
       .where("observation_id", "=", source).execute();
     expect(rows).toEqual([]);

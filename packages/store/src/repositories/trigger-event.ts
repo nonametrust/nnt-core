@@ -46,7 +46,7 @@ export class TriggerEventRepository {
    * harm-confirmed, a status outside the three grades and a surprise that is
    * not a finite number are refused by the check constraints, and a
    * namespace the observation does not belong to by the foreign key; each
-   * comes back as the driver's error with the SQLSTATE and constraint name
+   * is raised as ConstraintViolation with the SQLSTATE and constraint name
    * on it, as tag's `open` does for the same kinds of caller defect.
    */
   async record(input: RecordTriggerEvent): Promise<StoredTriggerEvent> {

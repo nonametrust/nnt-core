@@ -7,8 +7,8 @@ import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import {
-  AppendOnlyViolation, NamespaceShredded, ObservationNotFound, PermanentRecordNotFound,
-  StateNotPromotable, StoreError, mapPgError,
+  AppendOnlyViolation, ConstraintViolation, NamespaceShredded, ObservationNotFound,
+  PermanentRecordNotFound, StateNotPromotable, StoreError, mapPgError,
 } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
@@ -223,8 +223,9 @@ describe("the invariant the table holds on its own", () => {
       rescuedBy: null, confidence: 0.8,
     };
     await records.promote(input);
-    await expect(records.promote({ ...input, confidence: 0.9 }))
-      .rejects.toMatchObject({ code: "23505", constraint: "permanent_record_once" });
+    const again = records.promote({ ...input, confidence: 0.9 });
+    await expect(again).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(again).rejects.toMatchObject({ sqlstate: "23505", constraint: "permanent_record_once" });
   });
 
   // The same finding Task 7's review made against tag: two independent keys
@@ -233,19 +234,25 @@ describe("the invariant the table holds on its own", () => {
   it("refuses a record filed under a namespace its observation does not belong to", async () => {
     const other = await namespaces.ensure({ kind: "wallet", id: "SOMEONEELSE" });
     const { observation } = await observations.append(anEventOn("2026-09-16T09:00:00.000Z"));
-    await expect(records.promote({
+    const filed = records.promote({
       observationId: observation.observationId!, namespaceId: other.namespaceId,
       rescuedBy: null, confidence: 0.8,
-    })).rejects.toMatchObject({ code: "23503", constraint: "permanent_record_observation_in_namespace" });
+    });
+    await expect(filed).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(filed).rejects.toMatchObject({
+      sqlstate: "23503", constraint: "permanent_record_observation_in_namespace",
+    });
   });
 
   it("holds confidence to the unit interval, NaN included", async () => {
     for (const confidence of [-0.1, 1.1, Number.NaN, Number.POSITIVE_INFINITY]) {
       const { observation } = await observations.append(anEventOn("2026-09-17T09:00:00.000Z"));
-      await expect(records.promote({
+      const promoted = records.promote({
         observationId: observation.observationId!, namespaceId: ns,
         rescuedBy: null, confidence,
-      })).rejects.toMatchObject({ code: "23514", constraint: "permanent_record_confidence" });
+      });
+      await expect(promoted).rejects.toBeInstanceOf(ConstraintViolation);
+      await expect(promoted).rejects.toMatchObject({ sqlstate: "23514", constraint: "permanent_record_confidence" });
     }
   });
 });

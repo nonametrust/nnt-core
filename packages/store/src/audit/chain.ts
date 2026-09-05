@@ -384,25 +384,40 @@ export class AuditChain {
    * The head as of the close, not the last entry that occurred on the day:
    * a day on which nothing was decided is still a day the chain stood at
    * some head, and a seal for every day is what an auditor walks. The head
-   * at close is the entry with the highest sequence number whose instant
-   * precedes the close. That is the tie rule under writer clock skew: an
-   * entry with a higher sequence but an earlier instant is under the seal,
-   * and one with a lower sequence but a later instant is not; the seal
-   * follows the instants the entries themselves carry, which is what the
-   * chain hashes over. A day before the first entry has no head to seal and
-   * is refused by class.
+   * at close, when a day is first sealed, is the entry with the highest
+   * sequence number whose instant precedes the close. That is the tie rule
+   * under writer clock skew: an entry with a higher sequence but an earlier
+   * instant is under the seal, and one with a lower sequence but a later
+   * instant is not; the seal follows the instants the entries themselves
+   * carry, which is what the chain hashes over. A day before the first
+   * entry has no head to seal and is refused by class.
+   *
+   * That rule is applied once, at the first seal, and never re-derived
+   * against an existing one. The chain trigger makes sequence order the
+   * chain order, but nothing makes the instant monotone: it comes from the
+   * injected clock, and a wall clock stepped back across midnight, a
+   * restored virtual machine or any caller with a fixed clock appends an
+   * entry whose instant falls before a sealed day's close. Recomputed, that
+   * day's head would move, and every later re-run would raise, permanently,
+   * about rows that went in through the live trigger and were never a
+   * tamper. The seal states that at the close of a given day the head was a
+   * particular entry with a particular hash. A later backdated entry does
+   * not falsify that statement.
    *
    * A day that has not closed on the clock is refused. A seal fixes a head
    * that later entries of an open day would contradict, and the table
    * refuses rewrites, so it could not be corrected.
    *
    * Re-running is the normal case for a nightly job, not an error. A day
-   * already sealed over the same head returns; one whose head at close has
-   * moved since is SealMismatch, since that difference is the signal the
-   * seal exists to give, and it is raised rather than overwritten. Two runs
-   * arriving at once both find no seal and both insert; the loser's unique
-   * violation is caught once and it re-reads, so it too returns or raises
-   * by the same comparison.
+   * already sealed is checked against the entry it sealed: the row at the
+   * stored terminal sequence must still carry the stored terminal hash, and
+   * the stored HMAC must still verify over it. When both hold the run
+   * returns; when either fails it is SealMismatch, since a sealed entry no
+   * longer under its hash, or a seal no longer under its key, is a rewrite,
+   * which is the signal the seal exists to give, and it is raised rather
+   * than overwritten. Two runs arriving at once both find no seal and both
+   * insert; the loser's unique violation is caught once and it re-reads, so
+   * it too returns or raises by the same check.
    *
    * This does not verify the chain first. The seal states what the head
    * was; `verify` states that the chain is internally consistent. A seal
@@ -417,31 +432,40 @@ export class AuditChain {
     if (this.clock.now().getTime() < close.getTime()) {
       throw new DayNotClosed(`${day} has not closed; it cannot be sealed before ${close.toISOString()}`);
     }
-    const terminal = await this.db
-      .selectFrom("audit_entry")
-      .select(["seq", "entry_sha256"])
-      .where("occurred_at", "<", close)
-      .orderBy("seq", "desc")
-      .limit(1)
-      .executeTakeFirst();
-    if (!terminal) {
-      throw new NothingToSeal(`nothing had been appended to the audit chain by the close of ${day}`);
-    }
-    const hmac = createHmac("sha256", this.ring.deriveKey(AUDIT_DAY_SEAL_LABEL))
-      .update(Buffer.from(day, "utf8"))
-      .update(terminal.entry_sha256)
-      .digest();
+    const key = this.ring.deriveKey(AUDIT_DAY_SEAL_LABEL);
     for (let attempt = 0; ; attempt++) {
       const existing = await this.db
         .selectFrom("audit_day")
-        .select(["terminal_sha256", "hmac"])
+        .select(["terminal_seq", "terminal_sha256", "hmac"])
         .where(sql<boolean>`day = ${day}::date`)
         .executeTakeFirst();
       if (existing) {
-        if (existing.terminal_sha256.equals(terminal.entry_sha256) && existing.hmac.equals(hmac)) return;
+        // Checked against the entry it sealed, not against a recomputed
+        // head: see the tie rule above for why a recomputed head is not
+        // the seal's statement.
+        const sealed = await this.db
+          .selectFrom("audit_entry")
+          .select(["entry_sha256"])
+          .where("seq", "=", existing.terminal_seq)
+          .executeTakeFirst();
+        const entryStands = sealed !== undefined && sealed.entry_sha256.equals(existing.terminal_sha256);
+        const sealVerifies = sealHmac(key, day, existing.terminal_sha256).equals(existing.hmac);
+        if (entryStands && sealVerifies) return;
         throw new SealMismatch(
-          `${day} is already sealed over a different head; the head at its close is now entry ${terminal.seq}`,
+          entryStands
+            ? `${day} is sealed, and its seal no longer verifies under the derived key`
+            : `${day} is sealed over entry ${existing.terminal_seq}, which no longer carries the hash it was sealed under`,
         );
+      }
+      const terminal = await this.db
+        .selectFrom("audit_entry")
+        .select(["seq", "entry_sha256"])
+        .where("occurred_at", "<", close)
+        .orderBy("seq", "desc")
+        .limit(1)
+        .executeTakeFirst();
+      if (!terminal) {
+        throw new NothingToSeal(`nothing had been appended to the audit chain by the close of ${day}`);
       }
       try {
         await this.db
@@ -450,16 +474,28 @@ export class AuditChain {
             day,
             terminal_seq: terminal.seq,
             terminal_sha256: terminal.entry_sha256,
-            hmac,
+            hmac: sealHmac(key, day, terminal.entry_sha256),
             sealed_at: this.clock.now(),
           })
           .execute();
         return;
       } catch (err) {
+        // The driver's raw 23505, looked at before any mapping: mapPgError
+        // would turn it into ConstraintViolation, and to this loop a
+        // duplicate is the race it exists for, not a failure.
         if (attempt > 0 || !isUniqueViolation(err)) throw err;
       }
     }
   }
+}
+
+/**
+ * HMAC-SHA256 over the day and a terminal hash under the derived seal key.
+ * The day is in the input so a seal cannot be moved to another day; the
+ * same function makes a seal and checks one, so the two cannot drift.
+ */
+function sealHmac(key: Buffer, day: string, terminalSha256: Buffer): Buffer {
+  return createHmac("sha256", key).update(Buffer.from(day, "utf8")).update(terminalSha256).digest();
 }
 
 function isUniqueViolation(err: unknown): boolean {
