@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
@@ -62,8 +62,11 @@ describe("datedAt", () => {
     const dateFields = /\b(observedAt|validFrom|validUntil)\b/;
     const offenders: string[] = [];
     for (const entry of readdirSync(srcDir, { recursive: true, withFileTypes: true })) {
-      if (!entry.isFile() || !source.test(entry.name) || test.test(entry.name)) continue;
+      if (!source.test(entry.name) || test.test(entry.name)) continue;
       const file = join(entry.parentPath, entry.name);
+      // stat follows a symlink; the dirent's own isFile() is false for one,
+      // which let a symlinked module ship through tsc while this gate skipped it.
+      if (!statSync(file).isFile()) continue;
       const rel = relative(srcDir, file);
       if (exempt.has(rel)) continue;
       readFileSync(file, "utf8").split("\n").forEach((line, i) => {

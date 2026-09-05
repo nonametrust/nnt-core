@@ -5,5 +5,13 @@
     "rootDir": "src"
   },
   "include": ["src"],
-  "exclude": ["src/**/*.test.ts"]
+  // Every extension the compiler admits, so a test file cannot reach dist by
+  // renaming. CI proves the property after each build: no dist file matches
+  // *.test.*. tsconfig.test.json resets this list to typecheck the tests.
+  "exclude": [
+    "src/**/*.test.ts",
+    "src/**/*.test.mts",
+    "src/**/*.test.cts",
+    "src/**/*.test.tsx"
+  ]
 }

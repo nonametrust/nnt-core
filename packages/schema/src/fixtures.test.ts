@@ -1,11 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join } from "node:path";
 import { CHANNELS } from "./channel.js";
 import { validateObservation } from "./payloads.js";
 
 const dir = new URL("../fixtures/", import.meta.url).pathname;
-const packageRoot = new URL("../", import.meta.url).pathname;
 
 function fixture(channel: string): Record<string, unknown> {
   return JSON.parse(readFileSync(join(dir, `${channel}.json`), "utf8"));
@@ -117,25 +116,8 @@ describe("golden fixtures", () => {
     });
   });
 
-  // No tracked file in this package may contain a real Stellar address. The
-  // study this engine comes from shipped five real addresses in fixtures that
-  // its README called synthetic, and its compiled artefacts identify defrauded
-  // accounts. The gate rejects anything shaped like a StrKey account or muxed
-  // account, checksum-valid or not, so a synthetic identifier has to be
-  // obviously synthetic: short, like GPROVIDERADDRESS.
-  it("no fixture or source file contains a Stellar-shaped address", () => {
-    const strkey = /\b(?:G[A-Z2-7]{55}|M[A-Z2-7]{68})\b/;
-    const skip = new Set(["node_modules", "dist"]);
-    const offenders: string[] = [];
-    for (const entry of readdirSync(packageRoot, { recursive: true, withFileTypes: true })) {
-      const file = join(entry.parentPath, entry.name);
-      const rel = relative(packageRoot, file);
-      if (!entry.isFile() || rel.split("/").some((seg) => skip.has(seg))) continue;
-      readFileSync(file, "utf8").split("\n").forEach((line, i) => {
-        if (strkey.test(line)) offenders.push(`${rel}:${i + 1}: ${line.trim()}`);
-      });
-    }
-    expect(offenders, "these lines contain a Stellar-shaped address:\n" + offenders.join("\n"))
-      .toEqual([]);
-  });
+  // The gate that no tracked file contains a Stellar-shaped address lives at
+  // the repository root, gates/no-stellar-address.test.ts, and scans every
+  // tracked file, these fixtures included. It used to live here and covered
+  // one package; the repository goes public at the v0 tag, so it covers all.
 });

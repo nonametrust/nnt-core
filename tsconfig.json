@@ -1,0 +1,6 @@
+{
+  // Typecheck-only view of the root gates. Packages carry their own configs.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": { "noEmit": true },
+  "include": ["gates"]
+}

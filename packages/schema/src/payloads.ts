@@ -141,7 +141,13 @@ function formatIssue(issue: z.ZodIssue, root: string, prefix: string[] = []): st
   return `${path || root}: ${issue.message}`;
 }
 
-/** Assigned by the engine on ingest; their presence on the wire is an error. */
+/**
+ * Assigned by the engine on ingest; their presence on the wire is an error.
+ * Presence is tested with `in`, not by value, so a direct TypeScript caller
+ * that passes an explicit `observationId: undefined` is refused too. JSON has
+ * no undefined, so the only way that key arrives is a caller spreading an
+ * engine-side object back onto the wire, and the fix is the same: drop it.
+ */
 const ENGINE_ASSIGNED = ["observationId", "ingestedAt"] as const;
 
 /**

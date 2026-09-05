@@ -17,3 +17,15 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm build
+      # "The build emits no test file" was checked by hand until now. The
+      # exclusion list in each package's tsconfig is the mechanism; this is
+      # the gate on it.
+      - name: No test file reaches dist
+        run: |
+          offenders="$(find packages -path '*/node_modules' -prune -o -path '*/dist/*' -name '*.test.*' -print)"
+          if [ -n "$offenders" ]; then
+            echo "test files in dist:"
+            echo "$offenders"
+            exit 1
+          fi
