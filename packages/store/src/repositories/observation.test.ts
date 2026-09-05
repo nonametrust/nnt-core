@@ -1,0 +1,252 @@
+import { randomBytes, randomUUID } from "node:crypto";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { deriveIdempotencyKey, observationSchema, type WireObservation } from "@nonametrust/schema";
+import { sql } from "kysely";
+import type { Db } from "../db.js";
+import { withSchema } from "../testing/harness.js";
+import { keyRingFromEnv, newDataKey } from "../crypto.js";
+import { fixedClock } from "../clock.js";
+import { NamespaceShredded, ObservationNotFound, StoreError } from "../errors.js";
+import { NamespaceRepository } from "./namespace.js";
+import { ObservationRepository } from "./observation.js";
+
+let db: Db;
+let done: () => Promise<void>;
+let observations: ObservationRepository;
+let namespaces: NamespaceRepository;
+const ring = keyRingFromEnv(
+  { NNT_MASTER_KEY: randomBytes(32).toString("base64") } as NodeJS.ProcessEnv,
+);
+const clock = fixedClock(new Date("2026-09-07T00:00:00.000Z"));
+
+const src = {
+  producer: "stellar-indexer", producerVersion: "0.1.0",
+  network: "testnet", ref: "op:1", fetchedAt: "2026-09-05T10:00:00.000Z",
+};
+
+function anEvent(over: Record<string, unknown> = {}): WireObservation {
+  return {
+    schemaVersion: "0.1.0",
+    namespace: { kind: "wallet", id: "GOLDADDRESS" },
+    channel: "volume", evidenceKind: "event", kind: "payment",
+    observedAt: "2026-09-12T09:00:00.000Z",
+    source: src, payload: { amount: "500.0000000" },
+    salienceHints: { amount: "500.0000000" },
+    ...over,
+  } as WireObservation;
+}
+
+function aState(over: Record<string, unknown> = {}): WireObservation {
+  return {
+    schemaVersion: "0.1.0",
+    namespace: { kind: "wallet", id: "GOLDADDRESS" },
+    channel: "protocol", evidenceKind: "state", kind: "trustline_open",
+    validFrom: "2026-09-01T00:00:00.000Z", validUntil: null,
+    source: { ...src, ref: "op:state:1" }, payload: {},
+    ...over,
+  } as WireObservation;
+}
+
+beforeAll(async () => {
+  ({ db, done } = await withSchema("obs_test"));
+  namespaces = new NamespaceRepository(db, ring, clock);
+  observations = new ObservationRepository(db, namespaces, clock);
+});
+afterAll(async () => { await done(); });
+
+describe("the round trip", () => {
+  it("returns every wire field it was given", async () => {
+    const input = anEvent({ source: { ...src, ref: "op:rt:1" } });
+    const { observation, created } = await observations.append(input);
+    expect(created).toBe(true);
+    const read = await observations.get(observation.observationId!);
+    const parsed = observationSchema.parse(read) as Record<string, unknown>;
+    for (const key of Object.keys(input)) {
+      expect(parsed[key]).toEqual((input as Record<string, unknown>)[key]);
+    }
+  });
+
+  it("assigns the two fields ingest owns, and they are well-formed", async () => {
+    const { observation } = await observations.append(anEvent({ source: { ...src, ref: "op:rt:2" } }));
+    expect(observation.observationId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(observation.ingestedAt).toBe("2026-09-07T00:00:00.000Z");
+  });
+
+  it("carries the muxed identifier and the continuity assertion back out", async () => {
+    const input = anEvent({
+      source: { ...src, ref: "op:rt:3" },
+      namespace: {
+        kind: "wallet", id: "GOLDADDRESS", muxedId: "42",
+        continuity: {
+          assertedBy: "ops", assertedAt: "2026-09-06T00:00:00.000Z", reason: "same operator",
+        },
+      },
+    });
+    const { observation } = await observations.append(input);
+    const read = await observations.get(observation.observationId!);
+    expect(read.namespace).toEqual((input as Record<string, unknown>).namespace);
+  });
+
+  it("leaves a state undated, so a standing condition never enters a timing computation", async () => {
+    const { observation } = await observations.append(aState());
+    const row = await db.selectFrom("observation").select(["dated_at"])
+      .where("observation_id", "=", observation.observationId!).executeTakeFirstOrThrow();
+    expect(row.dated_at).toBeNull();
+    const read = await observations.get(observation.observationId!);
+    expect(read.evidenceKind).toBe("state");
+  });
+
+  it("dates an event by its own instant", async () => {
+    const { observation } = await observations.append(anEvent({ source: { ...src, ref: "op:rt:4" } }));
+    const row = await db.selectFrom("observation").select(["dated_at"])
+      .where("observation_id", "=", observation.observationId!).executeTakeFirstOrThrow();
+    expect(row.dated_at?.toISOString()).toBe("2026-09-12T09:00:00.000Z");
+  });
+
+  it("names a missing observation by class, so a bad id is not mistaken for a bug", async () => {
+    await expect(observations.get(randomUUID())).rejects.toBeInstanceOf(ObservationNotFound);
+    await expect(observations.get(randomUUID())).rejects.toBeInstanceOf(StoreError);
+    expect(await observations.byIdempotencyKey("no such key")).toBeNull();
+  });
+});
+
+// The repository derives dated_at and evidence_kind from one parsed object, so
+// it cannot write a row that breaks either direction of the invariant. These
+// two go under the repository, by raw SQL, and prove the database refuses the
+// rows a repository bug or a hand-written script could otherwise produce. The
+// constraint name is asserted because it is what tells the two directions
+// apart when one fires.
+describe("the invariant the table holds on its own", () => {
+  function rawRow(evidenceKind: string, datedAt: Date | null) {
+    return sql`
+      insert into observation (
+        observation_id, idempotency_key, namespace_id, channel, kind, evidence_kind,
+        dated_at, ingested_at, payload_nonce, payload_tag, payload_ciphertext
+      )
+      select ${randomUUID()}, ${randomUUID()}, namespace_id, 'protocol', 'raw', ${evidenceKind},
+        ${datedAt}, ${clock.now()}, decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
+      from namespace limit 1
+    `.execute(db);
+  }
+
+  it("refuses a dated state", async () => {
+    await namespaces.ensure({ kind: "wallet", id: "RAWROWS" });
+    await expect(rawRow("state", new Date("2026-09-01T00:00:00.000Z")))
+      .rejects.toMatchObject({ code: "23514", constraint: "observation_state_is_undated" });
+  });
+
+  it("refuses an undated event", async () => {
+    await namespaces.ensure({ kind: "wallet", id: "RAWROWS" });
+    await expect(rawRow("event", null))
+      .rejects.toMatchObject({ code: "23514", constraint: "observation_event_is_dated" });
+  });
+});
+
+describe("idempotency", () => {
+  it("yields one observation for the same source event twice", async () => {
+    const input = anEvent({ source: { ...src, ref: "op:dup:1" } });
+    const first = await observations.append(input);
+    const second = await observations.append(input);
+    expect(first.created).toBe(true);
+    expect(second.created).toBe(false);
+    expect(second.observation.observationId).toBe(first.observation.observationId);
+  });
+
+  it("keeps the two sides of one payment apart, because the namespace is in the key", async () => {
+    const ref = "op:twosided:1";
+    const sender = await observations.append(anEvent({
+      source: { ...src, ref }, namespace: { kind: "wallet", id: "SENDER" },
+    }));
+    const receiver = await observations.append(anEvent({
+      source: { ...src, ref }, namespace: { kind: "wallet", id: "RECEIVER" },
+    }));
+    expect(receiver.created).toBe(true);
+    expect(receiver.observation.observationId).not.toBe(sender.observation.observationId);
+  });
+
+  it("stores the derived key, not one a caller invented", async () => {
+    const input = anEvent({ source: { ...src, ref: "op:key:1" } });
+    const { observation } = await observations.append(input);
+    const row = await db.selectFrom("observation").select(["idempotency_key"])
+      .where("observation_id", "=", observation.observationId!).executeTakeFirstOrThrow();
+    expect(row.idempotency_key).toBe(
+      deriveIdempotencyKey(input.source, input.channel, input.namespace),
+    );
+  });
+
+  // The race itself, made deterministic: this instance's first pre-read sees
+  // nothing, as a writer that lost the race would, and its insert then lands
+  // on the row the winner stored. The loser must come back with the winner's
+  // observation and `created: false`, not with an error.
+  it("returns the winner's row when a concurrent writer stored the key first", async () => {
+    const input = anEvent({ source: { ...src, ref: "op:race:1" } });
+    const winner = await observations.append(input);
+    const loser = new ObservationRepository(db, namespaces, clock);
+    const realRead = loser.byIdempotencyKey.bind(loser);
+    let blind = true;
+    loser.byIdempotencyKey = async (key: string) => {
+      if (blind) { blind = false; return null; }
+      return realRead(key);
+    };
+    const result = await loser.append(input);
+    expect(result.created).toBe(false);
+    expect(result.observation.observationId).toBe(winner.observation.observationId);
+  });
+
+  // The read-then-insert in append has a race, and the insert's failure is
+  // how the loser learns it lost. Only a unique violation on the key is that
+  // race. Any other failed insert must surface as the failure it was: a
+  // caller told "already stored" when nothing was stored has lost evidence
+  // with no error anywhere, which is the failure this whole table exists to
+  // prevent. The stub hands back a namespace that has no row, so the insert
+  // fails on the foreign key and not on the key.
+  it("does not report a failed insert as already stored", async () => {
+    const orphan = {
+      ensure: async () => ({ namespaceId: randomUUID(), kind: "wallet", nsId: "ORPHAN", shreddedAt: null }),
+      dataKey: async () => newDataKey(),
+    } as unknown as NamespaceRepository;
+    const broken = new ObservationRepository(db, orphan, clock);
+    const input = anEvent({ source: { ...src, ref: "op:orphan:1" }, namespace: { kind: "wallet", id: "ORPHAN" } });
+    await expect(broken.append(input)).rejects.toMatchObject({ code: "23503" });
+    expect(await observations.byIdempotencyKey(
+      deriveIdempotencyKey(input.source, input.channel, input.namespace),
+    )).toBeNull();
+  });
+});
+
+describe("append-only", () => {
+  it("refuses an UPDATE, loudly and by SQLSTATE", async () => {
+    const { observation } = await observations.append(anEvent({ source: { ...src, ref: "op:ao:1" } }));
+    await expect(
+      sql`update observation set kind = 'tampered' where observation_id = ${observation.observationId}`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "NNT01" });
+  });
+
+  it("refuses a DELETE", async () => {
+    const { observation } = await observations.append(anEvent({ source: { ...src, ref: "op:ao:2" } }));
+    await expect(
+      sql`delete from observation where observation_id = ${observation.observationId}`.execute(db),
+    ).rejects.toMatchObject({ code: "NNT01" });
+  });
+
+  it("exposes no update or delete on the repository surface at all", () => {
+    const surface = Object.getOwnPropertyNames(ObservationRepository.prototype);
+    expect(surface.filter((m) => /update|delete|remove/i.test(m))).toEqual([]);
+  });
+});
+
+describe("shredding", () => {
+  it("leaves the row and refuses the read, by class", async () => {
+    const ns = await namespaces.ensure({ kind: "wallet", id: "SHREDOBS" });
+    const { observation } = await observations.append(anEvent({
+      source: { ...src, ref: "op:shred:1" }, namespace: { kind: "wallet", id: "SHREDOBS" },
+    }));
+    await namespaces.shred(ns.namespaceId);
+    const row = await db.selectFrom("observation").select(["observation_id"])
+      .where("observation_id", "=", observation.observationId!).executeTakeFirst();
+    expect(row).toBeDefined();
+    await expect(observations.get(observation.observationId!))
+      .rejects.toBeInstanceOf(NamespaceShredded);
+  });
+});

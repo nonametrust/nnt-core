@@ -16,6 +16,19 @@ export interface Schema {
     key_shredded_at: Date | null;
     created_at: Date;
   };
+  observation: {
+    observation_id: string;
+    idempotency_key: string;
+    namespace_id: string;
+    channel: string;
+    kind: string;
+    evidence_kind: string;
+    dated_at: Date | null;
+    ingested_at: Date;
+    payload_nonce: Buffer;
+    payload_tag: Buffer;
+    payload_ciphertext: Buffer;
+  };
 }
 
 export type Db = Kysely<Schema>;

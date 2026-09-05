@@ -15,6 +15,10 @@ export class NamespaceShredded extends StoreError {}
 // resolve as success: nothing was examined, and "the data is gone" would be
 // reported to an operator about data that was never looked for.
 export class NamespaceNotFound extends StoreError {}
+// Also raised in TypeScript. A read of an identifier no row carries is a
+// caller's condition, not the store's defect, and a generic Error would make
+// the two indistinguishable at the call site.
+export class ObservationNotFound extends StoreError {}
 export class MigrationDrift extends StoreError {}
 
 const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreError> = {
