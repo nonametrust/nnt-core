@@ -117,6 +117,14 @@ create table hot_window (
 -- trigger_event did not exist when that migration ran. 0004 declared the
 -- column with no constraint, on purpose, and this is the only place one is
 -- added.
+--
+-- The key is the pair with namespace_id, against the pair trigger_event
+-- holds unique above, for the design's locality criterion: an unrelated
+-- counterparty's tags are not promoted by a trigger, and a record in one
+-- namespace rescued by a trigger in another is that violation written
+-- down. rescued_by is nullable and the key is MATCH SIMPLE, so a null
+-- rescued_by skips the check, which is what an optional column wants;
+-- namespace_id is not null, so a non-null rescued_by is always checked.
 alter table permanent_record
   add constraint permanent_record_rescued_by_fk
-  foreign key (rescued_by) references trigger_event (trigger_id);
+  foreign key (rescued_by, namespace_id) references trigger_event (trigger_id, namespace_id);

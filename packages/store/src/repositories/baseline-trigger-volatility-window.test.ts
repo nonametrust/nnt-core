@@ -370,6 +370,26 @@ describe("permanent_record.rescued_by, now that trigger_event exists", () => {
     expect((await records.get(record.recordId)).rescuedBy).toBe(trig);
   });
 
+  // The design's locality criterion: an unrelated counterparty's tags are
+  // not promoted by a trigger. A record in one namespace rescued by a
+  // trigger in another is that violation written down, so the key is the
+  // pair, against the pair trigger_event holds unique. A null rescued_by
+  // skips the pair check, which is what an optional column wants.
+  it("refuses a rescued_by whose trigger belongs to another namespace", async () => {
+    const other = (await namespaces.ensure({ kind: "wallet", id: "SOMEONEELSE" })).namespaceId;
+    const theirs = await appendUnder("SOMEONEELSE");
+    const theirTrigger = (await triggers.record({
+      namespaceId: other, observationId: theirs, status: "verified", surprise: 5,
+    })).triggerId;
+    const source = await appendUnder("GOLDADDRESS");
+    await expect(records.promote({
+      observationId: source, namespaceId: ns, rescuedBy: theirTrigger, confidence: 0.7,
+    })).rejects.toMatchObject({ code: "23503", constraint: "permanent_record_rescued_by_fk" });
+    const rows = await db.selectFrom("permanent_record").select(["record_id"])
+      .where("observation_id", "=", source).execute();
+    expect(rows).toEqual([]);
+  });
+
   it("refuses a rescued_by that names no trigger, by foreign key", async () => {
     const source = await appendUnder("GOLDADDRESS");
     await expect(records.promote({
