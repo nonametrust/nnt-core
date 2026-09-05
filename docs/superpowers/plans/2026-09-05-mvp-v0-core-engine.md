@@ -620,8 +620,8 @@ git commit -m "Schema: the observation, with events and states kept strictly apa
 - Test: `packages/schema/src/idempotency.test.ts`
 
 **Interfaces:**
-- Consumes: `type Source` from `./source.js`, `type Channel` from `./channel.js`
-- Produces: `deriveIdempotencyKey(source: Source, channel: Channel): string`, keyed on producer, network, ref and channel
+- Consumes: `type Source` from `./source.js`, `type Channel` from `./channel.js`, `type NamespaceRef` from `./namespace.js`
+- Produces: `deriveIdempotencyKey(source: Source, channel: Channel, namespace: NamespaceRef): string`, keyed on producer, network, ref, channel and the namespace
 
 - [ ] **Step 1: Write the failing test**
 
@@ -719,9 +719,22 @@ import type { Source } from "./source.js";
  * producer and reference could be re-partitioned into a different pair with the
  * same concatenation.
  */
-export function deriveIdempotencyKey(source: Source, channel: Channel): string {
+export function deriveIdempotencyKey(
+  source: Source,
+  channel: Channel,
+  namespace: NamespaceRef,
+): string {
   return createHash("sha256")
-    .update([source.producer, source.network ?? "", source.ref, channel].join("\u0000"))
+    .update(
+      [
+        source.producer,
+        source.network ?? "",
+        source.ref,
+        channel,
+        namespace.kind,
+        namespace.id,
+      ].join("\u0000"),
+    )
     .digest("hex");
 }
 ```
@@ -961,7 +974,7 @@ export function validateObservation(input: unknown): ValidationResult {
   }
   return {
     ok: true,
-    value: { ...o, idempotencyKey: deriveIdempotencyKey(o.source, o.channel) },
+    value: { ...o, idempotencyKey: deriveIdempotencyKey(o.source, o.channel, o.namespace) },
   };
 }
 ```
