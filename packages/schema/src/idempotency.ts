@@ -36,7 +36,9 @@ import type { Source } from "./source.js";
  * rejects a NUL in `network` and `ref`, `namespaceRefSchema` rejects one in
  * `id`, and this function refuses one in any part as well, so the key stays
  * unambiguous for input that reached it without validation. `producer` is
- * constrained by its own regex, and `channel` and `kind` are enums.
+ * constrained by its own regex, and `channel` and the namespace `kind` are
+ * enums. The observation's own `kind`, the free-string source event type, is
+ * not a part of the key at all.
  *
  * An absent network occupies its slot as the empty string. The schema requires
  * a declared network to be non-empty, so absent and empty never collide.

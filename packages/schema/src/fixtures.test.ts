@@ -1,10 +1,15 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { CHANNELS } from "./channel.js";
 import { validateObservation } from "./payloads.js";
 
-const dir = new URL("../fixtures/", import.meta.url).pathname;
+// fileURLToPath, not URL.pathname: pathname is percent-encoded, so a checkout
+// under a directory with a space or a non-ASCII character in its name (this
+// team has several) made this suite alone fail with ENOENT. timing.test.ts and
+// the root gate already convert this way.
+const dir = fileURLToPath(new URL("../fixtures/", import.meta.url));
 
 function fixture(channel: string): Record<string, unknown> {
   return JSON.parse(readFileSync(join(dir, `${channel}.json`), "utf8"));
@@ -22,6 +27,27 @@ describe("golden fixtures", () => {
     for (const c of CHANNELS) {
       const raw = JSON.parse(readFileSync(join(dir, `${c}.json`), "utf8"));
       expect(validateObservation(raw).ok, `${c} fixture failed`).toBe(true);
+    }
+  });
+
+  // Every other key test is relational, equal or not equal, so swapping two
+  // parts or changing the separator would pass them all. The indexer writes
+  // keys to disk from 16 September and its acceptance test compares key sets
+  // between runs, so a silent re-derivation would re-key everything with no
+  // error anywhere. These two literals pin the derivation as it stands: the
+  // part order, the separator and the digest. Changing any of them is a
+  // migration and must fail here first.
+  it("derives the frozen literal keys for the volume and protocol fixtures", () => {
+    const volume = validateObservation(fixture("volume"));
+    const protocol = validateObservation(fixture("protocol"));
+    expect(volume.ok && protocol.ok).toBe(true);
+    if (volume.ok) {
+      expect(volume.value.idempotencyKey)
+        .toBe("e1708e874140819eab0b11a93398a2770d90a4bd541659ad97a6977c808f3857");
+    }
+    if (protocol.ok) {
+      expect(protocol.value.idempotencyKey)
+        .toBe("1f8a7e9076b82a6b83d2f5034eb6b135f7fecdaa76a238835995ebfab2456384");
     }
   });
 

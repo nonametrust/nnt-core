@@ -1,6 +1,19 @@
 import { describe, it, expect } from "vitest";
-import { observationSchema } from "./observation.js";
+import { observationSchema, type Observation, type WireObservation } from "./observation.js";
 import { EVIDENCE_KINDS } from "./channel.js";
+
+// Type-level gates on WireObservation, checked by `pnpm typecheck`. The wire
+// type must refuse the two fields the validator refuses, keep the optional
+// precomputed key, and stay a discriminated union so that an event still
+// needs its instant and a state its interval.
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
+type Assert<T extends true> = T;
+type _wireHasNoEngineFields =
+  Assert<Equal<Extract<keyof WireObservation, "observationId" | "ingestedAt">, never>>;
+type _wireKeepsOptionalKey = Assert<Equal<WireObservation["idempotencyKey"], string | undefined>>;
+type _wireIsAssignableToStored = Assert<WireObservation extends Observation ? true : false>;
+type _wireIsStillAUnion = Assert<Equal<Extract<WireObservation, { evidenceKind: "state" }>["validFrom"], string>>;
 
 const base = {
   schemaVersion: "0.1.0",

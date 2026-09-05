@@ -85,6 +85,26 @@ describe("idempotency key", () => {
       .toBe(deriveIdempotencyKey(src, "volume", ns));
   });
 
+  it("ignores a muxed identifier on the namespace", () => {
+    // The muxed identifier is an attribute of the namespace, like continuity.
+    // The base address is the counterparty; two payments to two muxed ids of
+    // one account are evidence about the same counterparty and must not be
+    // told apart by the key.
+    expect(deriveIdempotencyKey(src, "volume", { ...ns, muxedId: "12345" }))
+      .toBe(deriveIdempotencyKey(src, "volume", ns));
+  });
+
+  // The contract says the id is compared byte for byte. Nothing in this package
+  // trims, case-folds or URL-normalises it, and this is the gate on that: each
+  // pair below is one spelling apart and must derive two keys.
+  it("compares the namespace id byte for byte: no trimming, case folding or URL normalisation", () => {
+    const key = (id: string) => deriveIdempotencyKey(src, "volume", { kind: "endpoint", id });
+    expect(key("https://data.example/x402")).not.toBe(key("https://data.example/x402/"));
+    expect(key("https://data.example/x402")).not.toBe(key("https://DATA.example/x402"));
+    expect(key("https://data.example/x402")).not.toBe(key(" https://data.example/x402"));
+    expect(key("GABC")).not.toBe(key("gabc"));
+  });
+
   it("does not let a field boundary shift without changing the key", () => {
     // With a space separator these two concatenate identically. The test fails
     // if the separator is anything a field can contain.
@@ -96,9 +116,10 @@ describe("idempotency key", () => {
   it("does not let a namespace boundary shift without changing the key", () => {
     // The namespace kind and id are the last two parts. Each pair below
     // concatenates identically under a space separator, so the test fails if
-    // the separator is anything a field can contain. `channel` and `kind` are
-    // enums only at the type level; the derivation does not check them, so an
-    // unvalidated caller could pass the shifted values, and they are cast here.
+    // the separator is anything a field can contain. `channel` and the
+    // namespace `kind` are enums only at the type level; the derivation does
+    // not check them, so an unvalidated caller could pass the shifted values,
+    // and they are cast here. (The observation's own `kind` is not in the key.)
     // First, "x" crosses the boundary between the channel and the kind:
     // "volume" + "x wallet" versus "volume x" + "wallet".
     const a = deriveIdempotencyKey(src, "volume", { kind: "x wallet" as "wallet", id: "X" });

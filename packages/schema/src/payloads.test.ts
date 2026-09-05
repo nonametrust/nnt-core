@@ -318,6 +318,20 @@ describe("payload validators", () => {
     }
   });
 
+  // The indexer resolves a muxed address to its base address for the id and
+  // keeps the muxed identifier on the namespace. It must survive validation
+  // and must not change the key, or one account's muxed payments would count
+  // as several counterparties.
+  it("keeps a muxed identifier on the namespace and off the key", () => {
+    const plain = validateObservation(volume);
+    const muxed = validateObservation({ ...volume, namespace: { ...volume.namespace, muxedId: "12345" } });
+    expect(plain.ok && muxed.ok).toBe(true);
+    if (plain.ok && muxed.ok) {
+      expect(muxed.value.namespace.muxedId).toBe("12345");
+      expect(muxed.value.idempotencyKey).toBe(plain.value.idempotencyKey);
+    }
+  });
+
   it("accepts a state observation and assigns it a key too", () => {
     const r = validateObservation(state);
     expect(r.ok).toBe(true);

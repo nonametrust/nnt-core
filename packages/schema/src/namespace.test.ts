@@ -89,6 +89,20 @@ describe("namespace reference", () => {
     expect(issuePaths(r)).toEqual(["id"]);
   });
 
+  // A muxed address resolves to its base address, which is the id; the muxed
+  // identifier rides along as an attribute so it is not dropped on the wire.
+  it("accepts a muxed identifier as an attribute of the namespace", () => {
+    const r = namespaceRefSchema.safeParse({ kind: "wallet", id: "GBASE", muxedId: "12345" });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.muxedId).toBe("12345");
+  });
+
+  it("rejects an empty muxed identifier; omit the field instead", () => {
+    const r = namespaceRefSchema.safeParse({ kind: "wallet", id: "GBASE", muxedId: "" });
+    expect(r.success).toBe(false);
+    expect(issuePaths(r)).toEqual(["muxedId"]);
+  });
+
   it("rejects an unknown namespace kind", () => {
     expect(namespaceRefSchema.safeParse({ kind: "email", id: "a@b" }).success).toBe(false);
   });

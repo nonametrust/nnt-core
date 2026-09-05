@@ -19,8 +19,12 @@ const common = {
    */
   payload: z.record(z.string(), z.unknown()),
   /**
-   * Read by the salience computation without opening the payload, which is
-   * encrypted at rest, so the amount obeys the same rule as a payload amount.
+   * Read by the salience computation without opening the payload, so the
+   * amount obeys the same rule as a payload amount.
+   *
+   * Not yet enforced: that the payload is encrypted at rest, which is why the
+   * hints exist. The store belongs to a later milestone and nothing in this
+   * package encrypts anything.
    */
   salienceHints: z
     .object({
@@ -78,4 +82,22 @@ export const observationSchema = z
     }
   });
 
+/**
+ * The stored form: the engine-assigned fields are present once ingest has run.
+ * The design document's `Observation` interface describes this form.
+ */
 export type Observation = z.infer<typeof observationSchema>;
+
+// `Omit` on a union collapses it to its common keys, which would lose the
+// event/state discrimination; distributing over the members keeps it.
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/**
+ * The wire form: what a producer's mapper returns and `validateObservation`
+ * accepts. `observationId` and `ingestedAt` are absent because the validator
+ * refuses them on the wire; typing a mapper's output as this rather than as
+ * `Observation` makes that a compile-time error instead of a runtime one.
+ * `idempotencyKey` stays optional here because the validator accepts a
+ * precomputed key that equals the derived one.
+ */
+export type WireObservation = DistributiveOmit<Observation, "observationId" | "ingestedAt">;

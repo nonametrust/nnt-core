@@ -23,7 +23,16 @@ export type ContinuityAssertion = z.infer<typeof continuityAssertionSchema>;
  * Addresses, domains and endpoints are attributes of a namespace, not the
  * namespace itself. Where the integration supplies nothing richer, a wallet
  * address is the anchor. Muxed addresses resolve to the base address before
- * they reach this type; the muxed identifier is an attribute.
+ * they reach this type: `id` holds the base address and `muxedId` holds the
+ * muxed identifier, which is an attribute of the namespace and not part of
+ * which counterparty is meant, so it stays out of the idempotency key
+ * (gated in idempotency.test.ts). This is the subject's own identity; the
+ * `muxedId` on an address_integrity payload describes an advertised address
+ * inside a transition and is a different thing.
+ *
+ * The id is compared byte for byte, with no trimming, case folding or URL
+ * normalisation: two spellings are two namespaces. Gated in
+ * idempotency.test.ts.
  */
 export const namespaceRefSchema = z.object({
   kind: z.enum(["wallet", "domain", "endpoint", "merchant"]),
@@ -32,6 +41,9 @@ export const namespaceRefSchema = z.object({
   id: z.string().min(1).regex(/^[^\u0000]*$/, {
     message: "must not contain NUL, the idempotency key separator",
   }),
+  // The muxed identifier as Horizon reports it in `to_muxed_id` or
+  // `from_muxed_id`. The schema checks only that it is non-empty.
+  muxedId: z.string().min(1).optional(),
   continuity: continuityAssertionSchema.optional(),
 }).strict();
 export type NamespaceRef = z.infer<typeof namespaceRefSchema>;

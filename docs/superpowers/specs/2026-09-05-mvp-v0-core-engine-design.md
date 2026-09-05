@@ -117,6 +117,19 @@ interface Observation {
   salienceHints?: SalienceHints;
   signature?: string | null;  // present in v0, unverified in v0
 }
+```
+
+This interface is the **stored form**, after ingest. The code carries two types
+under `packages/schema`: `Observation`, the stored form, in which the
+engine-assigned fields are optional in the type because they are absent until
+ingest runs; and `WireObservation`, the wire form a producer's mapper returns,
+in which `observationId` and `ingestedAt` do not exist and the validator refuses
+them, while `idempotencyKey` may be present only if it equals the derived one.
+The payload is typed as a record in the code rather than `unknown`, because the
+validator requires an object; `payload: unknown` here means only that the
+envelope does not know the shape, the per-channel validator does.
+
+```ts
 
 interface NamespaceRef {
   kind: "wallet" | "domain" | "endpoint" | "merchant";

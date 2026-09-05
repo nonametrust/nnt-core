@@ -30,13 +30,16 @@ Node 22 and pnpm 10. Then, at the root:
 
 ```bash
 pnpm install
+pnpm build       # emits packages/*/dist; no test file may land there
 pnpm typecheck   # every package, plus the root gates
 pnpm test        # every package, then the root gates
-pnpm build       # emits packages/*/dist; no test file may land there
 ```
 
-CI runs those four in that order and then fails if any file under
-`packages/*/dist` matches `*.test.*` or `*.spec.*`.
+Build comes first because `@nonametrust/schema` resolves through `dist` and
+has no `src` fallback: a package that imports it cannot typecheck or test on a
+fresh checkout until `dist` exists, and must be rebuilt after every pull that
+touches `packages/schema`. CI runs those four in that order and then fails if
+any file under `packages/*/dist` matches `*.test.*` or `*.spec.*`.
 
 ## Gates
 
@@ -55,7 +58,9 @@ true. The ones worth knowing before you add a file:
 - **No test file in `dist`**, `*.test.*` or `*.spec.*` (CI, after `pnpm build`).
 - **Only `datedAt` reads a date off an observation**
   (`packages/schema/src/timing.test.ts`), so a state can never be credited as
-  a dated event.
+  a dated event. The gate scans `packages/schema/src` and nothing else today;
+  it extends to the engine packages when they land, and until then the claim
+  holds for this package only.
 - **The schema version is checked exactly** on every observation
   (`packages/schema/src/payloads.test.ts`), and the golden fixtures must all
   validate (`packages/schema/src/fixtures.test.ts`).

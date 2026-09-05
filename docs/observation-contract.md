@@ -17,17 +17,26 @@ Paket `@nonametrust/schema`, tek bağımlılığın bu. Kendi paketine şöyle b
 "dependencies": { "@nonametrust/schema": "workspace:*" }
 ```
 
-`main` alanı `dist/index.js`'e bakıyor, yani repoda önce bir kez `pnpm build`
-koşman gerekiyor. Sonra:
+`main` alanı `dist/index.js`'e bakıyor ve `src`'ye düşen bir yol yok: `dist`
+yoksa ya da eskiyse import ya patlar ya eski şemayı görür. O yüzden `pnpm build`
+**ilk kurulumda ve `packages/schema`'ya dokunan her pull'dan sonra** koşulur;
+kökteki sıra `pnpm build`, `pnpm typecheck`, `pnpm test` (CI de bu sırada).
+Sonra:
 
 ```ts
 import { validateObservation, deriveIdempotencyKey } from "@nonametrust/schema";
-import type { Observation, VolumePayload, ProtocolPayload, ContentPayload } from "@nonametrust/schema";
+import type { WireObservation, VolumePayload, ProtocolPayload, ContentPayload } from "@nonametrust/schema";
 
 const r = validateObservation(obj);      // obj: parse edilmiş JSON, string değil
 if (!r.ok) console.error(r.errors);       // ["alan: mesaj", ...]
 else out.write(JSON.stringify(r.value) + "\n");   // r.value.idempotencyKey atanmış geliyor
 ```
+
+Eşleyicinin dönüş tipi **`WireObservation`**, `Observation` değil. `Observation`
+depodaki biçim: motorun atadığı alanları da taşır. `WireObservation` telde
+giden biçim: `observationId` ve `ingestedAt` tipte yok, yani onları yazarsan
+`validateObservation`'ın reddetmesini beklemeden derleyici söyler.
+`idempotencyKey` iki tipte de isteğe bağlı (bölüm 10).
 
 Hatalar `alan: mesaj` biçiminde ve kontrol sırası şu: obje mi, motorun alanları
 var mı, `schemaVersion` tam eşleşiyor mu, zarf, kanalın payload'ı, varsa
@@ -76,15 +85,15 @@ eklemek şema göçü olmasın.
 | Alan | Tip | Kural |
 |---|---|---|
 | `schemaVersion` | string | Şimdilik `"0.1.0"`. Tam eşleşme; başka değer reddedilir. |
-| `namespace` | `{ kind, id, continuity? }` | Gözlemin **kim hakkında** olduğu. Bölüm 7. |
+| `namespace` | `{ kind, id, muxedId?, continuity? }` | Gözlemin **kim hakkında** olduğu. Bölüm 7. |
 | `channel` | enum | Yedi kanaldan biri. Bölüm 3. |
 | `evidenceKind` | `"event"` \| `"state"` | Anlık olay mı, süren durum mu. Bölüm 4. |
 | `kind` | string | Kaynakta ne oldu: `payment`, `memo`, `trustline_open`. Kanal değil. Serbest metin; bölüm 12. |
 | `observedAt` | UTC zaman | Sadece event'te, zorunlu. |
 | `validFrom`, `validUntil` | UTC zaman, `validUntil` null olabilir | Sadece state'te. `validUntil` yazılmazsa null sayılır, "hâlâ sürüyor" demek. `validUntil < validFrom` reddedilir. |
 | `source` | obje | Bunu kim, nereden, ne zaman okudu. Bölüm 8. |
-| `payload` | obje | Kanala özgü, zorunlu, boş obje bile olsa obje. Bölüm 3. |
-| `salienceHints` | `{ amount?, latencyMs? }` | İsteğe bağlı. Payload depoda şifreli duracak; önem hesabı payload'ı açmadan bu ipuçlarını okuyor. `volume` yazıyorsan `amount`'ı, `latency` yazıyorsan `latencyMs`'i buraya da yaz. |
+| `payload` | obje | Kanala özgü, zorunlu. Her zaman bir JSON objesi; **hiçbir zaman `null` ya da string değil**. Boş obje de geçmez: hiçbir kanal boş payload kabul etmiyor, her kanalın zorunlu alanları bölüm 3'te. |
+| `salienceHints` | `{ amount?, latencyMs? }` | İsteğe bağlı. Payload'ın depoda şifreli durması planlanıyor (henüz yok; M1'in işi); önem hesabı payload'ı açmadan bu ipuçlarını okuyacak. `volume` yazıyorsan `amount`'ı, `latency` yazıyorsan `latencyMs`'i buraya da yaz. |
 | `signature` | string \| null | İsteğe bağlı, v0'da doğrulanmıyor. Alan şimdiden var ki sonra açmak şema göçü olmasın. Yazma. |
 
 Her obje **strict**: tanınmayan bir anahtar atılmaz, gözlem reddedilir. Bu bilinçli;
@@ -190,7 +199,7 @@ Horizon `payment` kaydından kural:
 | `asset_code` | `payload.assetCode`; `asset_type: "native"` ise `"XLM"` yaz (şema bunu kontrol etmez) |
 | `id` | `source.ref: "op:<id>"` |
 | ledger zamanı (`created_at`) | `observedAt` |
-| `to_muxed_id` / `from_muxed_id` | namespace'e **girmez**; bölüm 7 ve 11 |
+| `to_muxed_id` / `from_muxed_id` | `namespace.muxedId`, olduğu gibi (string). `id`'ye **girmez**; bölüm 7 ve 11 |
 
 `path_payment_strict_send` ve `path_payment_strict_receive` için alıcı tarafı
 `amount` + `asset_code`, gönderen tarafı `source_amount` + `source_asset_code`.
@@ -236,13 +245,27 @@ hep `wallet` yazacaksın; fixture'lar `endpoint` çünkü hikâye bir x402 ucu.
 Adres, alan adı, uç: bunlar namespace'in **öznitelikleri**, namespace'in kendisi
 değil. Daha zengin bir şey yoksa cüzdan adresi çıpadır.
 
-**Muxed adres taban adrese çözülür, namespace id'sine taban adres (G...) yazılır,
-muxed kimlik özniteliktir.** Horizon zaten `to`'da taban adresi veriyor; muxed
-alıcı varsa `to_muxed` (M...) ve `to_muxed_id` ayrıca gelir. Namespace'e `to`
-yaz, `to_muxed`'ı asla. **Şema bunu v0'da kontrol etmiyor**: `id`'ye M ile
-başlayan 69 karakter yazarsan geçer. Kural senin uyacağın kural; M1'de kapısı
-eklenecek. Brief'in 7. bölümündeki "muxed adres payı" ölçümü de tam bu noktada
-sayılır: kaç ödeme muxed alıcı taşıdı, kaçını çözdün.
+**`id` bayt bayt karşılaştırılır.** Kırpma yok, büyük/küçük harf eşitleme yok,
+URL normalizasyonu yok: `https://data.example/x402` ile
+`https://data.example/x402/` iki ayrı namespace'tir, `GABC` ile `gabc` de. Bu
+bir karar, kaza değil; motor kimlik çözmez ve iki yazımı sessizce
+birleştirmez. Sonucu senin tarafta: bir adresi her yerde aynı yazımla yaz
+(Horizon'un verdiği gibi, büyük harf), URL'yi bir kez seç ve değiştirme.
+Kapısı `idempotency.test.ts`'de: yukarıdaki çiftler iki farklı anahtar türetir.
+
+**Muxed adres taban adrese çözülür: `id`'ye taban adres (G...) yazılır, muxed
+kimlik `namespace.muxedId`'ye.** Horizon zaten `to`'da taban adresi veriyor;
+muxed alıcı varsa `to_muxed` (M...) ve `to_muxed_id` ayrıca gelir. `id`'ye
+`to` yaz, `to_muxed`'ı asla; `to_muxed_id`'yi olduğu gibi `muxedId`'ye yaz
+(`from` tarafı için `from_muxed_id`). `muxedId` anahtara girmez: aynı hesabın
+iki muxed kimliğine giden iki ödeme aynı karşı taraf hakkındadır (bölüm 9).
+İki ayrı `muxedId` var, karıştırma: **namespace'teki** gözlemin öznesinin
+kimliği, **`address_integrity` payload'ındaki** ise bir geçişin içinde ilan
+edilen adresin muxed kimliği; ikincisini sen üretmiyorsun. **Şema `id`'nin
+biçimine v0'da bakmıyor**: `id`'ye M ile başlayan 69 karakter yazarsan geçer.
+Kural senin uyacağın kural; M1'de kapısı eklenecek. Brief'in 7. bölümündeki
+"muxed adres payı" ölçümü de tam bu noktada sayılır: kaç ödeme muxed alıcı
+taşıdı, kaçını çözdün.
 
 `continuity`: iki adresin aynı karşı taraf olduğunu söyleyen bir **beyandır**,
 çıkarım değil. Motor kimlik çözmez, sessizce birleştirmez. Yazarsan `assertedBy`,
@@ -303,7 +326,9 @@ Bunlar doğru olmak zorunda ve bugün doğruluğunu sadece sen sağlıyorsun. He
 birini kendi tarafında bir teste bağla; "cümle olarak değersiz, test olarak
 değerli" burada geçerli.
 
-1. **Muxed → taban adres** (bölüm 7). Şema `id`'nin biçimine bakmıyor. M1'de kapı.
+1. **Muxed → taban adres, muxed kimlik `muxedId`'de** (bölüm 7). Şema `id`'nin
+   biçimine bakmıyor ve `muxedId`'nin gerçekten o adresin kimliği olduğunu
+   bilemez. M1'de kapı.
 2. **`kind` sözlüğü** (bölüm 12). Şema `kind`'ın boş olmadığına bakıyor, başka
    hiçbir şeye.
 3. **`direction`'ın doğru tarafta olması.** Şema `"in"`/`"out"` olduğuna bakar,
@@ -324,6 +349,11 @@ değerli" burada geçerli.
    string görüyor.
 10. **Bir state'in hiç yeniden yazılmaması, bitişin ayrı event olması** (bölüm 4).
     Şema iki gözlemi ayrı ayrı doğrular; ilişkiyi motor M1'de kurar.
+11. **`protocol` payload'ında `issuerKnown`'ın varlıklı her kayıtta yazılması**
+    (bölüm 6). Airdrop tuzağı tam bu alana yaslanıyor (`issuerKnown: false`),
+    ama şemada isteğe bağlı: yazmazsan gözlem geçer ve motor "bilinmiyor" ile
+    "bilinmeyen issuer"ı ayıramaz. `assetCode` taşıyan her `protocol`
+    gözleminde `issuerKnown`'ı doldur; listende yoksa `false`.
 
 Şemanın kontrol **ettiği** şeyleri saymıyorum; onlar zaten hata mesajı olarak
 sana gelir.
@@ -361,7 +391,8 @@ dondurduğumuzda enum olacak ve o gün yazımı değiştirmek göç demek; o yü
 
 Kökte bir kapı var: izlenen hiçbir dosyada Stellar hesap adresi şeklinde bir
 şey olamaz, G ile başlayan 56 ya da M ile başlayan 69 karakter, checksum
-geçerli olsun olmasın. Kapı yolları git index'inden, içeriği çalışma ağacından
+geçerli olsun olmasın, küçük harfe çevrilmiş ya da başına sonuna bir şey
+yapışmış olsa da. Kapı yolları git index'inden, içeriği çalışma ağacından
 okur: `git add` ettiğin dosya commit'ten önce taranır, ama stage'leyip sonra
 yerelde temizlediğin bir adres yerelde geçer, onu commit edilmiş ağaç üzerinde
 koşan CI yakalar. Senin paketin de kapsamda. Test fixture'larında kısa, belli
