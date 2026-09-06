@@ -20,6 +20,21 @@ under him. Cost if wrong: one merge that would not have been needed.
 
 ---
 
+## A deviation from the process, recorded rather than left silent
+
+The subagent-driven-development skill prescribes the most capable available
+model for the final whole-branch review. Every agent in this milestone ran on
+`fable` instead — implementers, reviewers and the final review alike — because
+that is a standing instruction from the founder rather than a judgement made
+here. It is written down so the choice is visible to anyone weighing how much
+the final review's clean verdict is worth.
+
+What that review actually did, for calibration: it read the diff in six passes
+split by concern, ran three read-only greps against the checkout to confirm
+claims the diff made about itself, and produced four findings, none of which
+broke a named invariant and each of which was cheap before merge and a
+migration or a re-encryption afterwards.
+
 ## The contradiction M0 carried forward
 
 M0's third carried note held a conflict. One note wanted fixtures to hold
