@@ -18,7 +18,7 @@ word "done".
 **In scope.**
 
 - `packages/indexer`, a new workspace package depending on
-  `@nonametrust/schema` and `@stellar/stellar-base`, nothing else at run time.
+  `@nonametrust/schema` and `@stellar/stellar-sdk`, nothing else at run time.
 - Three channels: `volume`, `content` (memo), `protocol`.
 - A backfill of at least 100 followed pubnet accounts over 30 days, written as
   NDJSON, one validated observation per line, one file per run.
@@ -130,7 +130,7 @@ packages/indexer/
     horizon-fixtures.ts      builders that make Horizon-shaped records from run-time keys
 ```
 
-Dependencies: `@nonametrust/schema` (workspace), `@stellar/stellar-base`
+Dependencies: `@nonametrust/schema` (workspace), `@stellar/stellar-sdk`
 (StrKey, `MuxedAccount`, `Keypair.random()` in tests). No HTTP library:
 Node 22's `fetch`. No CLI framework: `node:util` `parseArgs`. Reason: the
 traps live in the HTTP layer (410, page caps, rate limits) and must be
