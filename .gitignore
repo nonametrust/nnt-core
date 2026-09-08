@@ -6,3 +6,7 @@ packages/store/.pgdata.log
 
 # Isolated workspaces for milestone branches
 .worktrees/
+packages/indexer/accounts*.txt
+packages/indexer/state*.json
+packages/indexer/cache/
+packages/indexer/out/
