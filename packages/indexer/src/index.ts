@@ -10,3 +10,4 @@ export * from "./mapper/issuers.js";
 export * from "./mapper/context.js";
 export * from "./mapper/volume.js";
 export * from "./mapper/content.js";
+export * from "./mapper/protocol.js";
