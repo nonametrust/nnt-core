@@ -1,4 +1,5 @@
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, afterAll } from "vitest";
@@ -102,5 +103,41 @@ describe("HorizonClient", () => {
     expect(await h.client.getJson("/c")).toEqual({ v: 1 });
     expect(h.counters.get("requests")).toBe(before);
     expect(h.counters.get("cache_hits")).toBe(1);
+  });
+
+  it("does not cache a non-JSON 200 body and rejects with a clear error", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "nnt-horizon-badjson-"));
+    const clock = fixedClock(new Date("2026-09-08T00:00:00.000Z"));
+    const counters = new Counters();
+    const fetchImpl = (async () => new Response("not json", { status: 200 })) as typeof fetch;
+    const sleep = async (ms: number) => {
+      clock.advance(ms);
+    };
+    const client = new HorizonClient({
+      baseUrl: "https://h.example", clock, counters, fetch: fetchImpl, sleep, cacheDir,
+    });
+    await expect(client.getJson("/bad")).rejects.toThrow(/non-JSON body/);
+    expect(readdirSync(cacheDir)).toHaveLength(0);
+    rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  it("still returns the parsed body when the cache write itself fails, and counts it", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "nnt-horizon-writefail-"));
+    const clock = fixedClock(new Date("2026-09-08T00:00:00.000Z"));
+    const counters = new Counters();
+    const url = "https://h.example/ok";
+    const fetchImpl = (async () => new Response(JSON.stringify({ v: 2 }), { status: 200 })) as typeof fetch;
+    const sleep = async (ms: number) => {
+      clock.advance(ms);
+    };
+    // Pre-create a directory at the exact cache file path so writeFileSync fails.
+    const cachePath = join(cacheDir, createHash("sha256").update(url).digest("hex") + ".json");
+    mkdirSync(cachePath);
+    const client = new HorizonClient({
+      baseUrl: "https://h.example", clock, counters, fetch: fetchImpl, sleep, cacheDir,
+    });
+    expect(await client.getJson("/ok")).toEqual({ v: 2 });
+    expect(counters.get("cache_write_failed")).toBe(1);
+    rmSync(cacheDir, { recursive: true, force: true });
   });
 });

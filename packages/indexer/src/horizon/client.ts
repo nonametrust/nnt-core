@@ -86,8 +86,14 @@ export class HorizonClient {
       const res = await this.fetchImpl(url, { headers: { accept: "application/json" } });
       if (res.status === 200) {
         const text = await res.text();
+        let parsed: T;
+        try {
+          parsed = JSON.parse(text) as T;
+        } catch {
+          throw new Error(`Horizon returned a non-JSON body for ${url}`);
+        }
         this.writeCache(url, text);
-        return JSON.parse(text) as T;
+        return parsed;
       }
       if (res.status === 410) {
         this.counters.inc("retention_refusals");
@@ -140,12 +146,23 @@ export class HorizonClient {
   private readCache(url: string): string | null {
     const p = this.cachePath(url);
     if (p === null || !existsSync(p)) return null;
-    return readFileSync(p, "utf8");
+    try {
+      return readFileSync(p, "utf8");
+    } catch {
+      // A cache entry that cannot be read (e.g. something other than this
+      // client occupies the path) is treated as a miss, not a crash.
+      return null;
+    }
   }
 
   private writeCache(url: string, text: string): void {
     const p = this.cachePath(url);
-    if (p !== null) writeFileSync(p, text, "utf8");
+    if (p === null) return;
+    try {
+      writeFileSync(p, text, "utf8");
+    } catch {
+      this.counters.inc("cache_write_failed");
+    }
   }
 }
 
