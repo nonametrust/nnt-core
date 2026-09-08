@@ -4,7 +4,7 @@ import type { SourceReader } from "../source/reader.js";
 import type {
   AccountId, EffectType, LedgerRange, MemoType, SourceAsset, SourceEffect, SourceMemo, SourcePayment,
 } from "../source/types.js";
-import { HorizonClient, RetentionBoundary } from "./client.js";
+import { HorizonClient, HorizonStatusError, RetentionBoundary } from "./client.js";
 import type { HorizonEffectRecord, HorizonPaymentRecord } from "./records.js";
 
 const PAGE_LIMIT = 200;
@@ -60,17 +60,29 @@ export class HorizonReader implements SourceReader {
     const path = `/accounts/${account}/payments?order=asc&limit=${PAGE_LIMIT}&join=transactions&cursor=${cursorForLedger(range.from)}`;
     for await (const page of this.client.pages<HorizonPaymentRecord>(path)) {
       for (const rec of page) {
-        const ledger = ledgerOfOperation(rec.id);
-        if (ledger > range.to) return;
-        if (ledger < range.from) continue;
-        this.counters.inc(`records_read.${rec.type}`);
-        if (!rec.transaction_successful) {
-          this.counters.inc("records_failed_tx");
-          continue;
-        }
-        yield* this.normalisePayment(rec, ledger);
+        const result = this.readRecord(rec, range);
+        if (result === "stop") return;
+        yield* result;
       }
     }
+  }
+
+  /**
+   * The per-record decision shared by `payments` and `globalPayments`, so the
+   * two scans cannot drift on what they count: a range-in-order stop signal,
+   * a skip of a record before the range, or the counted read (and, on a
+   * failed transaction, the counted skip) before normalising.
+   */
+  private readRecord(rec: HorizonPaymentRecord, range: LedgerRange): Iterable<SourcePayment> | "stop" {
+    const ledger = ledgerOfOperation(rec.id);
+    if (ledger > range.to) return "stop";
+    if (ledger < range.from) return [];
+    this.counters.inc(`records_read.${rec.type}`);
+    if (!rec.transaction_successful) {
+      this.counters.inc("records_failed_tx");
+      return [];
+    }
+    return this.normalisePayment(rec, ledger);
   }
 
   private *normalisePayment(rec: HorizonPaymentRecord, ledger: number): Iterable<SourcePayment> {
@@ -159,7 +171,7 @@ export class HorizonReader implements SourceReader {
       const tx = await this.client.getJson<{ hash: string; memo_type: string; memo?: string }>(`/transactions/${txHash}`);
       return memoOf(tx);
     } catch (e) {
-      if (e instanceof Error && /404/.test(e.message)) return null;
+      if (e instanceof HorizonStatusError && e.status === 404) return null;
       throw e;
     }
   }
@@ -211,10 +223,9 @@ export class HorizonReader implements SourceReader {
     const path = `/payments?order=asc&limit=${PAGE_LIMIT}&cursor=${cursorForLedger(range.from)}`;
     for await (const page of this.client.pages<HorizonPaymentRecord>(path)) {
       for (const rec of page) {
-        const ledger = ledgerOfOperation(rec.id);
-        if (ledger > range.to) return;
-        if (ledger < range.from || !rec.transaction_successful) continue;
-        yield* this.normalisePayment(rec, ledger);
+        const result = this.readRecord(rec, range);
+        if (result === "stop") return;
+        yield* result;
       }
     }
   }
@@ -224,26 +235,14 @@ export class HorizonReader implements SourceReader {
       await this.client.getJson(`/accounts/${id}`);
       return true;
     } catch (e) {
-      if (e instanceof Error && /404/.test(e.message)) return false;
+      if (e instanceof HorizonStatusError && e.status === 404) return false;
       throw e;
     }
   }
 
   private floorCache: number | null = null;
   private async assertServed(range: LedgerRange): Promise<void> {
-    if (this.floorCache === null) {
-      // The floor is a cheap, proactive check so a range wholly before it
-      // never spends a paged request. When it cannot be determined (no
-      // /ledgers response), skip the proactive check rather than blocking a
-      // legitimate read: a genuine retention violation still surfaces as an
-      // actual HTTP 410 from the paged request itself (client.ts), which
-      // already becomes RetentionBoundary and counts retention_refusals.
-      try {
-        this.floorCache = await this.retentionFloor();
-      } catch {
-        return;
-      }
-    }
+    if (this.floorCache === null) this.floorCache = await this.retentionFloor();
     if (range.from < this.floorCache) {
       this.counters.inc("retention_refusals");
       throw new RetentionBoundary(

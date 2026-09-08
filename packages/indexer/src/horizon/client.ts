@@ -19,6 +19,23 @@ export class RetentionBoundary extends Error {
   }
 }
 
+/**
+ * A non-retryable (or retries-exhausted) HTTP status from Horizon, with the
+ * status carried as its own field. A caller must never recover the status by
+ * matching the message against a status-code-shaped substring: the message
+ * embeds the URL, and a URL can contain a hex hash or an account id that
+ * itself contains digits that look like a status code.
+ */
+export class HorizonStatusError extends Error {
+  constructor(
+    readonly status: number,
+    readonly url: string,
+  ) {
+    super(`Horizon ${status} for ${url}`);
+    this.name = "HorizonStatusError";
+  }
+}
+
 export interface HorizonClientOptions {
   baseUrl: string;
   clock: Clock;
@@ -101,7 +118,7 @@ export class HorizonClient {
       }
       const retryable = res.status === 429 || res.status >= 500;
       if (!retryable || attempt >= this.maxRetries) {
-        throw new Error(`Horizon ${res.status} for ${url}`);
+        throw new HorizonStatusError(res.status, url);
       }
       attempt++;
       this.counters.inc("retries");

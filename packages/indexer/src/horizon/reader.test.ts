@@ -1,16 +1,22 @@
 import { describe, it, expect } from "vitest";
-import { HorizonClient, RetentionBoundary } from "./client.js";
+import { HorizonClient, HorizonStatusError, RetentionBoundary } from "./client.js";
 import { HorizonReader, cursorForLedger, ledgerOfOperation } from "./reader.js";
 import { fixedClock } from "../clock.js";
 import { Counters } from "../counters.js";
 import { effectRecord, fakeHorizon, nextOpId, paymentRecord } from "../testing/horizon-fixtures.js";
 import { muxedFor, randomAccount } from "../testing/keys.js";
 
+// A floor far below any ledger these tests use, so assertServed's strict,
+// unconditional lookup (Task 9 fix round 1, finding 3) never blocks a test
+// that has nothing to say about retention. A test that cares about the
+// retention wall supplies its own "/ledgers" route, which wins over this one.
+const DEFAULT_LEDGERS = [{ paging_token: "1", sequence: 1, closed_at: "2025-01-01T00:00:00Z" }];
+
 function reader(routes: Parameters<typeof fakeHorizon>[0]) {
   const counters = new Counters();
   const client = new HorizonClient({
     baseUrl: "https://h.example", clock: fixedClock(new Date("2026-09-08T00:00:00.000Z")), counters,
-    fetch: fakeHorizon(routes), sleep: async () => {}, minIntervalMs: 0,
+    fetch: fakeHorizon({ "/ledgers": DEFAULT_LEDGERS, ...routes }), sleep: async () => {}, minIntervalMs: 0,
   });
   return { r: new HorizonReader(client, counters), counters };
 }
@@ -111,6 +117,20 @@ describe("HorizonReader.payments", () => {
   });
 });
 
+describe("HorizonReader.globalPayments", () => {
+  it("counts a failed transaction the same way the account scan does", async () => {
+    const rows = [
+      paymentRecord({ id: nextOpId(100, 1), transaction_successful: true }),
+      paymentRecord({ id: nextOpId(100, 2), transaction_successful: false }),
+    ];
+    const { r, counters } = reader({ "/payments": rows });
+    const got = await collect(r.globalPayments({ from: 100, to: 100 }));
+    expect(got.length).toBe(1);
+    expect(counters.get("records_failed_tx")).toBe(1);
+    expect(counters.get("records_read.payment")).toBe(2);
+  });
+});
+
 describe("HorizonReader.effects", () => {
   it("normalises trustline and claimable effects and ignores the rest", async () => {
     const g = randomAccount();
@@ -135,6 +155,12 @@ describe("HorizonReader.memo and ledgers", () => {
     const hash = "cd".repeat(32);
     const { r } = reader({ [`/transactions/${hash}`]: { status: 200, body: { hash, memo_type: "text", memo: "x" } } });
     expect(await r.memo(hash)).toEqual({ txHash: hash, type: "text", text: "x" });
+  });
+
+  it("does not mistake a status buried in the url for a 404: a real error rejects rather than resolving null", async () => {
+    const hash = "a404" + "b".repeat(60);
+    const { r } = reader({ [`/transactions/${hash}`]: { status: 500 } });
+    await expect(r.memo(hash)).rejects.toBeInstanceOf(HorizonStatusError);
   });
 
   it("reads the retention floor and the latest ledger", async () => {
