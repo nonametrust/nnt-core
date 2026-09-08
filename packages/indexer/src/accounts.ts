@@ -7,8 +7,9 @@ import type { AccountId, LedgerRange, SourcePayment } from "./source/types.js";
  * made of account ids) and the population must be reproducible by anyone
  * from the rule and the ledger range (spec section 9). Accounts that appear
  * too often in the sample window have the exchange and service profile the
- * backtest excluded; they are dropped. The rest are ordered by the digest of
- * their id, which is a fixed order that favours nobody.
+ * backtest excluded; they are dropped. The rest are ordered by the byte
+ * order of the digest of their id, which is a fixed order that favours
+ * nobody and is reproducible on any machine.
  */
 export interface SelectionSource {
   globalPayments(range: LedgerRange): AsyncIterable<SourcePayment>;
@@ -36,17 +37,21 @@ export async function selectAccounts(source: SelectionSource, opts: SelectionOpt
   const appearances = new Map<AccountId, number>();
   for await (const p of source.globalPayments(opts.range)) {
     if (p.kind === "sac_transfer") continue;
-    for (const a of [p.from, p.to]) appearances.set(a, (appearances.get(a) ?? 0) + 1);
+    for (const a of new Set([p.from, p.to])) appearances.set(a, (appearances.get(a) ?? 0) + 1);
   }
   const result: SelectionResult = { accounts: [], candidates: appearances.size, excludedBusy: 0, excludedMissing: 0 };
   const ordered = [...appearances.entries()]
-    .filter(([, n]) => {
-      const keep = n <= opts.maxAppearances;
+    .filter(([, count]) => {
+      const keep = count <= opts.maxAppearances;
       if (!keep) result.excludedBusy++;
       return keep;
     })
     .map(([a]) => a)
-    .sort((x, y) => orderKey(x).localeCompare(orderKey(y)));
+    .sort((x, y) => {
+      const ka = orderKey(x);
+      const kb = orderKey(y);
+      return ka < kb ? -1 : ka > kb ? 1 : 0;
+    });
   for (const a of ordered) {
     if (result.accounts.length >= opts.n) break;
     if (await source.accountExists(a)) result.accounts.push(a);

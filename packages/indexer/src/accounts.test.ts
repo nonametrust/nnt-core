@@ -23,7 +23,13 @@ describe("selectAccounts", () => {
     const b = await selectAccounts(source([...payments].reverse()), { range: { from: 10, to: 10 }, n: 5, maxAppearances: 10 });
     expect(a.accounts).toEqual(b.accounts);
     expect(a.accounts).toHaveLength(5);
-    expect(a.accounts).toEqual([...a.accounts].sort((x, y) => orderKey(x).localeCompare(orderKey(y))));
+    expect(a.accounts).toEqual(
+      [...a.accounts].sort((x, y) => {
+        const kx = orderKey(x);
+        const ky = orderKey(y);
+        return kx < ky ? -1 : kx > ky ? 1 : 0;
+      }),
+    );
   });
 
   it("excludes an account that appears more than maxAppearances times", async () => {
@@ -42,5 +48,22 @@ describe("selectAccounts", () => {
     const r = await selectAccounts(source([pay(gone, here, 1)], new Set([gone])), { range: { from: 10, to: 10 }, n: 10, maxAppearances: 10 });
     expect(r.accounts).toEqual([here]);
     expect(r.excludedMissing).toBe(1);
+  });
+
+  it("counts a self-payment record once, not twice", async () => {
+    const self = randomAccount();
+    const r = await selectAccounts(source([pay(self, self, 1)]), { range: { from: 10, to: 10 }, n: 10, maxAppearances: 1 });
+    expect(r.candidates).toBe(1);
+    expect(r.accounts).toEqual([self]);
+    expect(r.excludedBusy).toBe(0);
+  });
+
+  it("ignores a sac_transfer record for counting", async () => {
+    const from = randomAccount();
+    const to = randomAccount();
+    const transfer: SourcePayment = { ...pay(from, to, 1), kind: "sac_transfer", transferIndex: 0 };
+    const r = await selectAccounts(source([transfer]), { range: { from: 10, to: 10 }, n: 10, maxAppearances: 10 });
+    expect(r.candidates).toBe(0);
+    expect(r.accounts).toEqual([]);
   });
 });
