@@ -33,7 +33,12 @@ export async function readKeys(ndjsonPath: string): Promise<Set<string>> {
   for await (const line of rl) {
     n++;
     if (line.trim().length === 0) continue;
-    const parsed = JSON.parse(line) as { idempotencyKey?: unknown };
+    let parsed: { idempotencyKey?: unknown };
+    try {
+      parsed = JSON.parse(line) as { idempotencyKey?: unknown };
+    } catch (e) {
+      throw new Error(`${ndjsonPath} line ${n}: not JSON: ${(e as Error).message}`);
+    }
     if (typeof parsed.idempotencyKey !== "string") {
       throw new Error(`${ndjsonPath} line ${n}: no idempotencyKey; not a validated observation`);
     }

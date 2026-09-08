@@ -31,4 +31,10 @@ describe("readKeys and compareKeys", () => {
     writeFileSync(p, JSON.stringify({ schemaVersion: "0.1.0" }) + "\n");
     await expect(readKeys(p)).rejects.toThrow(/line 1/);
   });
+
+  it("refuses a line that is not JSON, naming the file and the line", async () => {
+    const p = join(dir, "c.ndjson");
+    writeFileSync(p, [JSON.stringify({ idempotencyKey: "a" }), "not json", ""].join("\n"));
+    await expect(readKeys(p)).rejects.toThrow(/line 2/);
+  });
 });

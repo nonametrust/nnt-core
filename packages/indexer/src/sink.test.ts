@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Writable } from "node:stream";
 import { describe, it, expect, afterAll } from "vitest";
 import { openSink, outputFileName } from "./sink.js";
 
@@ -21,5 +22,17 @@ describe("sink", () => {
     const r = await s.close();
     expect(r).toEqual({ lines: 2, path });
     expect(readFileSync(path, "utf8")).toBe('{"a":1}\n{"b":2}\n');
+  });
+
+  it("fails close() when the underlying stream errors, instead of crashing the process", async () => {
+    const path = join(dir, "boom.ndjson");
+    const failing = new Writable({
+      write(_chunk, _enc, callback) {
+        callback(new Error("boom"));
+      },
+    });
+    const s = openSink(path, () => failing);
+    s.write({ a: 1 });
+    await expect(s.close()).rejects.toThrow(/boom/);
   });
 });
