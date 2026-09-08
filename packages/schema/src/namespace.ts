@@ -20,6 +20,13 @@ export const continuityAssertionSchema = z.object({
 export type ContinuityAssertion = z.infer<typeof continuityAssertionSchema>;
 
 /**
+ * A muxed address: M followed by 68 base32 characters. Matched in one case or
+ * the other rather than with the `i` flag, for the same reason the repository
+ * gate does it that way: a mixed-case run is not an address anyone produced.
+ */
+const MUXED_SHAPE = /^(?:M[A-Z2-7]{68}|m[a-z2-7]{68})$/;
+
+/**
  * Addresses, domains and endpoints are attributes of a namespace, not the
  * namespace itself. Where the integration supplies nothing richer, a wallet
  * address is the anchor. Muxed addresses resolve to the base address before
@@ -45,5 +52,23 @@ export const namespaceRefSchema = z.object({
   // `from_muxed_id`. The schema checks only that it is non-empty.
   muxedId: z.string().min(1).optional(),
   continuity: continuityAssertionSchema.optional(),
-}).strict();
+}).strict().superRefine((ref, ctx) => {
+  // The whitepaper's claim is that a muxed address resolves to its base
+  // address before it reaches this type. This is that claim's gate, and it is
+  // deliberately negative: it refuses the muxed shape and asserts nothing
+  // about what a valid base address looks like. A positive check would
+  // enforce "a wallet id is a Stellar account", which is a stronger claim than
+  // the whitepaper makes and which a second chain would invalidate.
+  //
+  // Still not enforced, and stated in docs/observation-contract.md as the
+  // indexer's own rule: that a wallet id is a checksum-valid account.
+  if (ref.kind !== "wallet") return;
+  if (!MUXED_SHAPE.test(ref.id)) return;
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    path: ["id"],
+    message:
+      "a wallet id is the base address: resolve the muxed address and carry its subaccount in muxedId",
+  });
+});
 export type NamespaceRef = z.infer<typeof namespaceRefSchema>;

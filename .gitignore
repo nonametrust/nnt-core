@@ -1,3 +1,5 @@
 node_modules/
 dist/
 .superpowers/
+packages/store/.pgdata/
+packages/store/.pgdata.log
