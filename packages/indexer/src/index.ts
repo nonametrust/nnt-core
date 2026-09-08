@@ -11,3 +11,6 @@ export * from "./mapper/context.js";
 export * from "./mapper/volume.js";
 export * from "./mapper/content.js";
 export * from "./mapper/protocol.js";
+export * from "./dedupe.js";
+export * from "./sink.js";
+export * from "./state.js";
