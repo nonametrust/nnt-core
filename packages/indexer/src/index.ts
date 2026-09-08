@@ -5,3 +5,6 @@ export * from "./counters.js";
 export * from "./source/types.js";
 export * from "./source/reader.js";
 export * from "./mapper/address.js";
+export * from "./mapper/kinds.js";
+export * from "./mapper/issuers.js";
+export * from "./mapper/context.js";
