@@ -161,8 +161,32 @@ the divergence and exposes it; what a consumer does with it is M3's.
 **The open question M1 left.** `0006` says whether `m2` is zero when `n` is zero,
 and whether `median_est` and `mad_est` arrive together, are M2's to settle. They
 are: `m2` is zero at `n = 0` because a sum of no squared deviations is zero, and
-the two robust estimates arrive together and are null together, because a MAD is a
-deviation from a median and one without the other has no meaning.
+the two robust estimates arrive together, at the first observation, and are null
+together before it, because a spread is a deviation from a location and one
+without the other has no meaning.
+
+**What the robust pair actually is, and why the column names lie.** It is not the
+sample median and the median absolute deviation. A constant-space update cannot
+produce either; they need the history the store deliberately does not keep. What
+is held is a winsorized location and a winsorized dispersion: the running mean of
+values clipped at a multiple of the current scale, and the running mean of the
+clipped absolute deviations from it. That is an online M-estimator, and it has
+the property the median and the MAD were chosen for, which is bounded influence.
+
+A streaming quantile sketch was the alternative and was rejected for a reason
+that matters here rather than for convenience: it needs a step-size parameter,
+which would be one more uncalibrated number, and it converges poorly on exactly
+the short histories this milestone spends most of its time in, around the minimum
+observation count.
+
+The cost is real and is recorded rather than hidden. Against a heavily skewed
+distribution an M-estimator's location sits between the mean and the median, so
+it is less resistant than a true median would be. If calibration later looks
+wrong on a skewed channel, this is the first thing to re-examine.
+
+The columns keep the names `median_est` and `mad_est`, because renaming them
+costs a migration that `0006` was landed to avoid, and the names are historical.
+The contract is written where the arithmetic is.
 
 ---
 
@@ -239,9 +263,11 @@ beneath that count. **v0 has no fleet.** There is no live traffic to aggregate, 
 aggregating would require a store read that the section 2 boundary forbids.
 
 The ruling: shrinkage stays, and the prior is a constant per channel in the policy
-file. Seven numbers, declared uncalibrated, with the same note the half-lives
-carry. A real fleet prior is D1.4's work alongside per-channel decay learning.
-Seven declared constants is a bounded admission; a prior per
+file. **Four numbers, not one per channel:** only the four channels that carry a
+continuous quantity have a baseline at all, and a prior for a channel nothing
+shrinks is a number nothing reads. Declared uncalibrated, with the same note the
+half-lives carry. A real fleet prior is D1.4's work alongside per-channel decay
+learning. Four declared constants is a bounded admission; a prior per
 `(kind, channel, aspect)` would be several hundred invented numbers, which is the
 kind of unenforced claim this project has repeatedly found to be false.
 
@@ -350,3 +376,29 @@ quietly retuned.
 **Whether the divergence between the two timescales should itself gate a tag** is
 left open. M2 computes and exposes it. Making it a gate is a claim about adversarial
 behaviour that nothing has measured yet.
+
+---
+
+## 16. Two things M1 shipped that M3 has to change
+
+Neither is M2's to fix, because M2 writes nothing to the database. Both are
+decided here so M3 does not rediscover them, and both were found by writing this
+milestone's plan against M1's actual code rather than against its design.
+
+**`TagRepository.refresh` implements different semantics from section 10.** It
+takes `greatest` over the **stored** `g0` rather than over the decayed strength,
+it does not move `tagged_at`, and it does not touch `saturation_state`. A tag
+refreshed through it therefore keeps decaying from its original instant, so a
+standing condition would fade while it still holds, which is the opposite of what
+section 4 requires. M3 replaces it.
+
+**The `tag` table has no `aspect` column**, and section 3 makes the aspect the
+thing that keeps incomparable quantities apart. Without it, a deviation on one
+asset and direction refreshes a tag created by another, which reintroduces at the
+tag layer exactly the pooling the aspect vocabulary exists to prevent. The live
+tag is keyed on `(namespace, channel, aspect)` and the column has to exist.
+
+This breaks the promise `0006` made, that M2 and M3 add code and not migrations.
+The promise was made before an aspect existed, so it was made without knowing
+this. Adding the column is better than pooling silently, and saying so here is
+better than letting M3 find the contradiction alone.
