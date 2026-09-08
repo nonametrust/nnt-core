@@ -17,3 +17,4 @@ export * from "./state.js";
 export * from "./horizon/client.js";
 export * from "./horizon/reader.js";
 export * from "./run.js";
+export * from "./accounts.js";
