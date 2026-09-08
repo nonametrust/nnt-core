@@ -48,21 +48,52 @@ function mapClassic(p: SourcePayment, followed: AccountId, ctx: MapContext, ref:
   return out;
 }
 
+/**
+ * The idempotency key for a volume observation carries (ref, channel,
+ * namespace) and nothing about direction or asset: a Soroban invocation that
+ * both pays the followed account and takes from it (a swap through a
+ * contract) cannot yield two observations under one operation id without two
+ * of them colliding on that key, and the contract forbids varying `ref` to
+ * dodge it. So at most one volume observation comes out of one invocation
+ * for one followed namespace. The "in" side wins over "out" when both are
+ * present, because value reaching the counterparty is the evidence the
+ * volume channel exists to carry; every other transfer record in the group —
+ * the losing direction's records, and any record of a different asset than
+ * the winning direction's first — still yields its own drop, so the loss
+ * stays visible per record rather than folded away.
+ */
 function mapSac(group: SourcePayment[], followed: AccountId, ctx: MapContext, ref: string): MapResult[] {
-  const out: MapResult[] = [];
-  for (const direction of ["in", "out"] as const) {
-    const mine = group.filter((p) => (direction === "in" ? p.to === followed : p.from === followed));
-    if (mine.length === 0) continue;
-    const firstAsset = mine[0]!.asset;
-    const same = mine.filter((p) => sameAsset(p.asset, firstAsset));
-    const other = mine.filter((p) => !sameAsset(p.asset, firstAsset));
-    const total = same.reduce((acc, p) => addDecimal(acc, p.amount), "0");
-    const muxed = direction === "in" ? mine[0]!.toMuxedId : mine[0]!.fromMuxedId;
-    out.push(build(mine[0]!, followed, direction, total, firstAsset, muxed, ctx, ref));
-    if (other.length > 0) out.push({ ok: false, reason: "sac_multi_asset", ref });
+  const ins = group.filter((p) => p.to === followed);
+  const outs = group.filter((p) => p.from === followed && p.to !== followed);
+  const foreign = group.filter((p) => p.to !== followed && p.from !== followed);
+
+  const out: MapResult[] = foreign.map((): MapResult => ({ ok: false, reason: "not_followed", ref }));
+
+  if (ins.length > 0) {
+    out.push(...sumDirection(ins, followed, "in", ctx, ref));
+    out.push(...outs.map((): MapResult => ({ ok: false, reason: "sac_bidirectional", ref })));
+  } else if (outs.length > 0) {
+    out.push(...sumDirection(outs, followed, "out", ctx, ref));
   }
-  if (out.length === 0) out.push({ ok: false, reason: "not_followed", ref });
   return out;
+}
+
+function sumDirection(
+  records: SourcePayment[],
+  followed: AccountId,
+  direction: "in" | "out",
+  ctx: MapContext,
+  ref: string,
+): MapResult[] {
+  const firstAsset = records[0]!.asset;
+  const same = records.filter((p) => sameAsset(p.asset, firstAsset));
+  const other = records.filter((p) => !sameAsset(p.asset, firstAsset));
+  const total = same.reduce((acc, p) => addDecimal(acc, p.amount), "0");
+  const muxed = direction === "in" ? records[0]!.toMuxedId : records[0]!.fromMuxedId;
+  return [
+    build(records[0]!, followed, direction, total, firstAsset, muxed, ctx, ref),
+    ...other.map((): MapResult => ({ ok: false, reason: "sac_multi_asset", ref })),
+  ];
 }
 
 function build(
