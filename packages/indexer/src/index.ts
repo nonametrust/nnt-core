@@ -14,3 +14,4 @@ export * from "./mapper/protocol.js";
 export * from "./dedupe.js";
 export * from "./sink.js";
 export * from "./state.js";
+export * from "./horizon/client.js";
