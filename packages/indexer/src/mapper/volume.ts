@@ -38,7 +38,10 @@ function mapClassic(p: SourcePayment, followed: AccountId, ctx: MapContext, ref:
   }
   if (isFrom) {
     if (isTo) {
-      out.push({ ok: false, reason: "self_payment", ref });
+      // A self-payment (from === to === followed) is one record and one
+      // observation: the "in" side already covers it, so no second result
+      // and no self_payment drop, or the record would count twice against
+      // records_read.payments.
     } else {
       const amount = p.sourceAmount ?? p.amount;
       const asset = p.sourceAsset ?? p.asset;

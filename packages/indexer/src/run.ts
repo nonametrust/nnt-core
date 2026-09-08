@@ -41,8 +41,12 @@ export interface BackfillResult {
  * invocation, several transfers of the same asset to the followed account
  * collapse into one written observation (context.ts, mapper/volume.ts).
  * `sac_transfers_merged` counts the records that vanished into that sum, so
- * that the per-stream identity records_read.payments == observations_written.volume
- * + drops(volume reasons) + sac_transfers_merged still holds.
+ * that the per-stream identity
+ * records_read.payments == observations_written.volume + drops(volume) + sac_transfers_merged
+ * still holds. `self_payments` is counted separately from the records
+ * themselves (a self-payment maps to exactly one "in" observation and no
+ * drop, so it already satisfies the identity on its own); it is a
+ * diagnostic count, not a term of the identity.
  */
 export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
   const keys = new KeySet();
@@ -86,8 +90,12 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
       group = [];
       const results = mapVolume(g, account, ctx);
       for (const r of results) emit(r);
-      if (g[0]!.kind === "sac_transfer") {
-        o.counters.inc("sac_transfers_merged", g.length - results.length);
+      if (g.length === 1 && g[0]!.from === g[0]!.to) {
+        o.counters.inc("self_payments");
+      }
+      const merged = g.length - results.length;
+      if (merged > 0) {
+        o.counters.inc("sac_transfers_merged", merged);
       }
     };
     for await (const p of o.reader.payments(account, o.range)) {

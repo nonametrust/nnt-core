@@ -78,13 +78,12 @@ describe("mapVolume", () => {
     expect(r).toEqual({ ok: false, reason: "invalid_account_id", ref: "op:214720397313" });
   });
 
-  it("maps a self-payment once, as direction in, and says so", () => {
+  it("maps a self-payment once, as direction in", () => {
     const g = randomAccount();
     const p = payment({ from: g, to: g });
     const rs = mapVolume([p], g, ctx);
-    expect(rs).toHaveLength(2);
+    expect(rs).toHaveLength(1);
     expect(ok(rs[0]!).payload).toMatchObject({ direction: "in" });
-    expect(rs[1]).toEqual({ ok: false, reason: "self_payment", ref: "op:214720397313" });
   });
 
   it("drops a record the followed account is not a party to", () => {

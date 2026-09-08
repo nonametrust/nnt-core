@@ -17,7 +17,6 @@ export const DROP_REASONS = [
   "sac_non_transfer",
   "invalid_account_id",
   "muxed_base_address",
-  "self_payment",
   "unsupported_type",
   "not_followed",
   "duplicate_key_in_run",

@@ -122,4 +122,26 @@ describe("backfill", () => {
     expect(counters.get("observations_written.volume")).toBe(1);
     expect(counters.get("sac_transfers_merged")).toBe(1);
   });
+
+  it("maps a self-payment as one written volume observation, no drops, and counts it as a diagnostic", async () => {
+    const g = randomAccount();
+    const createdAt = "2026-09-05T00:00:00.000Z";
+    const payments: SourcePayment[] = [
+      { opId: "300", ledger: 30, txHash: "12".repeat(32), createdAt, kind: "payment", from: g, to: g,
+        amount: "3.0000000", asset: { code: "XLM", issuer: null } },
+    ];
+    const state: IndexerState = { network: "stellar:pubnet", accounts: {} };
+    const counters = new Counters();
+    const sink = openSink(join(dir, "f.ndjson"));
+    const result = await backfill({
+      reader: fakeReader(payments, []), accounts: [g], range: { from: 30, to: 30 },
+      ctx: { network: "stellar:pubnet", producerVersion: "0.1.0" }, sink, state, saveState: async () => {},
+      counters, clock: fixedClock(new Date("2026-09-08T00:00:00.000Z")),
+    });
+    await sink.close();
+    expect(result.written).toBe(1);
+    expect(counters.get("observations_written.volume")).toBe(1);
+    expect(counters.drops()).toEqual({});
+    expect(counters.get("self_payments")).toBe(1);
+  });
 });
