@@ -9,3 +9,4 @@ export * from "./mapper/kinds.js";
 export * from "./mapper/issuers.js";
 export * from "./mapper/context.js";
 export * from "./mapper/volume.js";
+export * from "./mapper/content.js";
