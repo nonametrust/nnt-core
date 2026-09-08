@@ -142,7 +142,7 @@ interface Source {
   producer: string;         // bare name, "stellar-indexer"
   producerVersion: string;  // "0.1.0", deliberately a separate field
   network?: string;         // "stellar:pubnet"
-  ref: string;              // Horizon operation id or paging token
+  ref: string;              // stable source event ref, "op:<id>" in v0
   fetchedAt: string;
 }
 ```
@@ -192,7 +192,8 @@ the tagging pipeline believe the evidence is twice as strong. The version is a
 separate field because folding it into the producer name would change every key
 the moment the indexer is upgraded, silently minting a duplicate of everything
 already stored. The fetch time is excluded for the same reason. The network is
-included because Horizon operation ids repeat across pubnet and testnet, and one
+included because Stellar operation ids repeat across pubnet and testnet whichever
+API serves them, and one
 producer reading both is the expected configuration once the testnet demo runs
 alongside mainnet shadow observation. The namespace is included because a
 payment has two sides: one chain event yields an observation for the sender and

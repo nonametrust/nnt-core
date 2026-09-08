@@ -182,6 +182,13 @@ geçerli: bir durum değiştiyse değişimi yaz, bayrak koyma.
 
 ## 6. Horizon kaydından eşleme: `volume` ve `protocol`
 
+Bu bölüm v0'ın kaynağı olan Horizon kayıtlarına göre yazıldı. SDF Horizon'u
+ömrünün sonuna yaklaşmış sayıyor ve yerine Stellar RPC'yi gösteriyor; kapanma
+tarihi yok, bugün çalışıyor. Kural Horizon'a değil gözleme bağlı: aşağıdaki
+tablolar hangi zincir olgusunun hangi alana gittiğini söylüyor, Horizon alan
+adları o olguyu bugün nereden aldığını. Kaynak değişirse tablonun sol sütunu
+değişir, sağ sütunu değişmez. Eşleyiciyi kaynak okuyucudan ayrı yaz.
+
 ### `volume`: yön namespace'e göre
 
 `direction` **namespace'e göre**dir, ödeyene göre değil. `"in"`: değer karşı
@@ -284,8 +291,8 @@ v0'da yazmana gerek yok.
 |---|---|
 | `producer` | Çıplak isim: `stellar-indexer`. Küçük harf, rakam, tek tire. Versiyon **buraya girmez**; girerse reddedilir. |
 | `producerVersion` | `"0.1.0"`. Ayrı alan, çünkü anahtara girmiyor: versiyon yükselttiğinde depodaki her şeyin kopyası doğmasın. |
-| `network` | `"stellar:pubnet"` ya da `"stellar:testnet"`; şema sadece boş olmadığına bakar, bu iki yazım bizim sözümüz (bölüm 11). Sen her zaman yaz; Horizon operasyon id'leri iki ağda çakışır. Gateway'in ağı yok, o yazmıyor; isteğe bağlılığı bundan. |
-| `ref` | Kaynak olayın kararlı referansı: `"op:214720397313"`. Aynı olayı yeniden okuduğunda **birebir aynı** çıkmalı. Operasyon id bunu sağlar; paging token da olur ama birini seç ve değiştirme. NUL içeremez. |
+| `network` | `"stellar:pubnet"` ya da `"stellar:testnet"`; şema sadece boş olmadığına bakar, bu iki yazım bizim sözümüz (bölüm 11). Sen her zaman yaz; Stellar operasyon id'leri iki ağda çakışır, hangi API'den okunursa okunsun. Gateway'in ağı yok, o yazmıyor; isteğe bağlılığı bundan. |
+| `ref` | Kaynak olayın kararlı referansı: `"op:214720397313"`. Aynı olayı yeniden okuduğunda **birebir aynı** çıkmalı. Operasyon id bunu sağlar ve kaynaktan bağımsızdır. Paging token Horizon'a özgü: kaynak değiştiği gün her anahtar değişir, o yüzden operasyon id'yi seç. NUL içeremez. |
 | `fetchedAt` | Sen okuduğun an, UTC `Z`. Anahtara girmez; iki kez okuman iki gözlem doğurmaz. |
 
 ## 9. Anahtar, ve yeniden koşma garantisi
@@ -422,6 +429,12 @@ dolandırılmış hesapları tanımlıyor.
 - **Hesap bayrakları.** `protocol` payload'ında hangi bayrağın değiştiğini
   taşıyacak alan yok; v0 sadece değiştiğini kaydediyor. Alan gerekirse şemaya
   ekleriz, sen `event`'e sıkıştırma.
+- **Horizon sonrası okuyucu.** v0 Horizon'dan okuyor. Yerine gösterilen Stellar
+  RPC işlem ve olay geçmişini yalnızca yedi gün tutuyor ve hesaba göre ödeme ya
+  da efekt ucu vermiyor, yani 30 günlük geri doldurma bugün Horizon'a bağlı.
+  Kapanma duyurulduğunda seçenekler RPC `getLedgers` artı ham XDR ayrıştıran bir
+  veri gölü, ya da ücretli indeksli bir API. Kararı şimdi vermiyoruz; verilmesi
+  gereken tek şey kaynak okuyucunun ayrı bir katman olması.
 - **`kind` sözlüğü** bölüm 12'de; ilk eşleyici çıktısından sonra donduracağız.
 
 Sorusu olan yeri işaretle, oturup konuşalım. Fixture'la çelişen bir şey görürsen
