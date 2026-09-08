@@ -11,6 +11,13 @@ export interface ReportMeta {
   runDate: string;
   accounts: number;
   wallClockMs: number;
+  /**
+   * `backfill` covers a calendar period, so the report states it in days;
+   * `follow` covers whatever ledgers appeared since each account's own
+   * frontier, at a point in time, so the report states the ledger span
+   * instead of a period that would otherwise read as zero days.
+   */
+  mode: "backfill" | "follow";
   compare?: { previous: string; onlyInPrevious: number; onlyInCurrent: number };
 }
 
@@ -37,19 +44,26 @@ export function renderReport(snapshot: CountersSnapshot, meta: ReportMeta): { js
   const muxed = c["muxed_records"] ?? 0;
   const totalObs = Object.entries(c).filter(([k]) => k.startsWith("observations_written.")).reduce((a, [, v]) => a + v, 0);
   const requests = c["requests"] ?? 0;
-  const days = Math.round((Date.parse(meta.toIso) - Date.parse(meta.fromIso)) / 86_400_000);
   const dropRows = Object.entries(scrubbed.drops).map(([k, v]) => `| ${k} | ${v} |`).join("\n");
   const compare = meta.compare
     ? `| Deduplication | ${meta.compare.onlyInPrevious} keys only in previous, ${meta.compare.onlyInCurrent} only in current (against ${meta.compare.previous}) |`
     : "| Deduplication | not compared in this run (pass --compare) |";
+  const header =
+    meta.mode === "follow"
+      ? `Network ${meta.network}, follow run at ${meta.runDate}, ledgers ${meta.range.from}-${meta.range.to}.`
+      : `Network ${meta.network}, ${meta.fromIso} to ${meta.toIso} (ledgers ${meta.range.from}-${meta.range.to}), run on ${meta.runDate}.`;
+  const coverageRow =
+    meta.mode === "follow"
+      ? `| Coverage | ${meta.accounts} accounts, ledgers ${meta.range.from}-${meta.range.to} (follow) |`
+      : `| Coverage | ${meta.accounts} accounts, ${Math.round((Date.parse(meta.toIso) - Date.parse(meta.fromIso)) / 86_400_000)} days |`;
   const markdown = `# Indexer run report
 
-Network ${meta.network}, ${meta.fromIso} to ${meta.toIso} (ledgers ${meta.range.from}-${meta.range.to}), run on ${meta.runDate}.
+${header}
 Horizon served ledgers from ${meta.retentionFloor} on that day.
 
 | Metric | Measured |
 |---|---|
-| Coverage | ${meta.accounts} accounts, ${days} days |
+${coverageRow}
 ${compare}
 | Dropped records with reason | ${Object.values(scrubbed.drops).reduce((a, b) => a + b, 0)} (table below) |
 | Coverage ratio | ${ratio.toFixed(2)} (${written} volume observations from ${read} payment-family records) |

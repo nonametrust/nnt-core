@@ -12,7 +12,7 @@ import type { Network } from "./mapper/context.js";
 import { renderReport } from "./report.js";
 import { backfill } from "./run.js";
 import { openSink, outputFileName } from "./sink.js";
-import type { LedgerRange } from "./source/types.js";
+import type { AccountId, LedgerRange } from "./source/types.js";
 import { loadState, saveState } from "./state.js";
 
 const NETWORKS: Record<Network, string> = {
@@ -134,6 +134,11 @@ async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<num
     io.error(USAGE);
     return 2;
   }
+  if (values["min-interval-ms"] !== undefined && !Number.isFinite(Number(values["min-interval-ms"]))) {
+    io.error("--min-interval-ms must be a number");
+    io.error(USAGE);
+    return 2;
+  }
   const started = systemClock.now().getTime();
   const counters = new Counters();
   const reader = horizon(
@@ -150,10 +155,20 @@ async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<num
   let fromIso: string;
   let toIso: string;
   let range: LedgerRange;
+  let rangeFor: ((account: AccountId) => LedgerRange) | undefined;
   if (follow) {
     const latest = await reader.latestLedger();
-    const lastDone = Math.max(retentionFloor, ...Object.values(state.accounts).flatMap((a) => a.completed.map((c) => c.to)));
-    range = { from: lastDone + 1, to: latest };
+    // Accounts do not share a frontier: a lagging or newly added account
+    // must be read from its own last completed ledger, not from the pooled
+    // maximum, or ledgers between its frontier and the pool's get skipped.
+    rangeFor = (account: AccountId): LedgerRange => {
+      const completed = state.accounts[account]?.completed ?? [];
+      const lastTo = completed.length > 0 ? Math.max(...completed.map((c) => c.to)) : retentionFloor - 1;
+      const from = Math.max(retentionFloor, lastTo + 1);
+      if (from > latest) return { from: latest + 1, to: latest };
+      return { from, to: latest };
+    };
+    range = { from: retentionFloor, to: latest };
     fromIso = systemClock.now().toISOString();
     toIso = fromIso;
   } else {
@@ -180,6 +195,7 @@ async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<num
     counters,
     clock: systemClock,
     force: values.force,
+    ...(rangeFor ? { rangeFor } : {}),
   });
   const { lines } = await sink.close();
 
@@ -197,6 +213,7 @@ async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<num
     runDate: systemClock.now().toISOString(),
     accounts: accounts.length,
     wallClockMs: systemClock.now().getTime() - started,
+    mode: follow ? ("follow" as const) : ("backfill" as const),
     ...(compare ? { compare } : {}),
   };
   const { json, markdown } = renderReport(counters.snapshot(), meta);

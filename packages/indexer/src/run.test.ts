@@ -9,7 +9,7 @@ import { Counters } from "./counters.js";
 import { fixedClock } from "./clock.js";
 import type { IndexerState } from "./state.js";
 import type { SourceReader } from "./source/reader.js";
-import type { SourceEffect, SourcePayment } from "./source/types.js";
+import type { LedgerRange, SourceEffect, SourcePayment } from "./source/types.js";
 import { randomAccount } from "./testing/keys.js";
 
 const dir = mkdtempSync(join(tmpdir(), "nnt-run-"));
@@ -143,5 +143,40 @@ describe("backfill", () => {
     expect(counters.get("observations_written.volume")).toBe(1);
     expect(counters.drops()).toEqual({});
     expect(counters.get("self_payments")).toBe(1);
+  });
+
+  it("reads each account from its own frontier when rangeFor is given, not the pooled range", async () => {
+    const g1 = randomAccount();
+    const g2 = randomAccount();
+    const calls: Record<string, LedgerRange[]> = {};
+    const reader: SourceReader = {
+      async *payments(account, range) {
+        (calls[account] ??= []).push(range);
+      },
+      async *effects(account, range) {
+        (calls[account] ??= []).push(range);
+      },
+      async memo() {
+        return null;
+      },
+      async retentionFloor() {
+        return 1;
+      },
+    };
+    const ranges: Record<string, LedgerRange> = { [g1]: { from: 5, to: 10 }, [g2]: { from: 20, to: 30 } };
+    const state: IndexerState = { network: "stellar:pubnet", accounts: {} };
+    const counters = new Counters();
+    const sink = openSink(join(dir, "g.ndjson"));
+    await backfill({
+      reader, accounts: [g1, g2], range: { from: 1, to: 30 },
+      ctx: { network: "stellar:pubnet", producerVersion: "0.1.0" }, sink, state, saveState: async () => {},
+      counters, clock: fixedClock(new Date("2026-09-08T00:00:00.000Z")),
+      rangeFor: (account) => ranges[account]!,
+    });
+    await sink.close();
+    expect(calls[g1]).toEqual([ranges[g1], ranges[g1]]);
+    expect(calls[g2]).toEqual([ranges[g2], ranges[g2]]);
+    expect(state.accounts[g1]?.completed).toEqual([ranges[g1]]);
+    expect(state.accounts[g2]?.completed).toEqual([ranges[g2]]);
   });
 });

@@ -22,6 +22,15 @@ export interface BackfillOptions {
   counters: Counters;
   clock: Clock;
   force?: boolean;
+  /**
+   * `follow` pools accounts with different completed frontiers; the same
+   * range for every account would silently drop or re-read ledgers for
+   * whichever accounts are not at the pooled frontier. When given, this
+   * overrides `range` per account for the reader calls, `isCompleted` and
+   * `markCompleted`; `range` itself stays the nominal range used only for
+   * naming and reporting.
+   */
+  rangeFor?: (account: AccountId) => LedgerRange;
 }
 
 export interface BackfillResult {
@@ -54,8 +63,9 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
   o.counters.inc("accounts_followed", o.accounts.length);
 
   for (const account of o.accounts) {
+    const range = o.rangeFor ? o.rangeFor(account) : o.range;
     const accountState = (o.state.accounts[account] ??= { completed: [] });
-    if (!o.force && isCompleted(accountState, o.range)) {
+    if (!o.force && isCompleted(accountState, range)) {
       result.accountsSkipped++;
       continue;
     }
@@ -98,7 +108,7 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
         o.counters.inc("sac_transfers_merged", merged);
       }
     };
-    for await (const p of o.reader.payments(account, o.range)) {
+    for await (const p of o.reader.payments(account, range)) {
       o.counters.inc("records_read.payments");
       if (p.toMuxedId !== undefined || p.fromMuxedId !== undefined) o.counters.inc("muxed_records");
       if (group.length > 0 && group[0]!.opId !== p.opId) flush();
@@ -111,12 +121,12 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
     }
     flush();
 
-    for await (const e of o.reader.effects(account, o.range)) {
+    for await (const e of o.reader.effects(account, range)) {
       o.counters.inc("records_read.effects");
       emit(mapProtocol(e, ctx));
     }
 
-    markCompleted(accountState, o.range);
+    markCompleted(accountState, range);
     await o.saveState();
     result.accountsDone++;
   }

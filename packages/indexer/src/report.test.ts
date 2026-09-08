@@ -6,6 +6,7 @@ import { randomAccount } from "./testing/keys.js";
 const meta = {
   network: "stellar:pubnet" as const, fromIso: "2026-08-01T00:00:00.000Z", toIso: "2026-08-31T00:00:00.000Z",
   range: { from: 100, to: 200 }, retentionFloor: 50, runDate: "2026-09-08T00:00:00.000Z", accounts: 100, wallClockMs: 1234,
+  mode: "backfill" as const,
 };
 
 describe("renderReport", () => {
@@ -32,5 +33,13 @@ describe("renderReport", () => {
     const shape = /G[A-Z2-7]{55}|M[A-Z2-7]{68}/;
     expect(markdown).not.toMatch(shape);
     expect(json).not.toMatch(shape);
+  });
+
+  it("does not claim a period for a follow run: ledgers, not days", () => {
+    const c = new Counters();
+    const followMeta = { ...meta, mode: "follow" as const, fromIso: meta.runDate, toIso: meta.runDate };
+    const { markdown } = renderReport(c.snapshot(), followMeta);
+    expect(markdown).toContain("(follow)");
+    expect(markdown).not.toMatch(/ days/);
   });
 });
