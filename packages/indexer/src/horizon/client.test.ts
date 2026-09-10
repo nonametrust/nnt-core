@@ -159,6 +159,46 @@ describe("HorizonClient", () => {
     expect(counters.get("requests")).toBe(6);
   });
 
+  it("halves the page limit on a 503 and counts it", async () => {
+    const h = harness((url) => {
+      if (url.includes("limit=200")) return { status: 503, body: {} };
+      if (url.includes("limit=100")) return { status: 503, body: {} };
+      if (url.includes("limit=50")) return { status: 200, body: page([1, 2], null) };
+      throw new Error(`unexpected url ${url}`);
+    });
+    const pages: unknown[][] = [];
+    for await (const p of h.client.pages<number>("/p?limit=200")) pages.push(p);
+    expect(pages).toEqual([[1, 2]]);
+    expect(h.counters.get("page_limit_reduced")).toBe(2);
+    expect(h.counters.get("retries")).toBeLessThanOrEqual(2);
+  });
+
+  it("keeps the reduced limit on the next link", async () => {
+    const h = harness((url) => {
+      if (url.includes("limit=200")) return { status: 503, body: {} };
+      if (url.startsWith("https://h.example/p?cursor=1&limit=100") || url === "https://h.example/p?cursor=1&limit=100") {
+        return { status: 200, body: page([2], null) };
+      }
+      if (url.includes("limit=100")) return { status: 200, body: page([1], "https://h.example/p?cursor=1&limit=100") };
+      throw new Error(`unexpected url ${url}`);
+    });
+    const pages: unknown[][] = [];
+    for await (const p of h.client.pages<number>("/p?limit=200")) pages.push(p);
+    expect(pages).toEqual([[1], [2]]);
+    expect(h.urls.some((u) => u.includes("cursor=1") && u.includes("limit=100"))).toBe(true);
+  });
+
+  it("still gives up on a persistent 503 at the floor", async () => {
+    const h = harness(() => ({ status: 503, body: {} }));
+    const iterate = async () => {
+      const pages: unknown[][] = [];
+      for await (const p of h.client.pages<number>("/p?limit=50")) pages.push(p);
+      return pages;
+    };
+    await expect(iterate()).rejects.toThrow(/503/);
+    expect(h.counters.get("page_limit_reduced")).toBe(1);
+  });
+
   it("still returns the parsed body when the cache write itself fails, and counts it", async () => {
     const cacheDir = mkdtempSync(join(tmpdir(), "nnt-horizon-writefail-"));
     const clock = fixedClock(new Date("2026-09-08T00:00:00.000Z"));

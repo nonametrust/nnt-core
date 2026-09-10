@@ -59,6 +59,10 @@ interface RawPage<T> {
 
 const DEFAULT_MIN_INTERVAL_MS = 1250; // 0.8 requests per second, what the backtest sustained
 const DEFAULT_MAX_RETRIES = 5;
+// Measured 2026-09-10: a hot account's payments page answers 503 on every
+// attempt above this limit (about ten seconds, Horizon's query timeout);
+// at 25 it answers in time, so this is the floor `pages()` shrinks to.
+const PAGE_LIMIT_FLOOR = 25;
 
 /**
  * A thin client: every trap the backtest measured lives at this layer and
@@ -95,13 +99,14 @@ export class HorizonClient {
    * HTTP status; once retries are exhausted it fails with an error naming
    * the url, instead of aborting the run with the bare underlying message.
    */
-  async getJson<T = unknown>(pathWithQuery: string): Promise<T> {
+  async getJson<T = unknown>(pathWithQuery: string, opts?: { maxRetries?: number }): Promise<T> {
     const url = pathWithQuery.startsWith("http") ? pathWithQuery : `${this.baseUrl}${pathWithQuery}`;
     const cached = this.readCache(url);
     if (cached !== null) {
       this.counters.inc("cache_hits");
       return JSON.parse(cached) as T;
     }
+    const maxRetries = opts?.maxRetries ?? this.maxRetries;
     let attempt = 0;
     for (;;) {
       await this.throttle();
@@ -111,7 +116,7 @@ export class HorizonClient {
         res = await this.fetchImpl(url, { headers: { accept: "application/json" } });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        if (attempt >= this.maxRetries) {
+        if (attempt >= maxRetries) {
           throw new Error(`Horizon unreachable for ${url}: ${message}`);
         }
         attempt++;
@@ -135,7 +140,7 @@ export class HorizonClient {
         throw new RetentionBoundary(`Horizon no longer serves ${url} (HTTP 410)`, url);
       }
       const retryable = res.status === 429 || res.status >= 500;
-      if (!retryable || attempt >= this.maxRetries) {
+      if (!retryable || attempt >= maxRetries) {
         throw new HorizonStatusError(res.status, url);
       }
       attempt++;
@@ -150,18 +155,54 @@ export class HorizonClient {
    * as truncated, because that is the shape the backtest saw when Horizon
    * cut a page silently; nothing is lost, since the next link is followed
    * regardless, but the report must say it happened.
+   *
+   * Measured live (2026-09-10): for a hot account, a large `limit` makes
+   * Horizon exceed its own query timeout and answer 503 on *every* attempt,
+   * so the normal backoff ladder just burns eight retries and then aborts
+   * the run. A 503 while paging is therefore treated as "this page is too
+   * big", not as an outage: each page is first tried with a single-attempt
+   * ladder (`maxRetries: 1`), and a 503 above the floor of 25 halves the
+   * `limit` on the URL and retries the same page immediately, counting
+   * `page_limit_reduced`. Horizon's own `next` link on a reduced page
+   * already carries the smaller limit, so the reduction sticks for the rest
+   * of the iteration without extra bookkeeping. Once `limit` is at the
+   * floor (or the URL carries no `limit` at all) a 503 is no longer
+   * treated as "too big" and the page is fetched with the client's normal
+   * retry ladder, so a genuine outage still surfaces as a failure. The
+   * truncation heuristic compares against the limit actually used for the
+   * page that came back, not the limit the caller originally asked for.
    */
   async *pages<T>(pathWithQuery: string): AsyncIterable<T[]> {
-    const limit = requestedLimit(pathWithQuery);
     let url: string | null = pathWithQuery;
     let previousShort = false;
     while (url !== null) {
-      const raw: RawPage<T> = await this.getJson<RawPage<T>>(url);
+      let currentUrl = url;
+      let raw: RawPage<T>;
+      for (;;) {
+        const currentLimit = requestedLimit(currentUrl);
+        if (currentLimit !== null && currentLimit > PAGE_LIMIT_FLOOR) {
+          try {
+            raw = await this.getJson<RawPage<T>>(currentUrl, { maxRetries: 1 });
+            break;
+          } catch (err) {
+            if (err instanceof HorizonStatusError && err.status === 503) {
+              const reduced = Math.max(PAGE_LIMIT_FLOOR, Math.floor(currentLimit / 2));
+              currentUrl = withLimit(currentUrl, reduced);
+              this.counters.inc("page_limit_reduced");
+              continue;
+            }
+            throw err;
+          }
+        }
+        raw = await this.getJson<RawPage<T>>(currentUrl);
+        break;
+      }
+      const currentLimit = requestedLimit(currentUrl);
       const records = raw._embedded?.records ?? [];
       if (records.length === 0) return;
       if (previousShort) this.counters.inc("pages_truncated");
       yield records;
-      previousShort = limit !== null && records.length < limit;
+      previousShort = currentLimit !== null && records.length < currentLimit;
       url = raw._links?.next?.href ?? null;
     }
   }
@@ -204,4 +245,9 @@ export class HorizonClient {
 function requestedLimit(url: string): number | null {
   const m = /[?&]limit=(\d+)/.exec(url);
   return m ? Number(m[1]) : null;
+}
+
+/** Rewrites the `limit=` query parameter in place, keeping the rest of the URL (cursor included) untouched. */
+function withLimit(url: string, limit: number): string {
+  return url.replace(/([?&]limit=)\d+/, `$1${limit}`);
 }
