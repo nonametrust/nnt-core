@@ -21,9 +21,9 @@ const NETWORKS: Record<Network, string> = {
 };
 
 const USAGE = `usage:
-  nnt-indexer select-accounts --network <stellar:pubnet|stellar:testnet> --from <ISO> --to <ISO> [--n 100] [--max-appearances 50] --out accounts.txt
-  nnt-indexer backfill --network <net> --accounts <file> --from <ISO> --to <ISO> [--out-dir out] [--state <file>] [--cache-dir cache] [--force] [--compare <ndjson>] [--min-interval-ms 1250] [--horizon-url <url>]
-  nnt-indexer follow --network <net> --accounts <file> [--state <file>] [--cache-dir cache]
+  nnt-indexer select-accounts --network <stellar:pubnet|stellar:testnet> --from <ISO> --to <ISO> [--n 100] [--max-appearances 50] [--max-retries 8] --out accounts.txt
+  nnt-indexer backfill --network <net> --accounts <file> --from <ISO> --to <ISO> [--out-dir out] [--state <file>] [--cache-dir cache] [--force] [--compare <ndjson>] [--min-interval-ms 1250] [--max-retries 8] [--horizon-url <url>]
+  nnt-indexer follow --network <net> --accounts <file> [--state <file>] [--cache-dir cache] [--max-retries 8]
   nnt-indexer report --counters <file>`;
 
 interface Io {
@@ -65,10 +65,13 @@ function toIsoDay(s: string): string {
   return d.toISOString();
 }
 
+const DEFAULT_CLI_MAX_RETRIES = 8;
+
 interface HorizonOpts {
   horizonUrl?: string | undefined;
   cacheDir?: string | undefined;
   minIntervalMs?: string | undefined;
+  maxRetries?: string | undefined;
 }
 
 function horizon(net: Network, opts: HorizonOpts, counters: Counters): HorizonReader {
@@ -76,6 +79,7 @@ function horizon(net: Network, opts: HorizonOpts, counters: Counters): HorizonRe
     baseUrl: opts.horizonUrl ?? NETWORKS[net],
     clock: systemClock,
     counters,
+    maxRetries: opts.maxRetries !== undefined ? Number(opts.maxRetries) : DEFAULT_CLI_MAX_RETRIES,
     ...(opts.cacheDir ? { cacheDir: opts.cacheDir } : {}),
     ...(opts.minIntervalMs ? { minIntervalMs: Number(opts.minIntervalMs) } : {}),
   });
@@ -94,6 +98,7 @@ async function cmdSelect(args: string[], io: Io): Promise<number> {
       out: { type: "string" },
       "cache-dir": { type: "string" },
       "horizon-url": { type: "string" },
+      "max-retries": { type: "string" },
     },
   });
   const net = network(values.network, io);
@@ -101,8 +106,13 @@ async function cmdSelect(args: string[], io: Io): Promise<number> {
     io.error(USAGE);
     return 2;
   }
+  if (values["max-retries"] !== undefined && !Number.isFinite(Number(values["max-retries"]))) {
+    io.error("--max-retries must be a number");
+    io.error(USAGE);
+    return 2;
+  }
   const counters = new Counters();
-  const reader = horizon(net, { horizonUrl: values["horizon-url"], cacheDir: values["cache-dir"] }, counters);
+  const reader = horizon(net, { horizonUrl: values["horizon-url"], cacheDir: values["cache-dir"], maxRetries: values["max-retries"] }, counters);
   const range = await reader.resolveRange(toIsoDay(values.from), toIsoDay(values.to));
   const r = await selectAccounts(reader, { range, n: Number(values.n), maxAppearances: Number(values["max-appearances"]) });
   await writeFile(values.out, r.accounts.join("\n") + "\n", "utf8");
@@ -126,6 +136,7 @@ async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<num
       force: { type: "boolean", default: false },
       compare: { type: "string" },
       "min-interval-ms": { type: "string" },
+      "max-retries": { type: "string" },
       "horizon-url": { type: "string" },
     },
   });
@@ -139,11 +150,16 @@ async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<num
     io.error(USAGE);
     return 2;
   }
+  if (values["max-retries"] !== undefined && !Number.isFinite(Number(values["max-retries"]))) {
+    io.error("--max-retries must be a number");
+    io.error(USAGE);
+    return 2;
+  }
   const started = systemClock.now().getTime();
   const counters = new Counters();
   const reader = horizon(
     net,
-    { horizonUrl: values["horizon-url"], cacheDir: values["cache-dir"], minIntervalMs: values["min-interval-ms"] },
+    { horizonUrl: values["horizon-url"], cacheDir: values["cache-dir"], minIntervalMs: values["min-interval-ms"], maxRetries: values["max-retries"] },
     counters,
   );
   const accounts = (await readFile(values.accounts, "utf8")).split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
@@ -183,7 +199,7 @@ async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<num
 
   const name = follow ? `${net.replace(":", "-")}_follow_${range.from}_${range.to}.ndjson` : outputFileName(net, fromIso, toIso);
   const outPath = join(values["out-dir"], name);
-  const sink = openSink(outPath);
+  const sink = openSink(outPath, { append: !values.force });
   const result = await backfill({
     reader,
     accounts,

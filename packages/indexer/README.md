@@ -20,6 +20,13 @@ gitignored; the root gate refuses the id shape in any tracked file.
 a different Horizon deployment or a local one. `--min-interval-ms` overrides
 the client's request pacing (default 1250ms, what the backtest sustained);
 it must parse as a number or the command exits 2 before making a request.
+`--max-retries` overrides how many times a retryable Horizon response (429,
+5xx, or a network failure) is retried before the run fails (default 8 from
+the CLI; direct callers of `HorizonClient` still default to 5); it must
+parse as a number or the command exits 2 before making a request.
+
+`backfill` and `follow` resume from `state-*.json`; without `--force` the
+output file is appended, with `--force` it is rewritten.
 
 ## What is measured
 

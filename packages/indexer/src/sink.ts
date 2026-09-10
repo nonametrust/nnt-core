@@ -9,19 +9,38 @@ export function outputFileName(network: Network, fromIso: string, toIso: string)
   return `${network.replace(":", "-")}_${day(fromIso)}_${day(toIso)}.ndjson`;
 }
 
+/**
+ * Written by `backfill` as records are mapped; `close()` waits for the
+ * underlying stream to flush and reports the total line count. Opened with
+ * `append: true` (see `OpenSinkOptions`) when a run resumes, so the lines an
+ * interrupted run already wrote survive; opened without it (the default,
+ * `--force`) the file starts empty.
+ */
 export interface Sink {
   write(line: object): void;
   close(): Promise<{ lines: number; path: string }>;
 }
 
-/**
- * `createStream` is a seam for tests: it defaults to a real file stream, but
- * a test can substitute a writable that fails, to prove a stream error fails
- * `close()` instead of crashing the process.
- */
-export function openSink(path: string, createStream: (p: string) => Writable = (p) => createWriteStream(p, { encoding: "utf8" })): Sink {
+export interface OpenSinkOptions {
+  /**
+   * When true, an existing file at `path` is opened in append mode ("a") so
+   * that a resumed run keeps the lines a previous, interrupted run already
+   * wrote instead of truncating them. Default false (flag "w", as before).
+   */
+  append?: boolean;
+  /**
+   * A seam for tests: overrides the real file stream `openSink` would
+   * otherwise open, so a test can substitute a writable that fails, to prove
+   * a stream error fails `close()` instead of crashing the process.
+   */
+  createStream?: (p: string) => Writable;
+}
+
+export function openSink(path: string, options: OpenSinkOptions = {}): Sink {
   mkdirSync(dirname(path), { recursive: true });
-  const stream = createStream(path);
+  const stream = options.createStream
+    ? options.createStream(path)
+    : createWriteStream(path, { encoding: "utf8", flags: options.append ? "a" : "w" });
   let lines = 0;
   let failure: Error | undefined;
   stream.on("error", (e: Error) => {

@@ -31,8 +31,30 @@ describe("sink", () => {
         callback(new Error("boom"));
       },
     });
-    const s = openSink(path, () => failing);
+    const s = openSink(path, { createStream: () => failing });
     s.write({ a: 1 });
     await expect(s.close()).rejects.toThrow(/boom/);
+  });
+
+  it("appends across two opens when append is true, so a resume keeps earlier lines", async () => {
+    const path = join(dir, "append.ndjson");
+    const s1 = openSink(path, { append: true });
+    s1.write({ a: 1 });
+    await s1.close();
+    const s2 = openSink(path, { append: true });
+    s2.write({ b: 2 });
+    await s2.close();
+    expect(readFileSync(path, "utf8")).toBe('{"a":1}\n{"b":2}\n');
+  });
+
+  it("truncates on a second open without append, as today", async () => {
+    const path = join(dir, "truncate.ndjson");
+    const s1 = openSink(path);
+    s1.write({ a: 1 });
+    await s1.close();
+    const s2 = openSink(path);
+    s2.write({ b: 2 });
+    await s2.close();
+    expect(readFileSync(path, "utf8")).toBe('{"b":2}\n');
   });
 });

@@ -15,4 +15,15 @@ describe("cli", () => {
     expect(code).toBe(2);
     expect(out.join("\n")).toMatch(/stellar:pubnet/);
   });
+
+  it("refuses a non-numeric --max-retries", async () => {
+    const out: string[] = [];
+    const code = await main(
+      ["backfill", "--network", "stellar:testnet", "--accounts", "x", "--from", "2026-08-01", "--to", "2026-08-02", "--max-retries", "abc"],
+      {},
+      { log: (s) => out.push(s), error: (s) => out.push(s) },
+    );
+    expect(code).toBe(2);
+    expect(out.join("\n")).toMatch(/--max-retries must be a number/);
+  });
 });
