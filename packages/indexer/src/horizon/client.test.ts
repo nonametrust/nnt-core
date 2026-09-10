@@ -121,6 +121,44 @@ describe("HorizonClient", () => {
     rmSync(cacheDir, { recursive: true, force: true });
   });
 
+  it("retries a network error and then succeeds", async () => {
+    const clock = fixedClock(new Date("2026-09-08T00:00:00.000Z"));
+    const counters = new Counters();
+    const times: number[] = [];
+    let n = 0;
+    const fetchImpl = (async () => {
+      times.push(clock.now().getTime());
+      n++;
+      if (n < 3) throw new TypeError("fetch failed");
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const sleep = async (ms: number) => {
+      clock.advance(ms);
+    };
+    const client = new HorizonClient({
+      baseUrl: "https://h.example", clock, counters, fetch: fetchImpl, sleep,
+    });
+    expect(await client.getJson("/x")).toEqual({ ok: true });
+    expect(counters.get("retries")).toBe(2);
+    expect(times[2]! - times[1]!).toBeGreaterThan(times[1]! - times[0]!);
+  });
+
+  it("gives up on a persistent network error naming the url", async () => {
+    const clock = fixedClock(new Date("2026-09-08T00:00:00.000Z"));
+    const counters = new Counters();
+    const fetchImpl = (async () => {
+      throw new TypeError("fetch failed");
+    }) as typeof fetch;
+    const sleep = async (ms: number) => {
+      clock.advance(ms);
+    };
+    const client = new HorizonClient({
+      baseUrl: "https://h.example", clock, counters, fetch: fetchImpl, sleep,
+    });
+    await expect(client.getJson("/x")).rejects.toThrow(/unreachable for/);
+    expect(counters.get("requests")).toBe(6);
+  });
+
   it("still returns the parsed body when the cache write itself fails, and counts it", async () => {
     const cacheDir = mkdtempSync(join(tmpdir(), "nnt-horizon-writefail-"));
     const clock = fixedClock(new Date("2026-09-08T00:00:00.000Z"));

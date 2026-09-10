@@ -89,6 +89,12 @@ export class HorizonClient {
     if (this.cacheDir) mkdirSync(this.cacheDir, { recursive: true });
   }
 
+  /**
+   * A thrown fetch (a network-level failure such as `TypeError: fetch
+   * failed`, e.g. a dropped connection) is retried exactly like a retryable
+   * HTTP status; once retries are exhausted it fails with an error naming
+   * the url, instead of aborting the run with the bare underlying message.
+   */
   async getJson<T = unknown>(pathWithQuery: string): Promise<T> {
     const url = pathWithQuery.startsWith("http") ? pathWithQuery : `${this.baseUrl}${pathWithQuery}`;
     const cached = this.readCache(url);
@@ -100,7 +106,19 @@ export class HorizonClient {
     for (;;) {
       await this.throttle();
       this.counters.inc("requests");
-      const res = await this.fetchImpl(url, { headers: { accept: "application/json" } });
+      let res: Response;
+      try {
+        res = await this.fetchImpl(url, { headers: { accept: "application/json" } });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (attempt >= this.maxRetries) {
+          throw new Error(`Horizon unreachable for ${url}: ${message}`);
+        }
+        attempt++;
+        this.counters.inc("retries");
+        await this.sleep(this.minIntervalMs * 2 ** attempt);
+        continue;
+      }
       if (res.status === 200) {
         const text = await res.text();
         let parsed: T;
