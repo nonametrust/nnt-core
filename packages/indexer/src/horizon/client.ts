@@ -168,9 +168,15 @@ export class HorizonClient {
    * of the iteration without extra bookkeeping. Once `limit` is at the
    * floor (or the URL carries no `limit` at all) a 503 is no longer
    * treated as "too big" and the page is fetched with the client's normal
-   * retry ladder, so a genuine outage still surfaces as a failure. The
-   * truncation heuristic compares against the limit actually used for the
-   * page that came back, not the limit the caller originally asked for.
+   * retry ladder, so a genuine outage still surfaces as a failure. Only a
+   * 503 is read as "shrink the page": any other error from the
+   * single-attempt ladder (a 429, a 5xx that is not 503, a dropped
+   * connection) gets one retry with the client's full normal ladder before
+   * it is allowed to propagate, so the short ladder used to probe page
+   * size never undoes the retry behaviour the rest of the client relies on
+   * for ordinary transient failures. The truncation heuristic compares
+   * against the limit actually used for the page that came back, not the
+   * limit the caller originally asked for.
    */
   async *pages<T>(pathWithQuery: string): AsyncIterable<T[]> {
     let url: string | null = pathWithQuery;
@@ -191,7 +197,11 @@ export class HorizonClient {
               this.counters.inc("page_limit_reduced");
               continue;
             }
-            throw err;
+            // Not a 503: the short ladder just probed page size, it did
+            // not decide this was an outage. Give the full normal ladder
+            // one chance before this error is allowed to propagate.
+            raw = await this.getJson<RawPage<T>>(currentUrl);
+            break;
           }
         }
         raw = await this.getJson<RawPage<T>>(currentUrl);

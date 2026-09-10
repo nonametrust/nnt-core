@@ -170,7 +170,22 @@ describe("HorizonClient", () => {
     for await (const p of h.client.pages<number>("/p?limit=200")) pages.push(p);
     expect(pages).toEqual([[1, 2]]);
     expect(h.counters.get("page_limit_reduced")).toBe(2);
-    expect(h.counters.get("retries")).toBeLessThanOrEqual(2);
+    expect(h.counters.get("retries")).toBe(2);
+  });
+
+  it("a 429 on a big page gets the full ladder, not the short one", async () => {
+    let n = 0;
+    const h = harness((url) => {
+      if (url.includes("limit=200")) {
+        n++;
+        return n <= 4 ? { status: 429, body: {} } : { status: 200, body: page([1], null) };
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+    const pages: unknown[][] = [];
+    for await (const p of h.client.pages<number>("/p?limit=200")) pages.push(p);
+    expect(pages).toEqual([[1]]);
+    expect(h.counters.get("page_limit_reduced")).toBe(0);
   });
 
   it("keeps the reduced limit on the next link", async () => {
