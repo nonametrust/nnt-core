@@ -10,3 +10,6 @@ packages/indexer/accounts*.txt
 packages/indexer/state*.json
 packages/indexer/cache/
 packages/indexer/out/
+packages/indexer/*.txt
+packages/indexer/*.log
+packages/indexer/out*/
