@@ -109,6 +109,17 @@ describe("assertBaseline", () => {
     expect(() => assertBaseline({ ...s, ...patch })).toThrow(RangeError);
   });
 
+  // The pair arrives at the first observation, so this row was not written
+  // by the arithmetic. Admitted, it would be updated with no location to
+  // clip against: five observations at a mean of a hundred, then a million,
+  // moved the mean by over a hundred and sixty thousand against a bound of
+  // half a unit. M3 will hand this package rows it did not write.
+  it("refuses a positive count with no robust pair, on entry to an update too", () => {
+    const s = { ...warmed([100, 100, 100, 100, 100], 1), medianEst: null, madEst: null };
+    expect(() => assertBaseline(s)).toThrow(RangeError);
+    expect(() => updateBaseline(s, 1e6, 1, policy)).toThrow(RangeError);
+  });
+
   it("accepts every state the arithmetic produces along a history", () => {
     let state = emptyBaseline(ns, "volume", "amount/USDC/in");
     expect(() => assertBaseline(state)).not.toThrow();
@@ -249,5 +260,37 @@ describe("the stored shape", () => {
   it("refuses to produce a non-finite state, even from finite inputs", () => {
     const s = warmed([0], 1e154);
     expect(() => updateBaseline(s, 1e300, 1e154, policy)).toThrow(RangeError);
+  });
+});
+
+describe("the location is the mean", () => {
+  // medianEst and mean are fed the same clipped value, start from the same
+  // first value and move by the same recursion, so they are one number on
+  // every row. That identity carries criterion 3 for mean: the band is
+  // computed around medianEst and the Welford delta is measured from mean,
+  // so mean is bounded only because the two coincide. A change that
+  // separates them fails here, and must re-derive the bound for mean
+  // before it passes.
+  it("holds bit for bit along a history that clips", () => {
+    let s = emptyBaseline(ns, "volume", "amount/USDC/in");
+    for (const v of [100, 101, 99, 1e6, 100, -1e6, 102, 98, Number.MAX_VALUE, 100]) {
+      s = updateBaseline(s, v, 1, policy);
+      expect(s.medianEst).toBe(s.mean);
+    }
+  });
+});
+
+describe("the multiple is the policy's winsorMadMultiple", () => {
+  // Every other test runs the shipped policy, in which winsorMadMultiple and
+  // thresholdBase are both 3, so an update reading the wrong field, or the
+  // literal, computes the same bound and passes them all. With the multiple
+  // overridden to 1 the band is [98, 102] and the mean moves by 2/21; the
+  // other readings still move it by 6/21.
+  it("is read from that field and not from another number that happens to be three", () => {
+    const narrow = { ...policy, winsorMadMultiple: 1 };
+    const s = warmed(Array(20).fill(100), 2);
+    const next = updateBaseline(s, 1e6, 2, narrow);
+    expect(next.mean - s.mean).toBeCloseTo(2 / 21, 12);
+    expect(next.mean - s.mean).not.toBeCloseTo(6 / 21, 12);
   });
 });

@@ -26,6 +26,18 @@ import type { Policy } from "./policy.js";
  * multiple × scale / n. Do not "fix" this into a true median: any estimator
  * that needs history cannot be fed from this row.
  *
+ * Said plainly, so the name does not mislead: medianEst is the Welford mean
+ * of the same clipped input that mean is fed, started from the same first
+ * value and moved by the same recursion, and the two are equal on every
+ * row this arithmetic produces; baseline.test.ts holds that identity. The
+ * resistance of this design lives entirely in the clip, and not in the
+ * location estimator differing from the mean, because it does not. What
+ * actually differs between the two pairs is m2 against madEst: a clipped
+ * sum of squared deviations against a clipped mean absolute deviation. The
+ * identity is load-bearing, not incidental: the band is computed around
+ * medianEst and the Welford delta is measured from mean, so the bound on
+ * mean holds through the identity and would not survive its separation.
+ *
  * A streaming quantile sketch was the alternative and was rejected on its
  * merits, not for convenience. It needs a step-size parameter, which would
  * be one more uncalibrated number, and it converges worst on exactly the
@@ -97,6 +109,17 @@ export function assertBaseline(state: BaselineState): void {
   }
   if (state.count === 0 && state.medianEst !== null) {
     throw new RangeError("a baseline with no observations cannot carry a location");
+  }
+  // The pair arrives at the first observation, so a row with observations
+  // behind it and no pair was not written by this arithmetic. Admitting it
+  // would update it unclipped, since there is no location to clip against,
+  // and one observation could move the mean without bound. The
+  // first-observation branch of updateBaseline serves a zero count and
+  // this refusal a positive one; the two cases are disjoint.
+  if (state.count > 0 && state.medianEst === null) {
+    throw new RangeError(
+      `baseline ${state.channel}/${state.aspect} has ${state.count} observations and no robust pair`,
+    );
   }
   requireFinite("baseline mean", state.mean);
   requireNonNegative("baseline m2", state.m2);
