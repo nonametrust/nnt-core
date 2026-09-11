@@ -139,6 +139,13 @@ export function readObservation(o: Observation): Reading[] {
   switch (o.channel) {
     case "volume": {
       const p = parsePayload("volume", o.payload);
+      // Known limit, deferred and not decided. On Stellar an asset code
+      // alone does not fix a unit: two assets can both be named USDC under
+      // different issuers, and this aspect pools them into one baseline.
+      // The fix is an issuer in the aspect, which needs an issuer in the
+      // payload, which is a schema tightening; the contract is held still
+      // for the indexer's current delivery, so the tightening is not made
+      // here. A reader must not take `amount/USDC/in` for a unit it is not.
       return [continuous("volume", `amount/${p.assetCode}/${p.direction}`, decimal(p.amount, "amount"))];
     }
     case "price": {
@@ -153,6 +160,13 @@ export function readObservation(o: Observation): Reading[] {
       const p = parsePayload("cluster_proximity", o.payload);
       const readings: Reading[] = [continuous("cluster_proximity", "hops", finite(p.hops, "hops"))];
       if (p.amount !== undefined) {
+        // Known limit, deferred and not decided. The payload carries no
+        // asset for the amount, so this aspect pools dust across every
+        // asset: a contact in XLM and a contact in USDC land on one scale.
+        // Separating them needs an asset in the payload, which is the same
+        // schema tightening as the volume case above, deferred for the same
+        // reason. The aspect is one word because it fixes no unit, and a
+        // reader should take it that way.
         readings.push(continuous("cluster_proximity", "amount", decimal(p.amount, "amount")));
       }
       return readings;

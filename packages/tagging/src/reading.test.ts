@@ -168,10 +168,26 @@ describe("readObservation", () => {
     expect(() => readObservation(sideways)).toThrow(RangeError);
   });
 
-  // The decimal pattern admits any number of digits, and a double does not.
-  it("refuses a decimal that does not fit a double rather than reading it as infinity", () => {
-    const huge = withPayload(fixture("volume"), { amount: "9".repeat(400) });
-    expect(() => readObservation(huge)).toThrow(RangeError);
+  // No reading is ever infinite or NaN, on any of the four continuous
+  // channels. Two ways in are closed here. The decimal pattern admits any
+  // number of digits and a double does not, so a four-hundred-digit amount
+  // is Infinity after Number(). And a JSON number field arrives as a double
+  // already; the installed validator's z.number() refuses NaN but admits
+  // Infinity, so latencyMs is held finite by this package and by nothing
+  // upstream of it. hops is z.number().int(), which refuses Infinity on its
+  // own, and is listed anyway so the property is held on every field rather
+  // than on the fields where it happens to be this package's job today.
+  it.each<[string, Channel, Record<string, unknown>]>([
+    ["volume amount of four hundred digits", "volume", { amount: "9".repeat(400) }],
+    ["price quoted of four hundred digits", "price", { quoted: "9".repeat(400) }],
+    ["latency latencyMs Infinity", "latency", { latencyMs: Infinity }],
+    ["latency latencyMs NaN", "latency", { latencyMs: NaN }],
+    ["cluster_proximity hops Infinity", "cluster_proximity", { hops: Infinity }],
+    ["cluster_proximity hops NaN", "cluster_proximity", { hops: NaN }],
+    ["cluster_proximity amount of four hundred digits", "cluster_proximity", { amount: "9".repeat(400) }],
+  ])("refuses a quantity that is not a finite double: %s", (_case, channel, change) => {
+    const o = withPayload(fixture(channel), change);
+    expect(() => readObservation(o)).toThrow(RangeError);
   });
 
   it("is a pure function of the observation", () => {
