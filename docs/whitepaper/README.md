@@ -12,7 +12,11 @@ script that no longer exists anywhere. The Markdown here was reconstructed from
 those PDFs on 12 September 2026: the text was extracted and re-flowed paragraph
 by paragraph, the tables were rebuilt, and the seven figures were cut out of the
 PDFs' own vector content as SVG (`figures/`). The figures are therefore faithful
-but not editable: their text is glyph outlines. Figures 5 to 7 can be regenerated from the published
+but not editable: their text is glyph outlines. The one exception is the
+bottom-left box of Figure 2, whose "discarded" label was replaced with real
+text on 12 September 2026 when the retention design changed; `build.py`
+inlines the SVGs so that label is set in the bundled DejaVu Sans. Figures 5 to
+7 can be regenerated from the published
 study data in `github.com/KayaKerem/nonametrust` when someone writes that
 generator; Figures 1 to 4 are diagrams and would be redrawn by hand.
 
