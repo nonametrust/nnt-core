@@ -68,7 +68,10 @@ export function precisionAtEvenPrior(
   return v / (v + c);
 }
 
-const SIGNAL_TABLE = "nonametrust/results/signal_table.csv, 30-day rows, vendored as fixtures/study/signal_table_30d.csv";
+// The citation names the public export at a pinned revision, not the
+// `nonametrust` organisation, whose working repository holds subject-level
+// data and cannot be cited.
+const SIGNAL_TABLE = "github.com/KayaKerem/nonametrust@ee49e18, results/signal_table.csv, 30-day rows, vendored as fixtures/study/signal_table_30d.csv";
 
 export const CALIBRATION_V0: Calibration = {
   version: "calibration-v0",
@@ -111,16 +114,30 @@ export const CALIBRATION_V0: Calibration = {
   // distance still holds half of g0 when the loss arrives. The 80th
   // percentile, 23.4 days, is the limbo TTL's figure and belongs to W7.
   halfLifeMs: 14 * 24 * 60 * 60 * 1000,
-  halfLifeSource: "nonametrust/results/distance_hist.csv, pooled median, vendored as fixtures/study/distance_hist.csv",
+  halfLifeSource: "github.com/KayaKerem/nonametrust@ee49e18, results/distance_hist.csv, pooled median, vendored as fixtures/study/distance_hist.csv",
 };
 
+function named(name: string, value: string): void {
+  if (value.length === 0) throw new RangeError(`calibration.${name} must not be empty`);
+}
+
+/**
+ * A calibration the arithmetic can use and a result can cite. The version
+ * is what every result names, and an entry's signal and source are the
+ * provenance this file exists to carry, so an empty one is refused with the
+ * out-of-range weights rather than shipped as a blank citation.
+ */
 export function assertCalibration(calibration: Calibration): void {
+  named("version", calibration.version);
   for (const c of MEASURED_CHANNELS) {
     const entry = calibration.channelWeights[c];
     if (!(entry.weight > 0 && entry.weight <= 1)) {
       throw new RangeError(`calibration.channelWeights.${c}.weight must lie in (0, 1], got ${entry.weight}`);
     }
+    named(`channelWeights.${c}.signal`, entry.signal);
+    named(`channelWeights.${c}.source`, entry.source);
   }
+  named("halfLifeSource", calibration.halfLifeSource);
   if (!(calibration.halfLifeMs > 0) || !Number.isFinite(calibration.halfLifeMs)) {
     throw new RangeError(`calibration.halfLifeMs must be positive and finite, got ${calibration.halfLifeMs}`);
   }

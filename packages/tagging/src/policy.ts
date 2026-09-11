@@ -116,6 +116,9 @@ function unit(name: string, value: number, closedAtOne: boolean): void {
  * two timescales and the divergence they expose.
  */
 export function assertPolicy(policy: Policy): void {
+  // The version is what every result names and what the champion-challenger
+  // arrangement keys on; an empty one is a result that names nothing.
+  if (policy.version.length === 0) throw new RangeError("policy.version must not be empty");
   if (!Number.isSafeInteger(policy.minObservations) || policy.minObservations < 1) {
     throw new RangeError(`policy.minObservations must be a positive integer, got ${policy.minObservations}`);
   }

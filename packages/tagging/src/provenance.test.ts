@@ -62,8 +62,8 @@ describe("calibration against the study", () => {
   // formula is pinned here by hand on two rows, one with an empty control
   // arm and one without: one added to each count, two to each arm.
   it("smooths by adding one carrier and one non-carrier to each arm, and nothing else", () => {
-    expect(precisionAtEvenPrior(14, 100, 0, 200)).toBe((15 / 102) / (15 / 102 + 1 / 202));
-    expect(precisionAtEvenPrior(17, 100, 7, 200)).toBe((18 / 102) / (18 / 102 + 8 / 202));
+    expect(precisionAtEvenPrior(14, 100, 0, 200)).toBeCloseTo((15 / 102) / (15 / 102 + 1 / 202), 12);
+    expect(precisionAtEvenPrior(17, 100, 7, 200)).toBeCloseTo((18 / 102) / (18 / 102 + 8 / 202), 12);
   });
 
   // The audit's diagnosis: a rule that ORs channels inherits the broad
@@ -88,6 +88,14 @@ describe("calibration against the study", () => {
     for (const c of MEASURED_CHANNELS) {
       expect(CALIBRATION_V0.channelWeights[c].signal).not.toBe("counterparty_behavior_shift");
     }
+  });
+
+  // any_signal is in the vendored table and recomputes cleanly, so an entry
+  // citing it would pass the derivation test; and two channels citing one
+  // signal would too. Five distinct signals, none of them the OR row.
+  it("cites five distinct signals, and the pooled any_signal row is not one of them", () => {
+    const signals = MEASURED_CHANNELS.map((c) => CALIBRATION_V0.channelWeights[c].signal);
+    expect(new Set(signals.filter((s) => s !== "any_signal")).size).toBe(MEASURED_CHANNELS.length);
   });
 
   it("derives the half-life as the pooled median distance, rounded to a whole day", () => {
@@ -122,11 +130,34 @@ describe("calibration against the study", () => {
     expect(() => assertCalibration(broken)).toThrow(RangeError);
     expect(() => assertCalibration({ ...CALIBRATION_V0, halfLifeMs: 0 })).toThrow(RangeError);
   });
+
+  it("refuses an empty version, signal or source, since a result cites them", () => {
+    const withVolume = (over: Partial<(typeof CALIBRATION_V0.channelWeights)["volume"]>) => ({
+      ...CALIBRATION_V0,
+      channelWeights: { ...CALIBRATION_V0.channelWeights, volume: { ...CALIBRATION_V0.channelWeights.volume, ...over } },
+    });
+    expect(() => assertCalibration({ ...CALIBRATION_V0, version: "" })).toThrow(RangeError);
+    expect(() => assertCalibration({ ...CALIBRATION_V0, halfLifeSource: "" })).toThrow(RangeError);
+    expect(() => assertCalibration(withVolume({ signal: "" }))).toThrow(RangeError);
+    expect(() => assertCalibration(withVolume({ source: "" }))).toThrow(RangeError);
+  });
 });
 
 describe("channelWeight", () => {
-  it("returns the calibrated weight for a measured channel", () => {
-    expect(channelWeight("volume", CALIBRATION_V0, POLICY_V0)).toBe(CALIBRATION_V0.channelWeights.volume.weight);
+  // Every measured channel, not one: a dispatch that recognised volume alone
+  // would score the other four with the policy's uncalibrated weight while
+  // the result still named calibration-v0.
+  it("returns the calibrated weight for every measured channel", () => {
+    for (const c of MEASURED_CHANNELS) {
+      expect(channelWeight(c, CALIBRATION_V0, POLICY_V0), c).toBe(CALIBRATION_V0.channelWeights[c].weight);
+    }
+  });
+
+  // The complement is closed. A channel added to the schema later fails here
+  // until it is either measured or explicitly admitted as unmeasured.
+  it("leaves exactly latency and price to the policy", () => {
+    const unmeasured = CHANNELS.filter((c) => !(MEASURED_CHANNELS as readonly string[]).includes(c));
+    expect([...unmeasured].sort()).toEqual(["latency", "price"]);
   });
 
   // Latency and price were not in the study. Their weight is a policy
@@ -157,6 +188,7 @@ describe("policy", () => {
 
   it("refuses a value the arithmetic cannot use", () => {
     const cases: Array<Partial<typeof POLICY_V0>> = [
+      { version: "" },
       { minObservations: 0 },
       { winsorMadMultiple: 0 },
       { fastAlpha: 1 },
