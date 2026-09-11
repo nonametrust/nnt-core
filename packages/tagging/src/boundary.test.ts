@@ -29,7 +29,16 @@ const TEST = /\.(test|spec)\.(ts|mts|cts|tsx)$/;
 const SPECIFIER =
   /\b(?:import|export)\b[^"'`;]*?\bfrom\s*["']([^"']+)["']|\bimport\s*["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
 const DYNAMIC_EXPRESSION = /\bimport\s*\(\s*[^"')]/;
-const CLOCK = /\bDate\.now\s*\(|\bnew\s+Date\s*\(\s*\)/;
+// Any mention of Date.now, called or merely referenced, and any `new Date`
+// not followed by an argument. JavaScript admits `new Date` with no
+// parentheses at all, and that is the current instant as much as `new Date()`
+// is, so the construction is refused unless an opening parenthesis is followed
+// by something other than whitespace or a closing one. `new Date(x)` with an
+// instant passed in is what the package is expected to write. The scan is per
+// line, so `new Date(` with its argument on the next line is refused as well;
+// put the argument on the same line. `Date` in a type position never follows
+// `new` and is untouched.
+const CLOCK = /\bDate\.now\b|\bnew\s+Date\b(?!\s*\(\s*[^\s)])/;
 const DATABASE = /\bkysely\b|["']pg["']|@nonametrust\/store|NNT_TEST_DATABASE_URL/;
 
 interface SourceFile {
@@ -62,6 +71,18 @@ function specifiers(text: string): string[] {
     const spec = m[1] ?? m[2] ?? m[3];
     if (spec !== undefined) found.push(spec);
   }
+  return found;
+}
+
+// The lines of a module that read the wall clock, as `line: text`. The gate
+// below runs this over every non-test module; the planted cases further down
+// run it over single lines, so what they prove is the predicate the gate uses
+// and not a copy of it.
+function clockReads(text: string): string[] {
+  const found: string[] = [];
+  text.split("\n").forEach((line, i) => {
+    if (CLOCK.test(line)) found.push(`${i + 1}: ${line.trim()}`);
+  });
   return found;
 }
 
@@ -116,11 +137,41 @@ describe("the package boundary", () => {
     const offenders: string[] = [];
     for (const file of sourceFiles()) {
       if (file.isTest) continue;
-      file.text.split("\n").forEach((line, i) => {
-        if (CLOCK.test(line)) offenders.push(`${file.rel}:${i + 1}: ${line.trim()}`);
-      });
+      for (const hit of clockReads(file.text)) offenders.push(`${file.rel}:${hit}`);
     }
     expect(offenders, "these lines read the wall clock:\n" + offenders.join("\n")).toEqual([]);
+  });
+
+  // The clock predicate, proven on planted lines before it is trusted over
+  // the tree. Each refused form is a way to read the current instant; each
+  // allowed form is what the package legitimately writes, and is the case a
+  // widened pattern could break.
+  describe("the clock predicate", () => {
+    it.each([
+      ["a call", "const t = Date.now();"],
+      ["a reference, called later", "const clock = Date.now;"],
+      ["new Date with empty parentheses", "const t = new Date();"],
+      ["new Date with only whitespace inside", "const t = new Date( );"],
+      ["new Date with no parentheses", "const t = new Date;"],
+      ["new Date with the argument on the next line", "const t = new Date("],
+    ])("refuses %s", (_form, line) => {
+      expect(clockReads(line)).toEqual([`1: ${line}`]);
+    });
+
+    it.each([
+      ["new Date given an instant", "const t = new Date(at);"],
+      ["new Date given a literal", "const t = new Date(0);"],
+      ["Date in a type position", "function next(at: Date): Date {"],
+      ["Date as a generic argument", "const seen: Map<string, Date> = new Map();"],
+      ["a constructor whose name starts with Date", "const r = new DateRange();"],
+    ])("allows %s", (_form, line) => {
+      expect(clockReads(line)).toEqual([]);
+    });
+
+    it("reports the line number of an offender inside a module", () => {
+      const lines = ["export function at(instant: Date): Date {", "  return instant;", "}", "", "const started = new Date;"];
+      expect(clockReads(lines.join("\n"))).toEqual(["5: const started = new Date;"]);
+    });
   });
 
   it("names no database, in tests included", () => {
