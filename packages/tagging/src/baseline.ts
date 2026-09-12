@@ -1,4 +1,5 @@
 import type { Policy } from "./policy.js";
+import { timescaleStep } from "./timescales.js";
 
 /**
  * A baseline's state, as this package's arithmetic produces it and as
@@ -199,8 +200,15 @@ export function winsorize(x: number, location: number | null, rule: ClipRule): n
  * most multiple × scale / n. The interface's docstring says what was
  * considered instead and what this choice costs.
  *
- * The fast and slow pairs are carried unchanged here and moved by
- * timescales.ts, which Task 6 wires in.
+ * The fast and slow pairs are exponentially weighted under the policy's two
+ * alphas, seeded by the first observation, and see the same clipped value.
+ * The clip is what keeps each of their steps bounded, and it is also what
+ * the divergence they feed cannot see past: an observation at the band's
+ * edge and one a million times beyond it move the pairs identically, so
+ * the divergence carries how often a stream leaves the band and not by how
+ * far. The raw value would carry the magnitude, and would also let one
+ * observation move the fast pair without bound, which is the influence the
+ * clip exists to refuse.
  *
  * The state is checked on the way in and on the way out. Finite in does
  * not guarantee finite out: a scale large enough to overflow the band's
@@ -226,7 +234,16 @@ export function updateBaseline(state: BaselineState, x: number, scale: number, p
     madEst = state.madEst + (Math.abs(clipped - state.medianEst) - state.madEst) / count;
   }
 
-  const next: BaselineState = { ...state, count, mean, m2, medianEst, madEst };
+  const first = state.count === 0;
+  const fast = timescaleStep({ mean: state.fastMean, m2: state.fastM2 }, clipped, policy.fastAlpha, first);
+  const slow = timescaleStep({ mean: state.slowMean, m2: state.slowM2 }, clipped, policy.slowAlpha, first);
+
+  const next: BaselineState = {
+    ...state,
+    count, mean, m2, medianEst, madEst,
+    fastMean: fast.mean, fastM2: fast.m2,
+    slowMean: slow.mean, slowM2: slow.m2,
+  };
   assertBaseline(next);
   return next;
 }
