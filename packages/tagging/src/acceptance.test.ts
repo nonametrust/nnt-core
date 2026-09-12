@@ -201,7 +201,12 @@ function summaryOf(made: Made[]): string[] {
   return made.map((m) => `${m.day}:${m.channel}:${m.decision.kind}`).sort();
 }
 
-/** The store's check constraints on the baseline table, restated in value. */
+/**
+ * The store's check constraints on the baseline table, restated in value,
+ * plus one the table does not hold: the migration lets median_est and
+ * mad_est be null independently, and their pairing is assertBaseline's.
+ * Stricter than the SQL, on purpose, so a row that passes here passes both.
+ */
 function satisfiesStoreChecks(s: BaselineState): boolean {
   const finite = (x: number): boolean => Number.isFinite(x);
   return (
