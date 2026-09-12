@@ -225,7 +225,7 @@ describe("no tag is produced below the minimum observation count, beyond the bri
   // A zero minimum would make every history warm and the shrinkage divide
   // zero by zero. It is refused up front, for a null state too, under the
   // wording assertPolicy gives it.
-  it("refuses a policy whose minimum is not a positive integer, before any state is read", () => {
+  it("refuses a policy whose minimum is not a positive integer, for a null state and a warm one alike", () => {
     for (const minObservations of [0, -1, 2.5, Number.NaN]) {
       const broken = { ...policy, minObservations };
       const message = refusalOf(() => assertPolicy(broken));
