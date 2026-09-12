@@ -96,6 +96,18 @@ describe("surpriseOf", () => {
     refuses(() => surpriseOf(Number.MAX_VALUE, withSpread(-Number.MAX_VALUE, 1), 1), /^deviation of /);
   });
 
+  // The floor and state refusals belong to robustScale, and surpriseOf must
+  // reach them through it: an inlined maximum of spread and floor would
+  // return zero for every observation under an infinite floor, and a number
+  // rather than a refusal against a corrupt state, with the terminal
+  // quotient check still green. Each refusal is matched on its own cause, so
+  // the test cannot pass on a later check firing for a different reason.
+  it("refuses what robustScale refuses, naming the same cause", () => {
+    refuses(() => surpriseOf(101, withSpread(100, 0), Number.POSITIVE_INFINITY), /^scale floor must be positive and finite/);
+    refuses(() => surpriseOf(101, withSpread(100, -1), 0.05), /^baseline madEst must be non-negative/);
+    refuses(() => surpriseOf(101, { ...withSpread(100, 2), medianEst: 90 }, 0.05), /has location 90 apart from mean 100/);
+  });
+
   // The other overflow: the deviation fits a double and the quotient does
   // not. The floor here is not one the policy declares; it is the smallest
   // positive one the arithmetic admits, chosen to reach the division.
