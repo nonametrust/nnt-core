@@ -1,5 +1,5 @@
 import type { Policy } from "./policy.js";
-import { timescaleStep } from "./timescales.js";
+import { assertTimescales, timescaleStep } from "./timescales.js";
 
 /**
  * A baseline's state, as this package's arithmetic produces it and as
@@ -139,10 +139,10 @@ export function assertBaseline(state: BaselineState): void {
   requireNonNegative("baseline m2", state.m2);
   if (state.medianEst !== null) requireFinite("baseline medianEst", state.medianEst);
   if (state.madEst !== null) requireNonNegative("baseline madEst", state.madEst);
-  requireFinite("baseline fastMean", state.fastMean);
-  requireNonNegative("baseline fastM2", state.fastM2);
-  requireFinite("baseline slowMean", state.slowMean);
-  requireNonNegative("baseline slowM2", state.slowM2);
+  // The two pairs are judged by the predicate timescales.ts owns, so that
+  // the divergence, which reads only those four fields, refuses exactly what
+  // this does on them under the same message.
+  assertTimescales(state);
 }
 
 export interface ClipRule {

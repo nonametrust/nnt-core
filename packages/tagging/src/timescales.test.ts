@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { emptyBaseline, updateBaseline, type BaselineState } from "./baseline.js";
+import { assertBaseline, emptyBaseline, updateBaseline, type BaselineState } from "./baseline.js";
 import { POLICY_V0 } from "./policy.js";
 import { timescaleDivergence, timescaleStep } from "./timescales.js";
 
@@ -10,6 +10,17 @@ const floor = 0.05;
 
 function fed(state: BaselineState, values: number[]): BaselineState {
   return values.reduce((s, v) => updateBaseline(s, v, scale, policy), state);
+}
+
+/** The exact message a refusing call throws, so another call can be held to it. */
+function refusalOf(call: () => unknown): string {
+  try {
+    call();
+  } catch (e) {
+    if (e instanceof RangeError) return e.message;
+    throw e;
+  }
+  throw new Error("expected a RangeError and got none");
 }
 
 const steady = fed(emptyBaseline(ns, "volume", "amount/USDC/in"), Array(20).fill(100));
@@ -197,13 +208,40 @@ describe("timescaleDivergence", () => {
     expect(() => timescaleDivergence(steady, bad)).toThrow(/scale floor must be positive and finite/);
   });
 
-  // A negative variance would give a NaN square root and be refused at the
-  // end under the divergence's own message; the state is checked first, so
-  // the refusal names the cause the baseline's own checks name.
-  it("refuses what assertBaseline refuses, naming the same cause", () => {
-    expect(() => timescaleDivergence({ ...steady, fastM2: -1 }, floor)).toThrow(/baseline fastM2 must be non-negative/);
-    expect(() => timescaleDivergence({ ...steady, slowM2: Number.NaN }, floor)).toThrow(/baseline slowM2 must be finite/);
-    expect(() => timescaleDivergence({ ...steady, medianEst: 200 }, floor)).toThrow(/apart from mean/);
+  // The divergence and assertBaseline judge the four timescale fields
+  // through one predicate. Two checks in two places is how they would
+  // drift, so this holds them in agreement case by case: for every state
+  // assertBaseline refuses on one of those fields, the divergence refuses
+  // it too, under the very message assertBaseline gives. A negative
+  // variance unchecked would surface as the NaN of its square root, refused
+  // at the end under the divergence's own message and the wrong cause.
+  it.each([
+    ["a NaN fast mean", { fastMean: Number.NaN }],
+    ["an infinite fast mean", { fastMean: Number.NEGATIVE_INFINITY }],
+    ["a NaN fast variance", { fastM2: Number.NaN }],
+    ["an infinite fast variance", { fastM2: Number.POSITIVE_INFINITY }],
+    ["a negative fast variance", { fastM2: -1 }],
+    ["a NaN slow mean", { slowMean: Number.NaN }],
+    ["an infinite slow mean", { slowMean: Number.POSITIVE_INFINITY }],
+    ["a NaN slow variance", { slowM2: Number.NaN }],
+    ["an infinite slow variance", { slowM2: Number.NEGATIVE_INFINITY }],
+    ["a negative slow variance", { slowM2: -0.5 }],
+  ])("refuses %s under the message assertBaseline gives it", (_what, patch) => {
+    const bad = { ...steady, ...patch };
+    const message = refusalOf(() => assertBaseline(bad));
+    expect(message).toMatch(/^baseline (fast|slow)(Mean|M2) must be/);
+    expect(() => timescaleDivergence(bad, floor)).toThrow(message);
+  });
+
+  // The other direction of the same agreement: the divergence reads the two
+  // pairs and nothing else, so it does not re-judge the fields it does not
+  // read. A location apart from the mean is refused by assertBaseline and
+  // by every update, and is computed over here; copying that rule in would
+  // be the duplication the shared predicate exists to bound.
+  it("does not judge the fields it does not read", () => {
+    const apart = { ...steady, medianEst: 200 };
+    expect(() => assertBaseline(apart)).toThrow(/apart from mean/);
+    expect(timescaleDivergence(apart, floor)).toBe(0);
   });
 
   // Both sides finite and positive, and the quotient still not: the smallest

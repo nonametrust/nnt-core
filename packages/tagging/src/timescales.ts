@@ -1,17 +1,35 @@
-import { assertBaseline, type BaselineState } from "./baseline.js";
+import type { BaselineState } from "./baseline.js";
 
-// baseline.ts calls timescaleStep and this module calls assertBaseline, so
-// the two form a module cycle. It is safe because both sides bind function
-// declarations and neither calls across the cycle while it is being
-// evaluated, whichever module is entered first. Do not add a top-level
-// constant here that calls into baseline.ts, because whichever module is
-// evaluated first would see an uninitialised binding. The alternative,
-// checking the two variances here by hand, would restate the baseline's own
-// refusals and drift from them.
+// This module takes only a type from baseline.ts, which is erased, while
+// baseline.ts takes timescaleStep and assertTimescales from here as values.
+// That is one direction, and it must stay one direction: a value taken from
+// baseline.ts here would make a module cycle, which works until a top-level
+// constant or a reordered export makes it fail at load time with an
+// undefined binding, and no test would see it because tests load in one order.
 
 export interface Timescale {
   mean: number;
   m2: number;
+}
+
+/** The four timescale fields of a baseline, as the two pairs. */
+export type TimescalePairs = Pick<BaselineState, "fastMean" | "fastM2" | "slowMean" | "slowM2">;
+
+/**
+ * The validity of the two pairs: each mean finite, each variance finite and
+ * non-negative. This is the one place those four checks are written.
+ * assertBaseline calls it for the whole state and timescaleDivergence for
+ * the fields it reads, so a refusal reads identically wherever it comes
+ * from, and timescales.test.ts holds the two callers in agreement case by
+ * case rather than leaving it to a sentence.
+ */
+export function assertTimescales(pairs: TimescalePairs): void {
+  if (!Number.isFinite(pairs.fastMean)) throw new RangeError(`baseline fastMean must be finite, got ${pairs.fastMean}`);
+  if (!Number.isFinite(pairs.fastM2)) throw new RangeError(`baseline fastM2 must be finite, got ${pairs.fastM2}`);
+  if (pairs.fastM2 < 0) throw new RangeError(`baseline fastM2 must be non-negative, got ${pairs.fastM2}`);
+  if (!Number.isFinite(pairs.slowMean)) throw new RangeError(`baseline slowMean must be finite, got ${pairs.slowMean}`);
+  if (!Number.isFinite(pairs.slowM2)) throw new RangeError(`baseline slowM2 must be finite, got ${pairs.slowM2}`);
+  if (pairs.slowM2 < 0) throw new RangeError(`baseline slowM2 must be non-negative, got ${pairs.slowM2}`);
 }
 
 /**
@@ -47,9 +65,11 @@ export function timescaleStep(prev: Timescale, x: number, alpha: number, first: 
  * positive when the recent past is noisier than the reference, negative
  * when it is calmer.
  *
- * The state is checked on the way in, by the baseline's own refusals, so a
- * negative variance is named as such rather than surfacing as the NaN its
- * square root would become. The floor is checked next, and the result last:
+ * Only the two pairs are checked on the way in, by the same predicate the
+ * baseline's own check uses, so a negative variance is named as such rather
+ * than surfacing as the NaN its square root would become. The rest of the
+ * state, the count, the Welford pair and the robust pair, is not read here
+ * and is not judged here. The floor is checked next, and the result last:
  * the smallest positive floor over the largest spread is a quotient that
  * underflows to zero, whose log is an infinity, and that is refused rather
  * than returned.
@@ -60,7 +80,7 @@ export function timescaleStep(prev: Timescale, x: number, alpha: number, first: 
  * no decision depends on it.
  */
 export function timescaleDivergence(state: BaselineState, floor: number): number {
-  assertBaseline(state);
+  assertTimescales(state);
   if (!(floor > 0) || !Number.isFinite(floor)) {
     throw new RangeError(`scale floor must be positive and finite, got ${floor}`);
   }
