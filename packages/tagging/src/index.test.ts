@@ -15,7 +15,6 @@ import type {
   MeasuredChannel,
   Policy,
   Reading,
-  ReadingInput,
   ReadingResult,
   SurpriseVerdict,
   TagDecision,
@@ -55,7 +54,7 @@ const RUNTIME_SURFACE = [
   // threshold.ts
   "noiseOf", "shrinkNoise", "tagThreshold", "judgeSurprise",
   // tag.ts
-  "refreshTag", "tagReading", "tagObservation",
+  "refreshTag", "tagObservation",
 ] as const;
 
 interface TypeSurface {
@@ -65,7 +64,7 @@ interface TypeSurface {
   baseline: [BaselineState, ClipRule];
   timescales: [Timescale, TimescalePairs];
   threshold: [SurpriseVerdict];
-  tag: [LiveTagInput, TagRefresh, TagDecision, ReadingInput, ReadingResult, AspectContext, TaggingInput, TaggingResult];
+  tag: [LiveTagInput, TagRefresh, TagDecision, ReadingResult, AspectContext, TaggingInput, TaggingResult];
 }
 
 describe("the public surface", () => {

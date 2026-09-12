@@ -53,10 +53,10 @@ function requireInstant(name: string, value: Date): void {
 // The two policy fields refreshTag reads are checked where they are read,
 // under the wording assertPolicy gives them, so a refusal reads the same
 // whether the pipeline's entry or the arithmetic notices. refreshTag is
-// public and reachable without passing through tagReading's entry check; a
-// NaN increment would leave as a NaN strength, and a ceiling of zero would
+// public and reachable without passing through the entry's check; a NaN
+// increment would leave as a NaN strength, and a ceiling of zero would
 // saturate every tag at nothing. The categorical base is read only below
-// tagReading's own assertPolicy and carries no second check: one was
+// the entry's own assertPolicy and carries no second check: one was
 // written, and the sweep showed it unreachable.
 function requireRefreshFields(policy: Policy): { increment: number; ceiling: number } {
   const increment = policy.refreshIncrement;
@@ -160,7 +160,14 @@ export type TagDecision =
   | ({ kind: "new"; channel: Channel; aspect: string; g0: number; taggedAt: Date; surprise: number | null } & Provenance)
   | ({ kind: "refresh"; channel: Channel; aspect: string; g0: number; taggedAt: Date; refreshCount: number; saturationState: "open" | "saturated"; surprise: number | null } & Provenance);
 
-export interface ReadingInput {
+// Not exported, and not by oversight. The reading is the aspect, and spec
+// section 3 says the aspect is derived from the observation and never
+// supplied by a caller. A public function taking this shape would let a
+// caller pair any observation with any reading, and nothing below checks
+// that the two belong together: a price observation handed a hand-built
+// volume reading came back as a volume tag stamped with the price event's
+// instant. The only way in is tagObservation, which derives the reading.
+interface ReadingInput {
   namespaceId: string;
   observation: Observation;
   reading: Reading;
@@ -237,7 +244,9 @@ function decide(input: ReadingInput, g0: number, surprise: number | null, weight
  * One reading, judged and folded in. This is the pure function the spec
  * describes: in, the reading, the baseline for its pair, the live tag with
  * its strength now, the policy and the calibration; out, the next baseline
- * and either no decision or a decision.
+ * and either no decision or a decision. Private, because the reading is an
+ * argument here and the one caller that may build one is tagObservation
+ * below; see ReadingInput.
  *
  * On a continuous channel the order is fixed and tag.test.ts holds it:
  * judge against the baseline as it stands, then clip and update. The
@@ -264,10 +273,7 @@ function decide(input: ReadingInput, g0: number, surprise: number | null, weight
  * Nothing below reads it into the decision; tag.test.ts holds that two
  * baselines differing only in their fast and slow pairs decide alike.
  */
-export function tagReading(input: ReadingInput): ReadingResult {
-  assertPolicy(input.policy);
-  assertCalibration(input.calibration);
-  requireInstant("at", input.at);
+function tagReading(input: ReadingInput): ReadingResult {
   const { reading, policy, calibration } = input;
   const { weight, source } = channelWeightWithSource(reading.channel, calibration, policy);
 
@@ -332,7 +338,13 @@ const UNSEEN: AspectContext = { baseline: null, liveTag: null };
  * An observation, read into its readings and each one tagged against its
  * own context. The caller supplies the contexts by aspect; it learns which
  * aspects to fetch from readObservation, which is the same derivation this
- * function runs, so the two cannot disagree about the key.
+ * function runs, so the two cannot disagree about the key. A context keyed
+ * under an aspect the observation does not read into is never looked at:
+ * the readings come from the observation, and the contexts only answer for
+ * them. That is what keeps the aspect out of a caller's hands.
+ *
+ * The policy, the calibration and the instant are refused here, once,
+ * before anything is read; every reading below runs under that check.
  */
 export function tagObservation(input: TaggingInput): TaggingResult {
   assertPolicy(input.policy);

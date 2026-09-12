@@ -1,18 +1,17 @@
 import { describe, it, expect } from "vitest";
 import type { Observation } from "@nonametrust/schema";
 import { emptyBaseline, updateBaseline, type BaselineState } from "./baseline.js";
-import { CALIBRATION_V0 } from "./calibration.js";
+import { CALIBRATION_V0, type Calibration } from "./calibration.js";
 import { calibrateG0, uncertaintyOf } from "./g0.js";
-import { POLICY_V0, scaleFloorFor } from "./policy.js";
-import type { ContinuousChannel } from "./reading.js";
+import { POLICY_V0, scaleFloorFor, type Policy } from "./policy.js";
+import { readObservation, type ContinuousChannel } from "./reading.js";
 import { robustScale, surpriseOf } from "./scale.js";
 import { timescaleDivergence } from "./timescales.js";
 import {
   refreshTag,
   tagObservation,
-  tagReading,
   type LiveTagInput,
-  type ReadingInput,
+  type ReadingResult,
   type TagDecision,
 } from "./tag.js";
 
@@ -72,23 +71,38 @@ function live(over: Partial<LiveTagInput> = {}): LiveTagInput {
   };
 }
 
-function input(over: Partial<ReadingInput> & Pick<ReadingInput, "observation" | "reading">): ReadingInput {
-  return {
-    namespaceId: ns, at: new Date("2026-09-21T09:00:00.000Z"),
-    baseline: null, liveTag: null, policy, calibration,
-    ...over,
-  };
+/** One observation with one reading, tagged through the entry point. */
+interface One {
+  observation: Observation;
+  at?: Date;
+  baseline?: BaselineState | null;
+  liveTag?: LiveTagInput | null;
+  policy?: Policy;
+  calibration?: Calibration;
+}
+
+// Every reading here is tagged through tagObservation, the one public path,
+// which derives the reading from the observation itself. No test hands in a
+// reading: a hand-built one would be the caller-supplied aspect the spec
+// says no caller supplies, and the package no longer exposes a function
+// that takes one. The context is keyed under the aspect the observation
+// reads into, which is what an engine fetching by aspect will do.
+function tagOne(over: One): ReadingResult {
+  const [reading] = readObservation(over.observation);
+  const result = tagObservation({
+    namespaceId: ns, observation: over.observation, at: over.at ?? new Date("2026-09-21T09:00:00.000Z"),
+    contexts: new Map([[reading!.aspect, { baseline: over.baseline ?? null, liveTag: over.liveTag ?? null }]]),
+    policy: over.policy ?? policy, calibration: over.calibration ?? calibration,
+  });
+  return result.readings[0]!;
 }
 
 const bigPayment = event("volume", "payment", { amount: "500.0000000", assetCode: "USDC", direction: "in" }, "2026-09-21T08:00:00.000Z");
 const smallPayment = event("volume", "payment", { amount: "0.2600000", assetCode: "USDC", direction: "in" }, "2026-09-21T08:00:00.000Z");
 const tinyPayment = event("volume", "payment", { amount: "0.0100000", assetCode: "USDC", direction: "in" }, "2026-09-21T08:00:00.000Z");
-const volumeReading = { kind: "continuous", channel: "volume", aspect: "amount/USDC/in" } as const;
 const addressChange = event("address_integrity", "payment_address_changed", { previous: "GOLDADDRESS", current: "GNEWADDRESS" }, "2026-09-12T08:14:00.000Z");
 const addressRevert = event("address_integrity", "payment_address_changed", { previous: "GNEWADDRESS", current: "GOLDADDRESS" }, "2026-09-12T16:47:00.000Z");
-const addressReading = { kind: "categorical", channel: "address_integrity", aspect: "transition" } as const;
 const trustline = state("protocol", "trustline_open", { event: "trustline_created", assetCode: "USDC", issuerKnown: true }, "2026-08-20T11:02:31.000Z");
-const trustlineReading = { kind: "categorical", channel: "protocol", aspect: "event/trustline_created" } as const;
 
 describe("refreshTag", () => {
   const at = new Date("2026-09-21T08:00:00.000Z");
@@ -187,11 +201,11 @@ describe("refreshTag", () => {
   });
 });
 
-describe("tagReading on a continuous channel", () => {
+describe("tagging one reading on a continuous channel", () => {
   const warm = warmedVolume(Array(20).fill(0.25));
 
   it("opens a new tag on a crossing surprise, stamped at the event's instant and not the call's", () => {
-    const r = tagReading(input({ observation: bigPayment, reading: { ...volumeReading, value: 500 }, baseline: warm }));
+    const r = tagOne({ observation: bigPayment, baseline: warm });
     expect(r.decision?.kind).toBe("new");
     if (r.decision?.kind !== "new") return;
     expect(r.decision.taggedAt.toISOString()).toBe("2026-09-21T08:00:00.000Z");
@@ -204,14 +218,14 @@ describe("tagReading on a continuous channel", () => {
 
   it("returns no decision below the minimum count and still updates the baseline", () => {
     const cold = warmedVolume(Array(5).fill(0.25));
-    const r = tagReading(input({ observation: bigPayment, reading: { ...volumeReading, value: 500 }, baseline: cold }));
+    const r = tagOne({ observation: bigPayment, baseline: cold });
     expect(r.decision).toBeNull();
     expect(r.verdict).toEqual({ kind: "cold", count: 5, minObservations: policy.minObservations });
     expect(r.baseline?.count).toBe(6);
   });
 
   it("returns no decision on a surprise below the threshold, and leaves a live tag alone", () => {
-    const r = tagReading(input({ observation: smallPayment, reading: { ...volumeReading, value: 0.26 }, baseline: warm, liveTag: live() }));
+    const r = tagOne({ observation: smallPayment, baseline: warm, liveTag: live() });
     expect(r.decision).toBeNull();
     expect(r.verdict?.kind).toBe("measured");
     if (r.verdict?.kind === "measured") expect(r.verdict.crosses).toBe(false);
@@ -220,7 +234,7 @@ describe("tagReading on a continuous channel", () => {
 
   // The observation is judged against the history it has not yet joined.
   it("judges against the baseline before the update, not after", () => {
-    const r = tagReading(input({ observation: smallPayment, reading: { ...volumeReading, value: 0.26 }, baseline: warm }));
+    const r = tagOne({ observation: smallPayment, baseline: warm });
     if (r.verdict?.kind !== "measured" || r.baseline === null) throw new Error("expected a measured verdict and a next state");
     expect(r.verdict.surprise).toBeCloseTo(surpriseOf(0.26, warm, volumeFloor), 12);
     expect(r.verdict.surprise).not.toBeCloseTo(surpriseOf(0.26, r.baseline, volumeFloor), 12);
@@ -229,10 +243,10 @@ describe("tagReading on a continuous channel", () => {
   it("refreshes a live tag rather than opening a second, with the instant moved forward", () => {
     const tag = live({ g0: 0.5, taggedAt: new Date("2026-09-20T08:00:00.000Z") });
     const at = new Date("2026-09-21T09:00:00.000Z");
-    const r = tagReading(input({
-      observation: bigPayment, reading: { ...volumeReading, value: 500 }, baseline: warm, at,
+    const r = tagOne({
+      observation: bigPayment, baseline: warm, at,
       liveTag: { ...tag, decayedStrength: decayedAt(tag, at) },
-    }));
+    });
     expect(r.decision?.kind).toBe("refresh");
     if (r.decision?.kind !== "refresh") return;
     expect(r.decision.refreshCount).toBe(1);
@@ -243,7 +257,7 @@ describe("tagReading on a continuous channel", () => {
   });
 
   it("carries the signed surprise, so a deviation below the location leaves as a negative number", () => {
-    const r = tagReading(input({ observation: tinyPayment, reading: { ...volumeReading, value: 0.01 }, baseline: warm }));
+    const r = tagOne({ observation: tinyPayment, baseline: warm });
     expect(r.decision?.kind).toBe("new");
     expect(r.decision?.surprise).toBeLessThan(0);
     if (r.verdict?.kind === "measured") expect(r.verdict.surprise).toBeCloseTo((0.01 - 0.25) / volumeFloor, 9);
@@ -253,46 +267,43 @@ describe("tagReading on a continuous channel", () => {
   // only in their fast and slow pairs give the same decision and different
   // divergences.
   it("does not read the timescale divergence into the decision", () => {
-    const calm = tagReading(input({ observation: bigPayment, reading: { ...volumeReading, value: 500 }, baseline: warm }));
-    const inflated = tagReading(input({
-      observation: bigPayment, reading: { ...volumeReading, value: 500 },
-      baseline: { ...warm, fastM2: 1e6, slowM2: 0 },
-    }));
+    const calm = tagOne({ observation: bigPayment, baseline: warm });
+    const inflated = tagOne({
+      observation: bigPayment, baseline: { ...warm, fastM2: 1e6, slowM2: 0 },
+    });
     expect(inflated.decision).toEqual(calm.decision);
     expect(inflated.timescaleDivergence).not.toBe(calm.timescaleDivergence);
     expect(inflated.timescaleDivergence).toBeGreaterThan(0);
   });
 
   it("names the policy and calibration versions on the decision", () => {
-    const r = tagReading(input({ observation: bigPayment, reading: { ...volumeReading, value: 500 }, baseline: warm }));
+    const r = tagOne({ observation: bigPayment, baseline: warm });
     expect(r.decision).toMatchObject({ policyVersion: "policy-v0", calibrationVersion: "calibration-v0" });
   });
 
   it("refuses a baseline keyed to another aspect or another namespace", () => {
-    expect(() => tagReading(input({
-      observation: bigPayment, reading: { ...volumeReading, value: 500 },
-      baseline: { ...warm, aspect: "amount/XLM/in" },
-    }))).toThrow(RangeError);
-    expect(() => tagReading(input({
-      observation: bigPayment, reading: { ...volumeReading, value: 500 },
-      baseline: { ...warm, namespaceId: "22222222-2222-4222-8222-222222222222" },
-    }))).toThrow(RangeError);
+    expect(() => tagOne({
+      observation: bigPayment, baseline: { ...warm, aspect: "amount/XLM/in" },
+    })).toThrow(RangeError);
+    expect(() => tagOne({
+      observation: bigPayment, baseline: { ...warm, namespaceId: "22222222-2222-4222-8222-222222222222" },
+    })).toThrow(RangeError);
   });
 
   it("refuses an invalid instant and a policy the arithmetic cannot use", () => {
-    expect(() => tagReading(input({
-      observation: bigPayment, reading: { ...volumeReading, value: 500 }, baseline: warm, at: new Date("no"),
-    }))).toThrow(RangeError);
-    expect(() => tagReading(input({
-      observation: bigPayment, reading: { ...volumeReading, value: 500 }, baseline: warm,
+    expect(() => tagOne({
+      observation: bigPayment, baseline: warm, at: new Date("no"),
+    })).toThrow(RangeError);
+    expect(() => tagOne({
+      observation: bigPayment, baseline: warm,
       policy: { ...policy, minObservations: 0 },
-    }))).toThrow(RangeError);
+    })).toThrow(RangeError);
   });
 });
 
-describe("tagReading on a categorical channel", () => {
+describe("tagging one reading on a categorical channel", () => {
   it("tags from day one, against no baseline, at the channel weight times the categorical base", () => {
-    const r = tagReading(input({ observation: addressChange, reading: addressReading }));
+    const r = tagOne({ observation: addressChange});
     expect(r.baseline).toBeNull();
     expect(r.verdict).toBeNull();
     expect(r.timescaleDivergence).toBeNull();
@@ -302,7 +313,7 @@ describe("tagReading on a categorical channel", () => {
   });
 
   it("stamps an event's tag at the event's instant", () => {
-    const r = tagReading(input({ observation: addressChange, reading: addressReading, at: new Date("2026-09-12T20:00:00.000Z") }));
+    const r = tagOne({ observation: addressChange, at: new Date("2026-09-12T20:00:00.000Z") });
     expect(r.decision?.taggedAt.toISOString()).toBe("2026-09-12T08:14:00.000Z");
   });
 
@@ -310,7 +321,7 @@ describe("tagReading on a categorical channel", () => {
   // stamped at the call's instant, which is the only date in hand.
   it("stamps a state's tag at the call's instant", () => {
     const at = new Date("2026-09-01T08:00:05.000Z");
-    const r = tagReading(input({ observation: trustline, reading: trustlineReading, at }));
+    const r = tagOne({ observation: trustline, at });
     expect(r.decision?.kind).toBe("new");
     expect(r.decision?.taggedAt.toISOString()).toBe("2026-09-01T08:00:05.000Z");
   });
@@ -323,14 +334,14 @@ describe("tagReading on a categorical channel", () => {
 describe("a repeated deviation refreshes rather than stacks", () => {
   it("turns the revert into a refresh of the change", () => {
     const decisions: TagDecision[] = [];
-    const first = tagReading(input({ observation: addressChange, reading: addressReading, at: new Date("2026-09-12T08:14:00.000Z") }));
+    const first = tagOne({ observation: addressChange, at: new Date("2026-09-12T08:14:00.000Z") });
     decisions.push(first.decision!);
     const opened = { g0: first.decision!.g0, taggedAt: first.decision!.taggedAt };
     const at = new Date("2026-09-12T16:47:00.000Z");
-    const second = tagReading(input({
-      observation: addressRevert, reading: addressReading, at,
+    const second = tagOne({
+      observation: addressRevert, at,
       liveTag: { ...opened, refreshCount: 0, saturationState: "open", decayedStrength: decayedAt(opened, at) },
-    }));
+    });
     decisions.push(second.decision!);
 
     expect(decisions.map((d) => d.kind)).toEqual(["new", "refresh"]);
@@ -355,7 +366,7 @@ describe("a state observation never yields two tags inside one window", () => {
     let lastInstant = 0;
     for (let day = 1; day <= 7; day++) {
       const at = new Date(Date.UTC(2026, 8, day, 8, 0, 5));
-      const r = tagReading(input({ observation: trustline, reading: trustlineReading, at, liveTag: tag }));
+      const r = tagOne({ observation: trustline, at, liveTag: tag });
       const d = r.decision!;
       kinds.push(d.kind);
       expect(d.taggedAt.getTime()).toBeGreaterThan(lastInstant);
@@ -486,7 +497,7 @@ describe("refreshTag's refusals name their cause", () => {
     expect(refreshTag(live({ g0: 0.5, decayedStrength: 0.5 }), 0.4, at, policy).g0).toBeCloseTo(0.55, 12);
   });
 
-  // refreshTag is public and does not pass through tagReading's assertPolicy,
+  // refreshTag is public and does not pass through the entry's assertPolicy,
   // so the two fields it reads are checked where they are read, under
   // assertPolicy's own wording.
   it("refuses an increment or a ceiling assertPolicy refuses, under the same message", () => {
@@ -534,36 +545,36 @@ describe("refreshTag reads the increment and the ceiling from their own fields",
   });
 });
 
-describe("tagReading's entry", () => {
+describe("the entry", () => {
   const warm = warmedVolume(Array(20).fill(0.25));
 
   // The version is what every result names; nothing downstream of the entry
   // reads it, so the entry check is the only one and its message is pinned.
   it("refuses a policy or a calibration that names nothing", () => {
-    expect(() => tagReading(input({ observation: addressChange, reading: addressReading, policy: { ...policy, version: "" } })))
+    expect(() => tagOne({ observation: addressChange, policy: { ...policy, version: "" } }))
       .toThrow(/^policy\.version must not be empty$/);
-    expect(() => tagReading(input({ observation: addressChange, reading: addressReading, calibration: { ...calibration, version: "" } })))
+    expect(() => tagOne({ observation: addressChange, calibration: { ...calibration, version: "" } }))
       .toThrow(/^calibration\.version must not be empty$/);
   });
 
   it("names the versions it was given, not the shipped ones", () => {
-    const r = tagReading(input({
-      observation: bigPayment, reading: { ...volumeReading, value: 500 }, baseline: warm,
+    const r = tagOne({
+      observation: bigPayment, baseline: warm,
       policy: { ...policy, version: "policy-v0-shadow" },
       calibration: { ...calibration, version: "calibration-v0-shadow" },
-    }));
+    });
     expect(r.decision).toMatchObject({ policyVersion: "policy-v0-shadow", calibrationVersion: "calibration-v0-shadow" });
   });
 
   it("refuses an event whose instant does not parse, rather than stamping a tag at an invalid date", () => {
     const undated = event("address_integrity", "payment_address_changed", { previous: "GOLDADDRESS", current: "GNEWADDRESS" }, "not an instant");
-    expect(() => tagReading(input({ observation: undated, reading: addressReading })))
+    expect(() => tagOne({ observation: undated}))
       .toThrow(/^event instant must be a valid date$/);
   });
 
   it("hands a state's tag a copy of the call's instant, so the caller's date is not shared with the answer", () => {
     const at = new Date("2026-09-01T08:00:05.000Z");
-    const r = tagReading(input({ observation: trustline, reading: trustlineReading, at }));
+    const r = tagOne({ observation: trustline, at });
     r.decision!.taggedAt.setFullYear(2000);
     expect(at.toISOString()).toBe("2026-09-01T08:00:05.000Z");
   });
@@ -577,20 +588,18 @@ describe("tagReading's entry", () => {
 // predicate, this holds that the decision carries what it returns.
 describe("the weight's source is named on the decision", () => {
   const latencyEvent = event("latency", "response", { latencyMs: 100000 }, "2026-09-21T08:00:00.000Z");
-  const latencyReading = { kind: "continuous", channel: "latency", aspect: "latencyMs", value: 100000 } as const;
   const memo = event("content", "memo_seen", { text: "pay here", field: "memo" }, "2026-09-21T08:00:00.000Z");
-  const memoReading = { kind: "categorical", channel: "content", aspect: "field/memo" } as const;
 
   it("says calibration for a measured channel, continuous or categorical", () => {
-    const volume = tagReading(input({ observation: bigPayment, reading: { ...volumeReading, value: 500 }, baseline: warmedVolume(Array(20).fill(0.25)) }));
-    const content = tagReading(input({ observation: memo, reading: memoReading }));
+    const volume = tagOne({ observation: bigPayment, baseline: warmedVolume(Array(20).fill(0.25)) });
+    const content = tagOne({ observation: memo});
     expect(volume.decision).toMatchObject({ weightSource: "calibration", calibrationVersion: "calibration-v0" });
     expect(content.decision).toMatchObject({ weightSource: "calibration", calibrationVersion: "calibration-v0" });
   });
 
   it("says policy for latency, while still naming the calibration version beside it", () => {
     const latencyWarm = warmed("latency", "latencyMs", Array(20).fill(100));
-    const r = tagReading(input({ observation: latencyEvent, reading: latencyReading, baseline: latencyWarm }));
+    const r = tagOne({ observation: latencyEvent, baseline: latencyWarm });
     expect(r.decision?.kind).toBe("new");
     expect(r.decision).toMatchObject({ weightSource: "policy", calibrationVersion: "calibration-v0" });
     // The number is the policy's weight, and the source says so.
@@ -602,7 +611,7 @@ describe("the weight's source is named on the decision", () => {
 
   it("carries the source through a refresh as well", () => {
     const latencyWarm = warmed("latency", "latencyMs", Array(20).fill(100));
-    const r = tagReading(input({ observation: latencyEvent, reading: latencyReading, baseline: latencyWarm, liveTag: live() }));
+    const r = tagOne({ observation: latencyEvent, baseline: latencyWarm, liveTag: live() });
     expect(r.decision).toMatchObject({ kind: "refresh", weightSource: "policy" });
   });
 });
@@ -616,42 +625,40 @@ describe("the baseline handed in is the reading's own", () => {
   // prior with nothing downstream able to notice. This is the verdict's one
   // caller, and this is where the two are pinned equal.
   it("refuses a baseline keyed to another channel, naming both keys", () => {
-    expect(() => tagReading(input({
-      observation: bigPayment, reading: { ...volumeReading, value: 500 },
-      baseline: { ...warm, channel: "price" },
-    }))).toThrow(/^baseline .*\/price\/amount\/USDC\/in is not the baseline for .*\/volume\/amount\/USDC\/in$/);
+    expect(() => tagOne({
+      observation: bigPayment, baseline: { ...warm, channel: "price" },
+    })).toThrow(/^baseline .*\/price\/amount\/USDC\/in is not the baseline for .*\/volume\/amount\/USDC\/in$/);
   });
 
   it("refuses a corrupt baseline under its own message even when its key is also wrong", () => {
-    expect(() => tagReading(input({
-      observation: bigPayment, reading: { ...volumeReading, value: 500 },
-      baseline: { ...warm, aspect: "amount/XLM/in", count: -1 },
-    }))).toThrow(/^baseline count must be a non-negative integer/);
+    expect(() => tagOne({
+      observation: bigPayment, baseline: { ...warm, aspect: "amount/XLM/in", count: -1 },
+    })).toThrow(/^baseline count must be a non-negative integer/);
   });
 
   it("refuses a baseline offered for a categorical reading, which has none", () => {
-    expect(() => tagReading(input({ observation: addressChange, reading: addressReading, baseline: warm })))
+    expect(() => tagOne({ observation: addressChange, baseline: warm }))
       .toThrow(/^categorical reading address_integrity\/transition has no baseline/);
   });
 
   it("starts a first baseline on the reading's own key", () => {
-    const r = tagReading(input({ observation: bigPayment, reading: { ...volumeReading, value: 500 } }));
+    const r = tagOne({ observation: bigPayment});
     expect(r.baseline).toMatchObject({ namespaceId: ns, channel: "volume", aspect: "amount/USDC/in", count: 1 });
   });
 
   it("reads the categorical base from the policy and not a literal", () => {
     // 0.65 is shared by no shipped field; the nearest is protocol's weight at 0.6496.
-    const r = tagReading(input({ observation: addressChange, reading: addressReading, policy: { ...policy, categoricalBase: 0.65 } }));
+    const r = tagOne({ observation: addressChange, policy: { ...policy, categoricalBase: 0.65 } });
     expect(r.decision?.g0).toBeCloseTo(0.7984 * 0.65, 12);
   });
 });
 
-describe("what tagReading carries out", () => {
+describe("what a reading result carries out", () => {
   const warm = warmedVolume(Array(20).fill(0.25));
 
   it("reports the divergence of the next state, not of the one handed in", () => {
     const inflated = { ...warm, fastM2: 1e6, slowM2: 0 };
-    const r = tagReading(input({ observation: bigPayment, reading: { ...volumeReading, value: 500 }, baseline: inflated }));
+    const r = tagOne({ observation: bigPayment, baseline: inflated });
     expect(r.timescaleDivergence).toBe(timescaleDivergence(r.baseline!, volumeFloor));
     expect(r.timescaleDivergence).not.toBe(timescaleDivergence(inflated, volumeFloor));
   });
@@ -666,9 +673,9 @@ describe("what tagReading carries out", () => {
       ...policy,
       scaleFloor: { ...policy.scaleFloor, byAspect: { ...policy.scaleFloor.byAspect, "volume/amount/USDC/in": 5e-324 } },
     };
-    expect(() => tagReading(input({
-      observation: bigPayment, reading: { ...volumeReading, value: 1e308 }, baseline: warm, policy: tinyFloor,
-    }))).toThrow(/does not fit a double$/);
+    expect(() => tagOne({
+      observation: bigPayment, baseline: warm, policy: tinyFloor,
+    })).toThrow(/does not fit a double$/);
   });
 });
 
@@ -676,8 +683,8 @@ describe("tagObservation's entry and routing", () => {
   const at = new Date("2026-09-07T03:45:00.000Z");
   const farDust = event("cluster_proximity", "dust_received", { clusterId: "cluster:dust-fleet-0031", hops: 9, amount: "0.0000100" }, "2026-09-07T03:41:12.000Z");
 
-  // tagReading repeats these three checks, so on a readable observation the
-  // entry's own are invisible. They are not redundant: the observation is
+  // The per-reading step repeats these three checks, so on a readable
+  // observation the entry's own are invisible. They are not redundant: the observation is
   // read before any reading is tagged, and an unreadable payload would
   // otherwise be the first thing refused. The entry refuses the policy, the
   // calibration and the instant before it reads anything, and this holds
@@ -712,5 +719,29 @@ describe("tagObservation's entry and routing", () => {
     const byAspect = new Map(r.readings.map((x) => [x.reading.aspect, x]));
     expect(byAspect.get("hops")?.decision).toMatchObject({ kind: "refresh", refreshCount: 1, aspect: "hops" });
     expect(byAspect.get("amount")?.decision).toBeNull();
+  });
+
+  // Spec section 3: the aspect is derived from the observation and never
+  // supplied by a caller, so an indexer cannot split or merge a history by
+  // choosing a string. The only way in is this function, and it reads the
+  // observation; a context the caller keys under some other aspect is not
+  // a reading and produces nothing. Before this was pinned, a public
+  // per-reading function took the reading as an argument, and a price
+  // observation handed a hand-built volume reading came back as a volume
+  // tag stamped with the price event's instant.
+  it("derives the readings from the observation, and a context for an aspect it does not read into produces nothing", () => {
+    const quote = event("price", "quote", { quoted: "0.25", unit: "USDC" }, "2026-09-21T08:00:00.412Z");
+    const volumeWarm = warmedVolume(Array(20).fill(0.25));
+    const r = tagObservation({
+      namespaceId: ns, observation: quote, at,
+      contexts: new Map([["amount/USDC/in", { baseline: volumeWarm, liveTag: live() }]]),
+      policy, calibration,
+    });
+    expect(r.readings.map((x) => x.reading)).toEqual(readObservation(quote));
+    expect(r.readings).toHaveLength(1);
+    expect(r.readings[0]!.reading).toEqual({ kind: "continuous", channel: "price", aspect: "quoted/USDC", value: 0.25 });
+    expect(r.readings[0]!.verdict).toEqual({ kind: "cold", count: 0, minObservations: policy.minObservations });
+    expect(r.readings[0]!.decision).toBeNull();
+    expect(r.readings.some((x) => x.reading.channel === "volume")).toBe(false);
   });
 });
