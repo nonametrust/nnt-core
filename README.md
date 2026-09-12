@@ -19,7 +19,7 @@ Private until the `v0` tag, then public. Apache-2.0.
 | `packages/store` | The Postgres home of every observation, tag, trigger and audit entry the engine produces, with each invariant held by the database rather than by a caller's good manners. Depends on `schema`. See [The store](#the-store). |
 | `docs/observation-contract.md` | The contract for the indexer developer, in Turkish: what an observation is, what each field means, which rules the schema enforces and which it does not yet. Start there if you are writing a producer. |
 | `docs/superpowers/specs/`, `docs/superpowers/plans/` | The v0 design and the milestone plan the code follows. |
-| `gates/` | Repository-wide gates that are not about one package. Today: no tracked file may contain a Stellar-shaped account id, and only `datedAt` reads a date off an observation. |
+| `gates/` | Repository-wide gates that are not about one package. Today: no tracked file may contain a Stellar-shaped account id, only `datedAt` reads a date off an observation, and the tagging and store baseline shapes agree field for field. |
 
 The remaining engine packages named in the design (`tagging`, `engine`,
 `nonametrust`) arrive in later milestones and will depend on `schema`; `schema`
@@ -99,6 +99,12 @@ true. The ones worth knowing before you add a file:
   path relative to `packages/` rather than by basename, so a new package
   enters under it on the day it is created, with no exemption. Refuses to
   report green if it finds no package to scan.
+- **The two `BaselineState` declarations agree field for field**
+  (`gates/baseline-shape.test.ts`). `packages/tagging` produces the shape
+  and `packages/store` stores it, and the arithmetic may not import the
+  store, so the shape is declared twice and this gate reads both
+  declarations as text and compares names and written types. Refuses to
+  report green unless it finds the Welford fields in each.
 - **The schema version is checked exactly** on every observation
   (`packages/schema/src/payloads.test.ts`), and the golden fixtures must all
   validate (`packages/schema/src/fixtures.test.ts`).
