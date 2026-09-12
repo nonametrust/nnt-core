@@ -1,0 +1,250 @@
+import { requirePositive, type Policy } from "./policy.js";
+import { assertTimescales, timescaleStep } from "./timescales.js";
+
+/**
+ * A baseline's state, as this package's arithmetic produces it and as
+ * packages/store stores it. The two declarations are held equal field for
+ * field, name and written type, by the root gate gates/baseline-shape.test.ts;
+ * a field added here and not there, or there and not here, fails that gate
+ * on the day it is added. The type does not live in schema, because schema
+ * is the indexer's contract and the engine's internal state has no business
+ * in it, and it does not live in store, because this package may not depend
+ * on store.
+ *
+ * Welford state as count, mean, m2. The robust pair as medianEst, madEst,
+ * null together before the first observation and present together from it.
+ * The two timescales as the fast and slow pairs, which timescales.ts moves.
+ *
+ * What the robust pair is, honestly. The columns are named median_est and
+ * mad_est, and neither holds the sample median or the median absolute
+ * deviation: a constant-space update cannot produce either, because both
+ * need the history the store deliberately does not keep. What is held is a
+ * winsorized location and a winsorized dispersion, the running mean of
+ * values clipped at a multiple of the current scale and the running mean of
+ * the clipped absolute deviations from it. That is an online M-estimator,
+ * and it has the property the median and the MAD were chosen for, which is
+ * bounded influence: one observation moves either estimate by at most
+ * multiple × scale / n. Do not "fix" this into a true median: any estimator
+ * that needs history cannot be fed from this row.
+ *
+ * Said plainly, so the name does not mislead: medianEst is the Welford mean
+ * of the same clipped input that mean is fed, started from the same first
+ * value and moved by the same recursion, and the two are equal on every
+ * row this arithmetic produces; assertBaseline refuses a state where they
+ * differ, and baseline.test.ts holds the identity along a history. The
+ * resistance of this design lives entirely in the clip, and not in the
+ * location estimator differing from the mean, because it does not. What
+ * actually differs between the two pairs is m2 against madEst: a clipped
+ * sum of squared deviations against a clipped mean absolute deviation. The
+ * identity is load-bearing, not incidental: the band is computed around
+ * medianEst and the Welford delta is measured from mean, so the bound on
+ * mean holds through the identity and would not survive its separation.
+ *
+ * A streaming quantile sketch was the alternative and was rejected on its
+ * merits, not for convenience. It needs a step-size parameter, which would
+ * be one more uncalibrated number, and it converges worst on exactly the
+ * short histories this milestone spends most of its time in, around the
+ * minimum observation count.
+ *
+ * The cost is real and is recorded here rather than hidden. Against a
+ * heavily skewed distribution an M-estimator's location sits between the
+ * mean and the median, so it is less resistant than a true median would be.
+ * If calibration later looks wrong on a skewed channel, this is the first
+ * thing to re-examine.
+ */
+export interface BaselineState {
+  namespaceId: string;
+  channel: string;
+  aspect: string;
+  count: number;
+  mean: number;
+  m2: number;
+  medianEst: number | null;
+  madEst: number | null;
+  fastMean: number;
+  fastM2: number;
+  slowMean: number;
+  slowM2: number;
+}
+
+/**
+ * The state before any observation. m2 is zero because a sum of no squared
+ * deviations is zero, which settles the first question 0006 left open; the
+ * robust pair is null because there is no location to deviate from yet,
+ * which settles the second.
+ */
+export function emptyBaseline(namespaceId: string, channel: string, aspect: string): BaselineState {
+  return {
+    namespaceId, channel, aspect,
+    count: 0, mean: 0, m2: 0, medianEst: null, madEst: null,
+    fastMean: 0, fastM2: 0, slowMean: 0, slowM2: 0,
+  };
+}
+
+function requireFinite(name: string, value: number): void {
+  if (!Number.isFinite(value)) throw new RangeError(`${name} must be finite, got ${value}`);
+}
+
+// Two steps rather than the package's one-line predicate, on purpose: a
+// column that is NaN and a column that is negative are two different
+// corruptions of a stored row, and the message names which.
+function requireFiniteNonNegative(name: string, value: number): void {
+  requireFinite(name, value);
+  if (value < 0) throw new RangeError(`${name} must be non-negative, got ${value}`);
+}
+
+/**
+ * A state this arithmetic could have produced, and one it can safely take
+ * in. The shape it refuses first is a location without a spread or a spread
+ * without a location: a spread is a deviation from a location, and one
+ * without the other has no meaning. Beyond that it restates the baseline
+ * table's checks, every float finite and the sums of deviations
+ * non-negative, because a NaN in a running mean is permanent, every later
+ * update being NaN plus something, and this is the place that can refuse
+ * it before the arithmetic carries it forward.
+ */
+export function assertBaseline(state: BaselineState): void {
+  if ((state.medianEst === null) !== (state.madEst === null)) {
+    throw new RangeError(
+      `baseline ${state.channel}/${state.aspect} carries one robust estimate without the other`,
+    );
+  }
+  if (!Number.isSafeInteger(state.count) || state.count < 0) {
+    throw new RangeError(`baseline count must be a non-negative integer, got ${state.count}`);
+  }
+  if (state.count === 0 && state.medianEst !== null) {
+    throw new RangeError("a baseline with no observations cannot carry a location");
+  }
+  // The pair arrives at the first observation, so a row with observations
+  // behind it and no pair was not written by this arithmetic. Admitting it
+  // would update it unclipped, since there is no location to clip against,
+  // and one observation could move the mean without bound. The
+  // first-observation branch of updateBaseline serves a zero count and
+  // this refusal a positive one; the two cases are disjoint.
+  if (state.count > 0 && state.medianEst === null) {
+    throw new RangeError(
+      `baseline ${state.channel}/${state.aspect} has ${state.count} observations and no robust pair`,
+    );
+  }
+  // The location is the mean, by the same operations on the same operands,
+  // and the bound on the mean holds only through that: the band is centred
+  // on the location and the Welford delta is measured from the mean. A row
+  // where the two differ was not written by this arithmetic, and updating
+  // it would move the mean by the gap plus the bound. Strict equality is
+  // safe, because identical operations on identical operands give an
+  // identical double, and the store hands the double back unchanged.
+  if (state.medianEst !== null && state.medianEst !== state.mean) {
+    throw new RangeError(
+      `baseline ${state.channel}/${state.aspect} has location ${state.medianEst} apart from mean ${state.mean}`,
+    );
+  }
+  requireFinite("baseline mean", state.mean);
+  requireFiniteNonNegative("baseline m2", state.m2);
+  // The location's finiteness is the mean's, by the identity refused just
+  // above: a location that is not null equals the mean, and the mean was
+  // checked. A separate check here would look live and never fire.
+  if (state.madEst !== null) requireFiniteNonNegative("baseline madEst", state.madEst);
+  // The two pairs are judged by the predicate timescales.ts owns, so that
+  // the divergence, which reads only those four fields, refuses exactly what
+  // this does on them under the same message.
+  assertTimescales(state);
+}
+
+export interface ClipRule {
+  multiple: number;
+  scale: number;
+}
+
+/**
+ * The observation clipped to `location ± multiple × scale`. This is the
+ * bounded-influence protection: no single observation moves any estimator
+ * by more than multiple × scale / n, whatever its value.
+ *
+ * With no location there is no band, and the value passes through: the
+ * first observation is the location.
+ *
+ * The scale is an argument and not read off the state here, because the
+ * scale carries the floor that scale.ts owns, and the floor is what keeps
+ * a counterparty with a perfectly regular history from having a band of
+ * zero width, which would freeze its baseline at the first value forever.
+ */
+export function winsorize(x: number, location: number | null, rule: ClipRule): number {
+  requireFinite("observation", x);
+  requirePositive("scale", rule.scale);
+  requirePositive("multiple", rule.multiple);
+  if (location === null) return x;
+  requireFinite("location", location);
+  const half = rule.multiple * rule.scale;
+  // A half-width that overflowed is a band that clips nothing, and the bound
+  // this function exists to hold would be infinite. Refused, so the bound is
+  // finite whenever a value comes back.
+  requireFinite("band half-width", half);
+  return Math.min(Math.max(x, location - half), location + half);
+}
+
+/**
+ * The next state after one observation. Clip first, then update: an update
+ * that used the raw value and clipped afterwards would already have moved
+ * the mean, and the band would have been computed around a location the
+ * outlier had already pulled. baseline.test.ts pins the order by a case
+ * where the two orders give different numbers.
+ *
+ * Welford's recursion for mean and m2 in the standard streaming form: every
+ * observation counts the same forever, which is what these two are for and
+ * why the fast and slow pairs exist beside them.
+ *
+ * The robust pair: the location is the running mean of clipped values and
+ * the spread the running mean of clipped absolute deviations from the
+ * location before the update. Neither is the sample median or the median
+ * absolute deviation, which constant space cannot hold; both have the
+ * property those were chosen for, that one observation moves them by at
+ * most multiple × scale / n. The interface's docstring says what was
+ * considered instead and what this choice costs.
+ *
+ * The fast and slow pairs are exponentially weighted under the policy's two
+ * alphas, seeded by the first observation, and see the same clipped value.
+ * The clip is what keeps each of their steps bounded, and it is also what
+ * the divergence they feed cannot see past: an observation at the band's
+ * edge and one a million times beyond it move the pairs identically, so
+ * the divergence carries how often a stream leaves the band and not by how
+ * far. The raw value would carry the magnitude, and would also let one
+ * observation move the fast pair without bound, which is the influence the
+ * clip exists to refuse.
+ *
+ * The state is checked on the way in and on the way out. Finite in does
+ * not guarantee finite out: a scale large enough to overflow the band's
+ * half-width clips nothing, and the Welford delta can then overflow. A
+ * non-finite result is refused here rather than handed to the store.
+ */
+export function updateBaseline(state: BaselineState, x: number, scale: number, policy: Policy): BaselineState {
+  assertBaseline(state);
+  const clipped = winsorize(x, state.medianEst, { multiple: policy.winsorMadMultiple, scale });
+
+  const count = state.count + 1;
+  const delta = clipped - state.mean;
+  const mean = state.mean + delta / count;
+  const m2 = state.m2 + delta * (clipped - mean);
+
+  let medianEst: number;
+  let madEst: number;
+  if (state.medianEst === null || state.madEst === null) {
+    medianEst = clipped;
+    madEst = 0;
+  } else {
+    medianEst = state.medianEst + (clipped - state.medianEst) / count;
+    madEst = state.madEst + (Math.abs(clipped - state.medianEst) - state.madEst) / count;
+  }
+
+  const first = state.count === 0;
+  const fast = timescaleStep({ mean: state.fastMean, m2: state.fastM2 }, clipped, policy.fastAlpha, first);
+  const slow = timescaleStep({ mean: state.slowMean, m2: state.slowM2 }, clipped, policy.slowAlpha, first);
+
+  const next: BaselineState = {
+    ...state,
+    count, mean, m2, medianEst, madEst,
+    fastMean: fast.mean, fastM2: fast.m2,
+    slowMean: slow.mean, slowM2: slow.m2,
+  };
+  assertBaseline(next);
+  return next;
+}

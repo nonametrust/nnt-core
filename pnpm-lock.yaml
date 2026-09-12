@@ -47,6 +47,16 @@ importers:
         specifier: ^8.11.0
         version: 8.23.1
 
+  packages/tagging:
+    dependencies:
+      '@nonametrust/schema':
+        specifier: workspace:*
+        version: link:../schema
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+
 packages:
 
   '@esbuild/aix-ppc64@0.21.5':

@@ -3,3 +3,6 @@ dist/
 .superpowers/
 packages/store/.pgdata/
 packages/store/.pgdata.log
+
+# Isolated workspaces for milestone branches
+.worktrees/
