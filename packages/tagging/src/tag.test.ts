@@ -108,7 +108,7 @@ describe("refreshTag", () => {
   const at = new Date("2026-09-21T08:00:00.000Z");
 
   it("is the maximum of the decayed strength and the fresh g0, plus the increment", () => {
-    const r = refreshTag(live({ decayedStrength: 0.3 }), 0.4, at, policy);
+    const r = refreshTag(live({ decayedStrength: 0.3 }), 0.4, at, policy, "event");
     expect(r.g0).toBeCloseTo(0.45, 12);
     expect(r.saturationState).toBe("open");
   });
@@ -117,13 +117,13 @@ describe("refreshTag", () => {
   // sum here would be 0.7; the maximum plus the increment is 0.45, and the
   // bound holds on a grid, not on one case.
   it("never sums the two strengths", () => {
-    const r = refreshTag(live({ decayedStrength: 0.3 }), 0.4, at, policy);
+    const r = refreshTag(live({ decayedStrength: 0.3 }), 0.4, at, policy, "event");
     expect(r.g0).not.toBeCloseTo(0.7, 6);
     // g0 is raised to the grid's top so the decayed strength never exceeds
     // it, which refreshTag refuses; the open path does not read the g0.
     for (const decayed of [0, 0.1, 0.3, 0.5, 0.9]) {
       for (const fresh of [0, 0.1, 0.3, 0.5, 0.9]) {
-        const next = refreshTag(live({ g0: 0.9, decayedStrength: decayed }), fresh, at, policy);
+        const next = refreshTag(live({ g0: 0.9, decayedStrength: decayed }), fresh, at, policy, "event");
         expect(next.g0).toBeLessThanOrEqual(Math.max(decayed, fresh) + policy.refreshIncrement + 1e-12);
       }
     }
@@ -133,38 +133,38 @@ describe("refreshTag", () => {
   // that took the stored g0 would, together with the moved instant, revive
   // the tag to full at every repeat, which is a pump with a different name.
   it("reads the decayed strength and not the stored g0", () => {
-    const r = refreshTag(live({ g0: 0.9, decayedStrength: 0.3 }), 0.4, at, policy);
+    const r = refreshTag(live({ g0: 0.9, decayedStrength: 0.3 }), 0.4, at, policy, "event");
     expect(r.g0).toBeCloseTo(0.45, 12);
     expect(r.g0).toBeLessThan(0.9);
   });
 
   it("moves taggedAt forward to the instant, and never backward", () => {
-    const forward = refreshTag(live(), 0.4, at, policy);
+    const forward = refreshTag(live(), 0.4, at, policy, "event");
     expect(forward.taggedAt.toISOString()).toBe("2026-09-21T08:00:00.000Z");
     const earlier = new Date("2026-09-01T00:00:00.000Z");
-    const held = refreshTag(live(), 0.4, earlier, policy);
+    const held = refreshTag(live(), 0.4, earlier, policy, "event");
     expect(held.taggedAt.toISOString()).toBe("2026-09-20T08:00:00.000Z");
   });
 
   it("hands out a copy of the instant, so a caller cannot move a tag by mutating the answer", () => {
-    const r = refreshTag(live(), 0.4, at, policy);
+    const r = refreshTag(live(), 0.4, at, policy, "event");
     r.taggedAt.setFullYear(2000);
     expect(at.toISOString()).toBe("2026-09-21T08:00:00.000Z");
   });
 
   it("increments the refresh count", () => {
-    expect(refreshTag(live({ refreshCount: 4 }), 0.4, at, policy).refreshCount).toBe(5);
+    expect(refreshTag(live({ refreshCount: 4 }), 0.4, at, policy, "event").refreshCount).toBe(5);
   });
 
   it("saturates when the increment can no longer raise the strength in full", () => {
-    const r = refreshTag(live({ g0: 0.98, decayedStrength: 0.98 }), 0.5, at, policy);
+    const r = refreshTag(live({ g0: 0.98, decayedStrength: 0.98 }), 0.5, at, policy, "event");
     expect(r.g0).toBe(policy.g0Ceiling);
     expect(r.saturationState).toBe("saturated");
   });
 
   it("refreshes a saturated tag's instant and count but not its g0", () => {
     const saturated = live({ g0: 1, decayedStrength: 0.2, saturationState: "saturated", refreshCount: 9 });
-    const r = refreshTag(saturated, 0.9, at, policy);
+    const r = refreshTag(saturated, 0.9, at, policy, "event");
     expect(r.g0).toBe(1);
     expect(r.saturationState).toBe("saturated");
     expect(r.refreshCount).toBe(10);
@@ -177,7 +177,7 @@ describe("refreshTag", () => {
   it("bounds a hundred identical repeats by the ceiling, each raising by at most the increment", () => {
     let tag = live({ g0: 0.4, decayedStrength: 0.4 });
     for (let i = 0; i < 100; i++) {
-      const r = refreshTag(tag, 0.4, at, policy);
+      const r = refreshTag(tag, 0.4, at, policy, "event");
       expect(r.g0).toBeLessThanOrEqual(policy.g0Ceiling);
       expect(r.g0 - tag.g0).toBeLessThanOrEqual(policy.refreshIncrement + 1e-12);
       tag = { ...tag, g0: r.g0, decayedStrength: r.g0, saturationState: r.saturationState, refreshCount: r.refreshCount };
@@ -186,18 +186,78 @@ describe("refreshTag", () => {
     expect(tag.g0).toBe(policy.g0Ceiling);
   });
 
+  // A state that is still holding is not a repeat. Its refresh keeps the
+  // larger of the decayed strength and the fresh g0, moves the instant and
+  // the count, and adds no increment: the maximum is what stops a standing
+  // condition fading, and the increment is what a genuine repeat earns.
+  // The fixtures here are values no shipped field shares.
+  describe("a state that holds", () => {
+    it("keeps the fresh g0 when the decayed strength has fallen below it, with no increment", () => {
+      const r = refreshTag(live({ g0: 0.44, decayedStrength: 0.31 }), 0.37, at, policy, "state");
+      expect(r.g0).toBe(0.37);
+      expect(r.saturationState).toBe("open");
+    });
+
+    it("keeps the decayed strength when it is the larger, so an earlier repeat is not forgotten", () => {
+      const r = refreshTag(live({ g0: 0.44, decayedStrength: 0.41 }), 0.37, at, policy, "state");
+      expect(r.g0).toBe(0.41);
+    });
+
+    it("moves the instant forward and counts the refresh, like an event", () => {
+      const r = refreshTag(live({ refreshCount: 3 }), 0.37, at, policy, "state");
+      expect(r.taggedAt.toISOString()).toBe("2026-09-21T08:00:00.000Z");
+      expect(r.refreshCount).toBe(4);
+    });
+
+    it("does not climb over a hundred mornings, where an event would have saturated", () => {
+      let tag = live({ g0: 0.37, decayedStrength: 0.37 });
+      for (let i = 0; i < 100; i++) {
+        const r = refreshTag(tag, 0.37, at, policy, "state");
+        expect(r.g0).toBe(0.37);
+        expect(r.saturationState).toBe("open");
+        tag = { ...tag, g0: r.g0, decayedStrength: r.g0, saturationState: r.saturationState, refreshCount: r.refreshCount };
+      }
+      expect(tag.refreshCount).toBe(100);
+      const asEvent = refreshTag(live({ g0: 0.37, decayedStrength: 0.37 }), 0.37, at, policy, "event");
+      expect(asEvent.g0).toBeCloseTo(0.42, 12);
+    });
+
+    it("does not read the increment at all, so an overridden increment changes nothing", () => {
+      const shipped = refreshTag(live({ g0: 0.44, decayedStrength: 0.31 }), 0.37, at, policy, "state");
+      const other = refreshTag(live({ g0: 0.44, decayedStrength: 0.31 }), 0.37, at, { ...policy, refreshIncrement: 0.07 }, "state");
+      expect(other).toEqual(shipped);
+    });
+
+    // Section 10's sentence about a saturated tag is kept for both kinds:
+    // it refreshes its instant and its count and not its g0. A state cannot
+    // saturate on its own, since it adds nothing; a tag saturated by
+    // genuine repeats is held at the ceiling by the condition persisting.
+    it("holds a saturated tag at its g0, as an event does", () => {
+      const saturated = live({ g0: 1, decayedStrength: 0.2, saturationState: "saturated", refreshCount: 9 });
+      const r = refreshTag(saturated, 0.37, at, policy, "state");
+      expect(r).toEqual(refreshTag(saturated, 0.37, at, policy, "event"));
+      expect(r.g0).toBe(1);
+      expect(r.refreshCount).toBe(10);
+    });
+
+    it("refuses an evidence kind it does not know, rather than treating it as a repeat", () => {
+      expect(() => refreshTag(live(), 0.37, at, policy, "State" as never))
+        .toThrow(/^evidence must be "event" or "state", got State$/);
+    });
+  });
+
   it("does not read the clock into the strength, so two instants give one g0", () => {
-    const a = refreshTag(live(), 0.4, new Date("2026-09-21T08:00:00.000Z"), policy);
-    const b = refreshTag(live(), 0.4, new Date("2027-09-21T08:00:00.000Z"), policy);
+    const a = refreshTag(live(), 0.4, new Date("2026-09-21T08:00:00.000Z"), policy, "event");
+    const b = refreshTag(live(), 0.4, new Date("2027-09-21T08:00:00.000Z"), policy, "event");
     expect(a.g0).toBe(b.g0);
   });
 
   it("refuses a strength that is not a finite non-negative number, and an invalid instant", () => {
-    expect(() => refreshTag(live({ decayedStrength: Number.NaN }), 0.4, at, policy)).toThrow(RangeError);
-    expect(() => refreshTag(live({ decayedStrength: -0.1 }), 0.4, at, policy)).toThrow(RangeError);
-    expect(() => refreshTag(live(), Number.POSITIVE_INFINITY, at, policy)).toThrow(RangeError);
-    expect(() => refreshTag(live(), 0.4, new Date("not a date"), policy)).toThrow(RangeError);
-    expect(() => refreshTag(live({ taggedAt: new Date(Number.NaN) }), 0.4, at, policy)).toThrow(RangeError);
+    expect(() => refreshTag(live({ decayedStrength: Number.NaN }), 0.4, at, policy, "event")).toThrow(RangeError);
+    expect(() => refreshTag(live({ decayedStrength: -0.1 }), 0.4, at, policy, "event")).toThrow(RangeError);
+    expect(() => refreshTag(live(), Number.POSITIVE_INFINITY, at, policy, "event")).toThrow(RangeError);
+    expect(() => refreshTag(live(), 0.4, new Date("not a date"), policy, "event")).toThrow(RangeError);
+    expect(() => refreshTag(live({ taggedAt: new Date(Number.NaN) }), 0.4, at, policy, "event")).toThrow(RangeError);
   });
 });
 
@@ -357,8 +417,9 @@ describe("a repeated deviation refreshes rather than stacks", () => {
 
 // Acceptance criterion 4. A standing condition re-evaluated every morning
 // for a week yields one tag, refreshed six times, its instant carried
-// forward each day. The study credited a standing condition to every
-// window including the seven-day one; this is the arithmetic that does not.
+// forward each day and its strength held rather than grown. The study
+// credited a standing condition to every window including the seven-day
+// one; this is the arithmetic that does not.
 describe("a state observation never yields two tags inside one window", () => {
   it("opens once and refreshes on every later morning", () => {
     const kinds: string[] = [];
@@ -381,6 +442,25 @@ describe("a state observation never yields two tags inside one window", () => {
     }
     expect(kinds).toEqual(["new", "refresh", "refresh", "refresh", "refresh", "refresh", "refresh"]);
     expect(tag?.refreshCount).toBe(6);
+  });
+
+  // The condition holding is one fact: the strength neither fades nor
+  // climbs. Every morning's g0 is the day-one g0 exactly, while the decayed
+  // operand handed in each morning sits strictly below it.
+  it("holds the strength flat across the week, neither fading nor climbing", () => {
+    let tag: LiveTagInput | null = null;
+    const strengths: number[] = [];
+    for (let day = 1; day <= 7; day++) {
+      const at = new Date(Date.UTC(2026, 8, day, 8, 0, 5));
+      if (tag !== null) expect(tag.decayedStrength).toBeLessThan(tag.g0);
+      const d: TagDecision = tagOne({ observation: trustline, at, liveTag: tag }).decision!;
+      strengths.push(d.g0);
+      const held: Omit<LiveTagInput, "decayedStrength"> = {
+        g0: d.g0, taggedAt: d.taggedAt, refreshCount: d.kind === "refresh" ? d.refreshCount : 0, saturationState: "open",
+      };
+      tag = { ...held, decayedStrength: decayedAt(held, new Date(at.getTime() + DAY)) };
+    }
+    expect(strengths).toEqual(Array(7).fill(0.6496 * policy.categoricalBase));
   });
 });
 
@@ -449,27 +529,27 @@ describe("refreshTag's refusals name their cause", () => {
   const at = new Date("2026-09-21T08:00:00.000Z");
 
   it("refuses a live g0 that is not a finite non-negative number, open or saturated", () => {
-    expect(() => refreshTag(live({ g0: Number.NaN }), 0.4, at, policy))
+    expect(() => refreshTag(live({ g0: Number.NaN }), 0.4, at, policy, "event"))
       .toThrow(/^live tag g0 must be a finite non-negative number/);
     // A saturated tag hands its own g0 back, so a bad one would leave as the answer.
-    expect(() => refreshTag(live({ g0: -1, saturationState: "saturated" }), 0.4, at, policy))
+    expect(() => refreshTag(live({ g0: -1, saturationState: "saturated" }), 0.4, at, policy, "event"))
       .toThrow(/^live tag g0 must be a finite non-negative number/);
   });
 
   it("names the decayed strength, the fresh g0 and each instant", () => {
-    expect(() => refreshTag(live({ decayedStrength: Number.NaN }), 0.4, at, policy))
+    expect(() => refreshTag(live({ decayedStrength: Number.NaN }), 0.4, at, policy, "event"))
       .toThrow(/^decayed strength must be a finite non-negative number/);
-    expect(() => refreshTag(live(), Number.POSITIVE_INFINITY, at, policy))
+    expect(() => refreshTag(live(), Number.POSITIVE_INFINITY, at, policy, "event"))
       .toThrow(/^fresh g0 must be a finite non-negative number/);
-    expect(() => refreshTag(live({ taggedAt: new Date(Number.NaN) }), 0.4, at, policy))
+    expect(() => refreshTag(live({ taggedAt: new Date(Number.NaN) }), 0.4, at, policy, "event"))
       .toThrow(/^live tag instant must be a valid date$/);
-    expect(() => refreshTag(live(), 0.4, new Date("not a date"), policy))
+    expect(() => refreshTag(live(), 0.4, new Date("not a date"), policy, "event"))
       .toThrow(/^instant must be a valid date$/);
   });
 
   it("refuses a refresh count that is not a non-negative integer", () => {
     for (const refreshCount of [1.5, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(() => refreshTag(live({ refreshCount }), 0.4, at, policy))
+      expect(() => refreshTag(live({ refreshCount }), 0.4, at, policy, "event"))
         .toThrow(/^refresh count must be a non-negative integer/);
     }
   });
@@ -480,21 +560,21 @@ describe("refreshTag's refusals name their cause", () => {
   // produce it. At the ceiling is fine; the brief's saturated test holds it.
   it("refuses a saturated tag whose g0 lies above the ceiling, naming both", () => {
     const legacy = live({ g0: 7, decayedStrength: 0.2, saturationState: "saturated" });
-    expect(() => refreshTag(legacy, 0.9, at, policy))
+    expect(() => refreshTag(legacy, 0.9, at, policy, "event"))
       .toThrow(/^saturated tag g0 7 lies above policy\.g0Ceiling 1;/);
     const lowered = live({ g0: 1, decayedStrength: 0.2, saturationState: "saturated" });
-    expect(() => refreshTag(lowered, 0.9, at, { ...policy, g0Ceiling: 0.9 }))
+    expect(() => refreshTag(lowered, 0.9, at, { ...policy, g0Ceiling: 0.9 }, "event"))
       .toThrow(/^saturated tag g0 1 lies above policy\.g0Ceiling 0\.9;/);
-    expect(refreshTag(lowered, 0.9, at, policy).g0).toBe(1);
+    expect(refreshTag(lowered, 0.9, at, policy, "event").g0).toBe(1);
   });
 
   // No honest curve returns more than the g0 it started from.
   it("refuses a decayed strength above the live g0, open or saturated", () => {
-    expect(() => refreshTag(live({ g0: 0.5, decayedStrength: 0.6 }), 0.4, at, policy))
+    expect(() => refreshTag(live({ g0: 0.5, decayedStrength: 0.6 }), 0.4, at, policy, "event"))
       .toThrow(/^decayed strength 0\.6 exceeds the live tag g0 0\.5/);
-    expect(() => refreshTag(live({ g0: 0.5, decayedStrength: 0.6, saturationState: "saturated" }), 0.4, at, policy))
+    expect(() => refreshTag(live({ g0: 0.5, decayedStrength: 0.6, saturationState: "saturated" }), 0.4, at, policy, "event"))
       .toThrow(/^decayed strength 0\.6 exceeds the live tag g0 0\.5/);
-    expect(refreshTag(live({ g0: 0.5, decayedStrength: 0.5 }), 0.4, at, policy).g0).toBeCloseTo(0.55, 12);
+    expect(refreshTag(live({ g0: 0.5, decayedStrength: 0.5 }), 0.4, at, policy, "event").g0).toBeCloseTo(0.55, 12);
   });
 
   // refreshTag is public and does not pass through the entry's assertPolicy,
@@ -502,11 +582,11 @@ describe("refreshTag's refusals name their cause", () => {
   // assertPolicy's own wording.
   it("refuses an increment or a ceiling assertPolicy refuses, under the same message", () => {
     for (const refreshIncrement of [Number.NaN, -0.1, Number.POSITIVE_INFINITY]) {
-      expect(() => refreshTag(live(), 0.4, at, { ...policy, refreshIncrement }))
+      expect(() => refreshTag(live(), 0.4, at, { ...policy, refreshIncrement }, "event"))
         .toThrow(/^policy\.refreshIncrement must be a non-negative finite number/);
     }
     for (const g0Ceiling of [0, 1.5, Number.NaN]) {
-      expect(() => refreshTag(live(), 0.4, at, { ...policy, g0Ceiling }))
+      expect(() => refreshTag(live(), 0.4, at, { ...policy, g0Ceiling }, "event"))
         .toThrow(/^policy\.g0Ceiling must lie in \(0, 1\]/);
     }
   });
@@ -522,14 +602,14 @@ describe("refreshTag reads the increment and the ceiling from their own fields",
   it("adds the policy's increment and not a literal or a floor", () => {
     const shadow = { ...policy, refreshIncrement: 0.07 };
     expect(shadow.scaleFloor.byAspect["volume/amount/USDC/in"]).not.toBe(0.07);
-    const r = refreshTag(live({ decayedStrength: 0.3 }), 0.4, at, shadow);
+    const r = refreshTag(live({ decayedStrength: 0.3 }), 0.4, at, shadow, "event");
     expect(r.g0).toBeCloseTo(0.47, 12);
   });
 
   it("saturates at the policy's ceiling and not at one", () => {
     const shadow = { ...policy, g0Ceiling: 0.9 };
     expect(shadow.noiseCoefficient).not.toBe(0.9);
-    const r = refreshTag(live({ g0: 0.88, decayedStrength: 0.88 }), 0.5, at, shadow);
+    const r = refreshTag(live({ g0: 0.88, decayedStrength: 0.88 }), 0.5, at, shadow, "event");
     expect(r.g0).toBe(0.9);
     expect(r.saturationState).toBe("saturated");
   });
@@ -539,7 +619,7 @@ describe("refreshTag reads the increment and the ceiling from their own fields",
   // the sum is exact and the test is about the comparison, not rounding.
   it("is saturated when the raised strength lands exactly on the ceiling", () => {
     const shadow = { ...policy, refreshIncrement: 0.25, g0Ceiling: 0.75 };
-    const r = refreshTag(live({ decayedStrength: 0.5 }), 0, at, shadow);
+    const r = refreshTag(live({ decayedStrength: 0.5 }), 0, at, shadow, "event");
     expect(r.g0).toBe(0.75);
     expect(r.saturationState).toBe("saturated");
   });

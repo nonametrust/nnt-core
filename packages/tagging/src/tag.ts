@@ -1,4 +1,4 @@
-import { datedAt, type Channel, type Observation } from "@nonametrust/schema";
+import { datedAt, type Channel, type EvidenceKind, type Observation } from "@nonametrust/schema";
 import { assertBaseline, emptyBaseline, updateBaseline, type BaselineState } from "./baseline.js";
 import { assertCalibration, channelWeightWithSource, type Calibration, type WeightSource } from "./calibration.js";
 import { calibrateG0, uncertaintyOf } from "./g0.js";
@@ -106,8 +106,27 @@ function requireRefreshFields(policy: Policy): { increment: number; ceiling: num
  * The decayed strength is held at or below the live g0. No curve the caller
  * could honestly run produces more, so a larger one is a mismatched pair or
  * a bad computation, and it is refused rather than folded in.
+ *
+ * Whether the increment is added depends on what refreshed the tag, and
+ * this is a ruling rather than a reading of section 10. A state that is
+ * still holding tomorrow is one fact, not one fact per morning: the
+ * increment exists so that a genuinely repeated deviation accumulates, and
+ * a trustline that is simply still open is not a new deviation. Composed
+ * with section 4, where a state refreshes every time it is seen, an
+ * increment on persistence would let every standing condition climb from
+ * its channel weight to the ceiling in a few weeks and sit there in front
+ * of every future decision, which is a brief nobody reads. So a state
+ * refresh takes the maximum of the decayed strength and the fresh g0, moves
+ * the instant and the count, and adds nothing. The maximum is what stops it
+ * fading, which is the defect M1's own refresh had while a condition still
+ * held; the fresh g0 is what the condition is worth today, and the decayed
+ * strength is what an earlier repeat earned, and the tag keeps the larger.
+ * An event refresh is a repeat and keeps the increment.
  */
-export function refreshTag(live: LiveTagInput, freshG0: number, instant: Date, policy: Policy): TagRefresh {
+export function refreshTag(live: LiveTagInput, freshG0: number, instant: Date, policy: Policy, evidence: EvidenceKind): TagRefresh {
+  if (evidence !== "event" && evidence !== "state") {
+    throw new RangeError(`evidence must be "event" or "state", got ${String(evidence)}`);
+  }
   requireStrength("live tag g0", live.g0);
   requireStrength("decayed strength", live.decayedStrength);
   requireStrength("fresh g0", freshG0);
@@ -132,7 +151,8 @@ export function refreshTag(live: LiveTagInput, freshG0: number, instant: Date, p
     }
     return { g0: live.g0, taggedAt, refreshCount, saturationState: "saturated" };
   }
-  const raised = Math.max(live.decayedStrength, freshG0) + increment;
+  const held = Math.max(live.decayedStrength, freshG0);
+  const raised = evidence === "event" ? held + increment : held;
   const g0 = Math.min(raised, ceiling);
   return {
     g0,
@@ -210,7 +230,8 @@ function instantOf(o: Observation, at: Date): Date {
 /**
  * The decision for one g0: a new tag when the pair has none, a refresh of
  * the live one otherwise. Either way the instant is the observation's own,
- * as instantOf gives it.
+ * as instantOf gives it, and the refresh is told whether an event or a
+ * state produced it, which is what decides whether the increment applies.
  *
  * A consequence worth stating. For an event that instant is the event's,
  * and the call's instant may be later: minutes on a synchronous path, days
@@ -236,7 +257,7 @@ function decide(input: ReadingInput, g0: number, surprise: number | null, weight
   if (input.liveTag === null) {
     return { kind: "new", channel: reading.channel, aspect: reading.aspect, g0, taggedAt: instant, surprise, ...provenance };
   }
-  const refreshed = refreshTag(input.liveTag, g0, instant, input.policy);
+  const refreshed = refreshTag(input.liveTag, g0, instant, input.policy, input.observation.evidenceKind);
   return { kind: "refresh", channel: reading.channel, aspect: reading.aspect, ...refreshed, surprise, ...provenance };
 }
 

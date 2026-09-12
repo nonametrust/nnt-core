@@ -270,6 +270,8 @@ describe("criterion 2: a repeated deviation refreshes rather than stacks", () =>
     const decayed = decayedAt({ ...opened, refreshCount: 0, saturationState: "open" }, refreshed.taggedAt, calibration.halfLifeMs);
     // Eight hours of decay leave the opened strength below the fresh g0, so
     // the maximum is the fresh g0 here; tag.test.ts holds the other operand.
+    // The revert is an event, a second deviation, so it earns the increment;
+    // criterion 4 below holds that a state persisting does not.
     expect(decayed).toBeLessThan(opened.g0);
     expect(refreshed.g0).toBeCloseTo(Math.max(decayed, opened.g0) + policy.refreshIncrement, 12);
     expect(refreshed.g0).toBeLessThan(decayed + opened.g0);
@@ -332,28 +334,33 @@ describe("criterion 4: a state observation never yields two tags inside one wind
     expect(inWeek.filter((m) => m.decision.kind === "new")).toHaveLength(0);
   });
 
-  it("grows the held strength by at most the increment each morning and stays under the ceiling", () => {
-    // Each morning's refresh is the maximum of the decayed strength and the
-    // fresh categorical g0, plus the increment. On the second morning a day's
-    // decay has taken the opened strength below the fresh g0, so the fresh
-    // operand wins and the rise is the increment exactly; from the third
-    // morning the decayed operand wins and the rise is the increment less a
-    // day's decay, strictly positive and strictly less. Under the shipped
-    // increment the walk does not reach the ceiling inside twenty-two days.
-    // A walk that rose by the full increment every morning would be a
-    // refresh that had forgotten to decay; one that reached the ceiling here
-    // would have stacked.
-    let previous = trustline[0]!.decision.g0;
+  it("holds the strength flat: the condition persisting is one fact, and neither fades nor climbs", () => {
+    // A state refresh is the maximum of the decayed strength and the fresh
+    // categorical g0, with no increment: persistence is not a repeat. Each
+    // morning a day's decay has taken the held strength below the fresh
+    // g0, so the maximum picks the fresh operand and every morning's g0 is
+    // day one's exactly, weight times categorical base. The decayed
+    // operand is asserted strictly below it each morning, so the maximum
+    // is shown to be doing the holding rather than the test being green on
+    // a constant. A walk that rose would have taken persistence for a
+    // repeat; one that fell would have let a standing condition fade while
+    // it held, which is the defect recorded against M1's refresh.
+    const opened = trustline[0]!.decision.g0;
+    expect(opened).toBeCloseTo(calibration.channelWeights.protocol.weight * policy.categoricalBase, 12);
+    let held: HeldTag = { g0: opened, taggedAt: trustline[0]!.decision.taggedAt, refreshCount: 0, saturationState: "open" };
     for (const m of trustline.slice(1)) {
       const d = m.decision;
       if (d.kind !== "refresh") throw new Error("expected refresh");
+      const morning = steps.find((s) => s.day === m.day && s.observation.channel === "protocol")!.at;
+      const decayed = decayedAt(held, morning, calibration.halfLifeMs);
+      expect(decayed, `day ${m.day}`).toBeLessThan(opened);
+      expect(decayed, `day ${m.day}`).toBeGreaterThan(0.49);
+      expect(d.g0, `day ${m.day}`).toBe(opened);
       expect(d.saturationState, `day ${m.day}`).toBe("open");
-      expect(d.g0, `day ${m.day}`).toBeGreaterThan(previous);
-      if (m.day === 2) expect(d.g0 - previous).toBeCloseTo(policy.refreshIncrement, 12);
-      else expect(d.g0 - previous, `day ${m.day}`).toBeLessThan(policy.refreshIncrement);
-      expect(d.g0, `day ${m.day}`).toBeLessThan(policy.g0Ceiling);
-      previous = d.g0;
+      expect(d.refreshCount, `day ${m.day}`).toBe(m.day - 1);
+      held = { g0: d.g0, taggedAt: d.taggedAt, refreshCount: d.refreshCount, saturationState: d.saturationState };
     }
+    expect(new Set(trustline.map((m) => m.decision.g0)).size).toBe(1);
   });
 });
 
@@ -508,27 +515,24 @@ describe("under another policy and calibration version", () => {
     expect(refreshed.g0).toBeCloseTo(opened.g0 + 0.07, 12);
   });
 
-  it("saturates the trustline tag at the ceiling and holds it there, which the shipped increment never reaches", () => {
-    // Section 10: a saturated tag refreshes its instant and its count but not
-    // its g0, so once the walk reaches the ceiling every later morning is
-    // the ceiling exactly. Asserted structurally, with the first saturated
-    // morning required to exist so the loop after it is not green for
-    // nothing.
+  it("does not read the increment into the trustline walk, which is the same morning for morning under 0.07 as under 0.05", () => {
+    // The state path adds no increment, so the override that moves the
+    // address refresh by 0.07 leaves the trustline walk untouched: twenty-
+    // two mornings equal to the shipped run's in g0, instant, count and
+    // saturation state. Asserted as a whole-decision equality rather than
+    // on g0 alone, so a state refresh that started counting or stamping
+    // differently would fail here too. Under this ruling no state
+    // saturates on its own; saturation by genuine repeats is held in
+    // tag.test.ts on a hundred event refreshes.
+    const shipped = made.filter((m) => m.channel === "protocol").map((m) => m.decision);
     const walk = otherMade.filter((m) => m.channel === "protocol").map((m) => m.decision);
-    const first = walk.findIndex((d) => d.kind === "refresh" && d.saturationState === "saturated");
-    expect(first).toBeGreaterThan(1);
-    expect(first).toBeLessThan(walk.length - 1);
+    expect(walk).toHaveLength(22);
     for (const [i, d] of walk.entries()) {
-      if (i === 0) continue;
-      if (d.kind !== "refresh") throw new Error("expected refresh");
-      if (i < first) {
-        expect(d.saturationState, `morning ${i + 1}`).toBe("open");
-        expect(d.g0, `morning ${i + 1}`).toBeLessThan(overridden.policy.g0Ceiling);
-      } else {
-        expect(d.saturationState, `morning ${i + 1}`).toBe("saturated");
-        expect(d.g0, `morning ${i + 1}`).toBe(overridden.policy.g0Ceiling);
-      }
+      const { policyVersion: _p, calibrationVersion: _c, ...rest } = d;
+      const { policyVersion: _sp, calibrationVersion: _sc, ...shippedRest } = shipped[i]!;
+      expect(rest, `morning ${i + 1}`).toEqual(shippedRest);
     }
+    expect(new Set(walk.map((d) => d.g0)).size).toBe(1);
   });
 
   it("makes the same decisions on the same days, since none of the six criteria turns on the overridden values", () => {
