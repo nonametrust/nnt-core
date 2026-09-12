@@ -29,7 +29,8 @@ import type { Policy } from "./policy.js";
  * Said plainly, so the name does not mislead: medianEst is the Welford mean
  * of the same clipped input that mean is fed, started from the same first
  * value and moved by the same recursion, and the two are equal on every
- * row this arithmetic produces; baseline.test.ts holds that identity. The
+ * row this arithmetic produces; assertBaseline refuses a state where they
+ * differ, and baseline.test.ts holds the identity along a history. The
  * resistance of this design lives entirely in the clip, and not in the
  * location estimator differing from the mean, because it does not. What
  * actually differs between the two pairs is m2 against madEst: a clipped
@@ -119,6 +120,18 @@ export function assertBaseline(state: BaselineState): void {
   if (state.count > 0 && state.medianEst === null) {
     throw new RangeError(
       `baseline ${state.channel}/${state.aspect} has ${state.count} observations and no robust pair`,
+    );
+  }
+  // The location is the mean, by the same operations on the same operands,
+  // and the bound on the mean holds only through that: the band is centred
+  // on the location and the Welford delta is measured from the mean. A row
+  // where the two differ was not written by this arithmetic, and updating
+  // it would move the mean by the gap plus the bound. Strict equality is
+  // safe, because identical operations on identical operands give an
+  // identical double, and the store hands the double back unchanged.
+  if (state.medianEst !== null && state.medianEst !== state.mean) {
+    throw new RangeError(
+      `baseline ${state.channel}/${state.aspect} has location ${state.medianEst} apart from mean ${state.mean}`,
     );
   }
   requireFinite("baseline mean", state.mean);

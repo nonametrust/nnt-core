@@ -120,6 +120,18 @@ describe("assertBaseline", () => {
     expect(() => updateBaseline(s, 1e6, 1, policy)).toThrow(RangeError);
   });
 
+  // The bound on the mean holds only through the location being the mean:
+  // the band is centred on the location, the Welford delta is measured from
+  // the mean. A stored row with the two apart was not written by this
+  // arithmetic. Admitted, twenty observations at mean 100 with location 200
+  // and then a million at scale 2 moved the mean by 106/21 against a bound
+  // of 6/21. The store admits such a row today; this is the gate on it.
+  it("refuses a location apart from the mean, on entry to an update too", () => {
+    const s = { ...warmed(Array(20).fill(100), 2), medianEst: 200 };
+    expect(() => assertBaseline(s)).toThrow(RangeError);
+    expect(() => updateBaseline(s, 1e6, 2, policy)).toThrow(RangeError);
+  });
+
   it("accepts every state the arithmetic produces along a history", () => {
     let state = emptyBaseline(ns, "volume", "amount/USDC/in");
     expect(() => assertBaseline(state)).not.toThrow();
