@@ -660,6 +660,58 @@ describe("the entry", () => {
   });
 });
 
+// The event's instant is producer-supplied, and nothing can be observed
+// after it is decided on, so the tag's instant is the earlier of the event's
+// and the call's. Before this was bounded, an event stamped in 2099 opened a
+// tag the curve held at full strength until 2099, and the forward-only
+// refresh pinned an existing tag there for good. Clamped and not refused:
+// two seconds of producer skew must not stop the pipeline.
+describe("an event's instant is bounded above by the call's", () => {
+  const at = new Date("2026-09-12T08:14:02.000Z");
+  const changeAt = (instant: string): Observation =>
+    event("address_integrity", "payment_address_changed", { previous: "GOLDADDRESS", current: "GNEWADDRESS" }, instant);
+
+  it("stamps a new tag at the call's instant when the event claims one in 2099, on either kind of channel", () => {
+    const categorical = tagOne({ observation: changeAt("2099-01-01T00:00:00.000Z"), at });
+    expect(categorical.decision?.kind).toBe("new");
+    expect(categorical.decision?.taggedAt.toISOString()).toBe("2026-09-12T08:14:02.000Z");
+    const warm = warmedVolume(Array(20).fill(0.25));
+    const future = event("volume", "payment", { amount: "500.0000000", assetCode: "USDC", direction: "in" }, "2099-01-01T00:00:00.000Z");
+    const continuous = tagOne({ observation: future, baseline: warm, at });
+    expect(continuous.decision?.kind).toBe("new");
+    expect(continuous.decision?.taggedAt.toISOString()).toBe("2026-09-12T08:14:02.000Z");
+  });
+
+  it("does not let a refresh pin a live tag at a future date", () => {
+    const tag = live({ g0: 0.6, taggedAt: new Date("2026-09-11T08:14:00.000Z") });
+    const r = tagOne({
+      observation: changeAt("2099-01-01T00:00:00.000Z"), at,
+      liveTag: { ...tag, decayedStrength: decayedAt(tag, at) },
+    });
+    expect(r.decision?.kind).toBe("refresh");
+    expect(r.decision?.taggedAt.toISOString()).toBe("2026-09-12T08:14:02.000Z");
+  });
+
+  it("clamps two seconds of producer skew rather than refusing the observation", () => {
+    const r = tagOne({ observation: changeAt("2026-09-12T08:14:04.000Z"), at });
+    expect(r.decision?.kind).toBe("new");
+    expect(r.decision?.taggedAt.toISOString()).toBe("2026-09-12T08:14:02.000Z");
+  });
+
+  it("keeps the event's own instant when it is at or before the call's", () => {
+    expect(tagOne({ observation: changeAt("2026-09-12T08:14:00.000Z"), at }).decision?.taggedAt.toISOString())
+      .toBe("2026-09-12T08:14:00.000Z");
+    expect(tagOne({ observation: changeAt("2026-09-12T08:14:02.000Z"), at }).decision?.taggedAt.toISOString())
+      .toBe("2026-09-12T08:14:02.000Z");
+  });
+
+  it("hands a clamped tag a copy of the call's instant, not the caller's own date", () => {
+    const r = tagOne({ observation: changeAt("2099-01-01T00:00:00.000Z"), at });
+    r.decision!.taggedAt.setFullYear(2000);
+    expect(at.toISOString()).toBe("2026-09-12T08:14:02.000Z");
+  });
+});
+
 // The policy's unmeasured weight equals the weakest measured one, and every
 // decision names the calibration version, so a latency decision and a
 // content decision cannot be told apart by their numbers or their versions.

@@ -285,6 +285,51 @@ the merge.
 
 ---
 
+## Two HIGH findings after the fix wave, from an independent review
+
+An independent code review ran against the branch when it was about to merge,
+after this ledger was first written. It raised two HIGH findings that eleven
+task reviews, the whole-branch review and the fix-wave re-review all missed,
+and reproduced both by execution. Recorded here in full, because a ledger that
+holds only the decisions that were vindicated is not a record.
+
+**An event's tag instant is the earlier of the event's instant and the
+call's** (HIGH 1, mine). `instantOf` took the producer's event instant
+verbatim; the only check refused a non-date. Nothing bounded it above by the
+call's own instant, and the forward-only maximum in `refreshTag` then pinned a
+live tag at that future date for good. The store's curve returns the full
+initial strength whenever the elapsed time is zero or negative, so the tag sat
+at full strength until the date arrived. Reproduced: an address-integrity
+event stamped in 2099, decided in 2026, yielded a tag stamped 2099 at full
+strength that no decay curve would ever reduce. The composing function's own
+docstring reasoned only about the call's instant being *later* than the
+event's; the other direction was never examined, and the instant is
+producer-supplied and therefore attacker-influenced.
+
+Ruling: clamp, do not refuse. An observation cannot have happened after the
+moment we decided on it, so the later of the two is not information; it is
+clock skew or a manufactured value. Refusing would turn two seconds of skew on
+a producer into a stopped pipeline, which is a worse failure than the one
+being closed. Clamping loses nothing: the event's own instant stays on the
+observation and in the store, the tag's instant governs decay only, and a tag
+that decays from the moment we learned of the observation is conservative and
+true. No new number. The clamp lives in `instantOf`, the one place both
+operands are in hand; `refreshTag` stays public and trusts the instant it is
+handed the way it trusts the live tag's own. Five tests hold it, three of which
+die when the clamp is deleted. The corpus did not move: every corpus event is
+read fifteen seconds after its instant, so the clamp is idle there, which is
+what it should be on an honest path. Cost if wrong: a producer whose clock is
+genuinely ahead has its events' tags decay from the engine's clock rather than
+its own, by exactly the skew, in the conservative direction. The assumption
+does not appear elsewhere in the package: `instantOf` is the only reader of an
+observation's date in tagging, by the single-date-reader gate, and every other
+instant the package touches is the caller's `at` or a tag's own `taggedAt`.
+What the clamp cannot undo is a tag already written with a future instant;
+none has been, since no engine has written a tag from this package yet, and M3
+should know that the forward-only rule would preserve one if it ever were.
+
+---
+
 ## Where the plan was wrong, and an implementer or a reviewer was right
 
 This section is about the plan, not the code, and it is the finding M3's plan

@@ -208,18 +208,39 @@ export interface ReadingResult {
 }
 
 /**
- * The instant a tag opened by this observation is stamped at. An event's
- * own instant, through datedAt, the single reader of a date off an
- * observation; for a state datedAt returns null and the call's instant
- * stands in, since a standing condition has no instant of its own and the
- * tag's own taggedAt is what carries it forward from here.
+ * The instant a tag opened or refreshed by this observation is stamped at.
+ *
+ * For a state, datedAt returns null and the call's instant stands in: a
+ * standing condition has no instant of its own, and the tag's own taggedAt
+ * is what carries it forward from here.
+ *
+ * For an event, the earlier of the event's own instant, through datedAt,
+ * the single reader of a date off an observation, and the call's. An
+ * observation cannot have happened after the moment we decided on it, so
+ * when the event's instant is the later of the two it is not information:
+ * it is clock skew on the producer, or a value the producer manufactured.
+ * The instant is producer-supplied and therefore attacker-influenced, and
+ * the tag's instant is what the decay curve reads; the store's curve
+ * returns the full initial strength at any instant before taggedAt. Left
+ * unbounded, an event stamped in 2099 and decided in 2026 opened a tag that
+ * sat at full strength until 2099, and the forward-only rule in refreshTag
+ * then pinned an existing tag there against every later observation.
+ *
+ * Clamped, not refused. A refusal would turn two seconds of skew on a
+ * producer into a stopped pipeline, which is a worse failure than the one
+ * being closed. Clamping loses nothing: the event's own instant stays on
+ * the observation and in the store, the tag's instant governs decay only,
+ * and a tag that decays from the moment we learned of the observation is
+ * conservative and true. No new number is introduced; both operands were
+ * already in hand. The call's instant is refused at the entry before
+ * anything is read, so the minimum below is over two valid dates.
  */
 function instantOf(o: Observation, at: Date): Date {
   const dated = datedAt(o);
   if (dated === null) return new Date(at.getTime());
   const instant = new Date(dated);
   requireInstant("event instant", instant);
-  return instant;
+  return new Date(Math.min(instant.getTime(), at.getTime()));
 }
 
 /**
@@ -230,16 +251,26 @@ function instantOf(o: Observation, at: Date): Date {
  *
  * A consequence worth stating. For an event that instant is the event's,
  * and the call's instant may be later: minutes on a synchronous path, days
- * on a backfill. The decayed strength the caller hands in was computed at
- * the call's instant, so on a refresh the maximum compares a strength
- * decayed to the call's instant against a fresh g0 stamped at the earlier
- * one. The decayed operand is under-credited by the gap and never
- * over-credited. The fresh operand is stamped at the event's instant only
- * when that instant is at or after the tag's; an event backfilled from
- * behind the tag is stamped at the tag's instant by the forward-only rule,
- * later than its own, and that is the one place a fresh strength is dated
- * after its event. Held that way on purpose: the alternative, decaying to
- * the event's instant, would need the curve this package does not have.
+ * on a backfill. It is never earlier, because instantOf clamps an event's
+ * instant to the call's; the gap runs in one direction only. The decayed
+ * strength the caller hands in was computed at the call's instant, so on a
+ * refresh the maximum compares a strength decayed to the call's instant
+ * against a fresh g0 stamped at the earlier one. The decayed operand is
+ * under-credited by the gap and never over-credited. The fresh operand is
+ * stamped at the event's instant only when that instant is at or after the
+ * tag's; an event backfilled from behind the tag is stamped at the tag's
+ * instant by the forward-only rule, later than its own, and that is the one
+ * place a fresh strength is dated after its event. Held that way on
+ * purpose: the alternative, decaying to the event's instant, would need
+ * the curve this package does not have.
+ *
+ * The forward-only rule takes the maximum of the tag's instant and the
+ * clamped one, so a live tag can only ever be moved to an instant at or
+ * before the call's. What the rule cannot undo is a tag that already
+ * carries a future instant, written before the clamp existed; none has
+ * been, since no engine has written a tag from this package yet, and
+ * refreshTag, which is public, trusts the instant it is handed the way it
+ * trusts the live tag's own.
  */
 function decide(input: ReadingInput, g0: number, surprise: number | null, weightSource: WeightSource): TagDecision {
   const { reading } = input;
