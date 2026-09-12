@@ -17,13 +17,14 @@ Private until the `v0` tag, then public. Apache-2.0.
 |---|---|
 | `packages/schema` | The observation schema: seven channels, the event/state distinction, namespace and source, per-channel payload validators, the deterministic idempotency key, and one golden fixture per channel. **This is the only package the indexer depends on.** |
 | `packages/store` | The Postgres home of every observation, tag, trigger and audit entry the engine produces, with each invariant held by the database rather than by a caller's good manners. Depends on `schema`. See [The store](#the-store). |
+| `packages/tagging` | The arithmetic: an observation read into `(aspect, value)` readings by a derivation no caller can influence, judged against its baseline, clipped, folded in, and turned into a bounded `g0` when the surprise crosses the noise-adaptive threshold. Depends on `schema` alone and needs no database. See [Tagging](#tagging). |
 | `docs/observation-contract.md` | The contract for the indexer developer, in Turkish: what an observation is, what each field means, which rules the schema enforces and which it does not yet. Start there if you are writing a producer. |
 | `docs/superpowers/specs/`, `docs/superpowers/plans/` | The v0 design and the milestone plan the code follows. |
 | `gates/` | Repository-wide gates that are not about one package. Today: no tracked file may contain a Stellar-shaped account id, only `datedAt` reads a date off an observation, and the tagging and store baseline shapes agree field for field. |
 
-The remaining engine packages named in the design (`tagging`, `engine`,
-`nonametrust`) arrive in later milestones and will depend on `schema`; `schema`
-depends on nothing and is publishable on its own.
+The remaining engine packages named in the design (`engine`, `nonametrust`)
+arrive in later milestones and will depend on `schema`; `schema` depends on
+nothing and is publishable on its own.
 
 ## Running it
 
@@ -76,6 +77,41 @@ is gitignored. `pnpm --filter @nonametrust/store db:down` stops it;
 `packages/store/scripts/dev-db.sh destroy` removes it, and the next `db:up`
 creates it again. Each test file works in a schema of its own, created and
 dropped around the file, so the database carries nothing over between runs.
+
+## Tagging
+
+`packages/tagging` is where a baseline is defined, where a surprise is
+measured against it, and where a tag's `g0` comes from. It depends on
+`schema` alone and its suite needs no database:
+
+    pnpm --filter @nonametrust/tagging test
+
+The shape is a pure function: in, an observation, the baseline for its
+`(namespace, channel, aspect)`, the live tag on that pair with its strength
+at this instant, and the policy and calibration in force; out, the next
+baseline and either no decision or a decision carrying `g0`, the channel,
+the signed surprise and whether the tag is new or a refresh. The decayed
+strength is an input, computed by the caller with the store's `strengthAt`,
+because the two packages may not depend on each other and the curve must
+have one definition. The aspect is derived from the observation and never
+supplied, so a producer cannot split or merge a counterparty's history by
+choosing a string.
+
+Two files carry the numbers. `src/calibration.ts` holds what the study
+measured, the channel weights and the pooled half-life, each entry naming
+its source, and a test recomputes every entry from the aggregate tables
+vendored under `fixtures/study/`. `src/policy.ts` holds what the study does
+not speak to, and every entry there is declared uncalibrated, its default
+chosen to make the design's day-twelve to day-twenty-one scenario behave.
+The half-life is one pooled value for every channel and is not calibrated
+per channel, pending D1.4. Both files are versioned and every result names
+the two versions that produced it, and every decision also names whether
+its channel weight came from the calibration or from the policy, since the
+two unmeasured channels take a policy number that the calibration never
+produced.
+
+`src/acceptance.test.ts` runs the six M2 criteria together on one corpus,
+that scenario, in milliseconds.
 
 ## Gates
 
