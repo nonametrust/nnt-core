@@ -427,12 +427,20 @@ until the payload is read into a signal. The other five: the decision is
 keyed on the channel and the aspect while the store's tag row is keyed on the
 channel alone, already carried above as the missing column; the band-endpoint
 guard checks the half-width but not the endpoints, so an exported function's
-documented bound can be infinite on inputs the pipeline cannot produce; a zero
-threshold base is admissible and would open a zero-strength tag on every
-observation; a state refresh can flip a tag to saturated without adding
-anything, when the decayed operand and the fresh g0 already sit at the
-ceiling; and the two constant singletons are not frozen, so a shallow spread
-shares their nested objects.
+documented bound can be infinite on inputs the pipeline cannot produce; an
+ungated refresh can flip a tag to saturated without adding anything, when the
+decayed operand and the fresh g0 already sit at the ceiling; the two constant
+singletons are not frozen, so a shallow spread shares their nested objects;
+and a zero threshold base is admissible. That last one was first written here
+as opening a zero-strength tag on every observation, and under the crossing
+rule that understates it: with the base at zero every measured observation
+crosses, the first opens a tag at zero and each one after earns the
+increment, so thirty routine payments around a quarter unit climb a tag from
+nothing to eight tenths, monotone toward the ceiling. The increment's
+protection is exactly the threshold's, and a policy that lowers the threshold
+to nothing turns ordinary traffic into a pump. The base is operator-controlled
+and versioned, which is why it stays a minor; whoever reviews a policy version
+that touches `thresholdBase` owns that consequence.
 
 ---
 
@@ -606,9 +614,12 @@ constraint; its worktree needs the cluster from Task 1.
 
 ## Carried into M3 and the schema card, not fixed here
 
-The first five are the ones M3's plan cannot be written without. The rest are
-the residual minors the final review triaged as able to stand, grouped so they
-can be found.
+The first eight are the ones M3's plan cannot be written without. The second,
+third and fourth were added after the whole-branch review at `d92dfa6`, and
+they are contracts the engine owes rather than defects in the arithmetic;
+every number in them was re-measured on the built package at that commit. The
+rest are the residual minors the final review triaged as able to stand,
+grouped so they can be found.
 
 - **The store's refresh method cannot store what this package returns.**
   `TagRepository.refresh(tagId, g0)` takes `greatest` over the stored `g0`
@@ -618,6 +629,49 @@ can be found.
   returned, because together with a moved instant, `greatest` over the stored
   value revives a tag to full at every repeat. M3's engine writes a new
   refresh; the M1 method is not to be reused.
+- **The caller's `at` is the engine's own clock, and is never derived from the
+  observation.** The clamp that closed the first HIGH finding takes the
+  earlier of the event's instant and `at`, and it protects only while `at` is
+  a clock the producer cannot write. On a backfill the natural move is to set
+  `at` from the observation being replayed, so that the tag is dated when the
+  event happened; do that and the clamp compares the producer's instant with
+  itself, is idle, and the defect returns in full: an event stamped years
+  ahead opens a tag at that date, at full strength until the date arrives,
+  and the forward-only rule then holds a live tag there against every later
+  observation. Nothing in this package can tell the two kinds of `at` apart
+  and nothing in it refuses the second. The contract M3's engine owes: `at`
+  is read from the engine's clock on every path, replay included, and a
+  backfill that wants tags dated to their events decays them from the clock
+  it ran under and accepts the conservative result. If a replay must date
+  tags from the observation, that is a new ruling with its own gate, not a
+  choice of argument.
+- **A state whose validity has ended still opens and refreshes a tag.**
+  `datedAt` returns null for a state and nothing else in this package may
+  read a date off an observation, by the root gate, so `validUntil` is never
+  seen here. Confirmed on the shipped package: a trustline state with
+  `validUntil` in 2025, tagged at an `at` in 2026, opens a protocol tag at
+  its full weight times the base, stamped at `at`, and refreshes a live one
+  the same way. Section 4's "refreshed while it holds" is therefore entirely
+  the caller's promise. M3's engine decides that a state holds at `at`
+  before it calls this package, and a backfill that replays a history of
+  states replays the ended ones as current unless it does. Where that check
+  lives, and whether the gate should admit a second reader for it, is M3's
+  to rule; until it does, no state reaching this package is checked for
+  having ended.
+- **A refusal from the arithmetic belongs to the one observation that raised
+  it, and never to the pipeline.** The Task 5 ruling above says a surprise
+  refusal must propagate and calls a near-double amount impossible. The
+  second half is wrong: the decimal string has no digit cap, so an amount of
+  three hundred and eight digits is schema-valid, reads as 1e307, and
+  `surpriseOf` refuses it against any warm baseline because the quotient over
+  a scale floored at 0.05 does not fit a double. The spec's own section on
+  refusals sanctions the refusal. What it must not become in M3 is a stopped
+  engine: the refusal leaves `tagObservation` as the refusal it is, and the
+  engine records it against that observation, with its message, and
+  continues with the next one. An engine that halts ingest on it hands any
+  unauthenticated producer a one-string denial of service; an engine that
+  swallows it has the silent absence of a tag this package refuses to
+  produce. Both are M3's to get right and nothing here checks either.
 - **The `tag` table has no `aspect` column.** The live tag is keyed on
   `(namespace, channel, aspect)` and `TagDecision` carries the aspect; the
   store's `StoredTag` carries the channel only. Without the column a deviation
@@ -651,12 +705,27 @@ can be found.
   until then the categorical base is the whole of a categorical tag's
   strength. This is the stated limit of the second HIGH fix.
 - **A state on a continuous channel is schema-valid, crosses, and earns the
-  increment while it crosses.** No producer emits one. Whether a standing
-  condition belongs in a continuous baseline at all, when each morning's
-  re-evaluation enters the history it is judged against, is a question for
-  the schema card or M3, and the answer decides whether `tagReading` should
-  refuse such a state, skip the baseline update, or leave it. Pinned by a
-  test in `tag.test.ts`; measured at saturation on the forty-eighth morning.
+  increment while it crosses; then the baseline absorbs it, it stops
+  crossing, and the tag fades while the state still holds.** No producer
+  emits one. Both faces measured on the shipped arithmetic, a two-unit
+  standing state re-evaluated every morning against a baseline of twenty
+  quarter-unit payments: it crosses on fifty-seven mornings and saturates on
+  the forty-eighth, which is the ratchet. From the fifty-eighth morning its
+  own re-evaluations have moved the location far enough that it no longer
+  crosses, no decision is made at all, and the tag decays from the ceiling to
+  about four hundredths by the hundred-and-twentieth morning with the state
+  unchanged, which is the defect M1's refresh was called out for, on this
+  path. A larger standing value does the same later, because the clip bounds
+  what one morning can move; five hundred units is still crossing on the
+  two-hundred-and-fortieth morning, and fades the same way once absorbed.
+  Leaving this open is therefore not a neutral choice: the path is wrong in
+  two directions at once, first too strong and then gone. The question that
+  settles it is the one already carried, whether a standing condition belongs
+  in a continuous baseline at all when each morning's re-evaluation enters
+  the history it is judged against, and the answer decides whether
+  `tagReading` refuses such a state, skips the baseline update, or leaves it.
+  That ruling is for the schema card or M3. Pinned by a test in
+  `tag.test.ts` on the crossing face only.
 - **A categorical weight is the precision of one study signal applied to
   every observation on its channel.** The categorical path derives no signal
   from the payload, so any memo scores at the memo-anomaly weight and any
@@ -686,7 +755,9 @@ rediscover:
   the event's or the tag's, whichever is later. Minutes apart on a synchronous
   path; days apart on a backfill, where the maximum compares a strength
   decayed to `at` against a `g0` stamped earlier. Held conservative. M3
-  chooses its `at` knowing this.
+  chooses its `at` knowing this, and knowing that the clamp from the first
+  HIGH fix holds only while `at` is the engine's clock; the contract is in
+  the list above.
 - **The saturated remnant is narrower than before the state ruling but still
   reachable.** A protocol event and a protocol state derive the same aspect,
   so ten event refreshes saturate the pair and a state then holds it at the
