@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { assertBaseline, emptyBaseline, updateBaseline, type BaselineState } from "./baseline.js";
 import { POLICY_V0 } from "./policy.js";
-import { timescaleDivergence, timescaleStep } from "./timescales.js";
+import { assertTimescales, timescaleDivergence, timescaleStep } from "./timescales.js";
 
 const ns = "11111111-1111-4111-8111-111111111111";
 const policy = POLICY_V0;
@@ -112,6 +112,30 @@ describe("the two pairs inside updateBaseline", () => {
     expect(s.slowMean).toBeCloseTo(100.12, 12);
   });
 
+  // Every test above reads the pairs one step from a state of rest, where
+  // the two means are equal and both variances are zero, and one such step
+  // cannot tell which previous pair a step was handed: a fast step given the
+  // slow pair's mean or variance, or a seed flag that fires on the second
+  // observation too, all pass them. Two steps from a seed pin the recurrence
+  // on each pair's own history. With a scale of 100 nothing clips. From 100:
+  //   106  fast 100 + 0.2 × 6 = 101.2, 0.8 × (0.2 × 36) = 5.76
+  //        slow 100 + 0.02 × 6 = 100.12, 0.98 × (0.02 × 36) = 0.7056
+  //   94   fast 101.2 − 0.2 × 7.2 = 99.76, 0.8 × (5.76 + 0.2 × 51.84) = 12.9024
+  //        slow 100.12 − 0.02 × 6.12 = 99.9976, 0.98 × (0.7056 + 0.02 × 37.4544) = 1.42559424
+  it("carry each pair's own mean and variance from one step to the next", () => {
+    const seeded = updateBaseline(emptyBaseline(ns, "volume", "amount/USDC/in"), 100, 100, policy);
+    const one = updateBaseline(seeded, 106, 100, policy);
+    expect(one.fastMean).toBeCloseTo(101.2, 12);
+    expect(one.fastM2).toBeCloseTo(5.76, 12);
+    expect(one.slowMean).toBeCloseTo(100.12, 12);
+    expect(one.slowM2).toBeCloseTo(0.7056, 12);
+    const two = updateBaseline(one, 94, 100, policy);
+    expect(two.fastMean).toBeCloseTo(99.76, 12);
+    expect(two.fastM2).toBeCloseTo(12.9024, 12);
+    expect(two.slowMean).toBeCloseTo(99.9976, 12);
+    expect(two.slowM2).toBeCloseTo(1.42559424, 12);
+  });
+
   // Every other test runs the shipped policy, whose alphas are 0.2 and 0.02.
   // The test above tells the fast weight from the slow one, but a step
   // reading the literal 0.2 where the policy's field belongs would pass it.
@@ -133,7 +157,11 @@ describe("the two pairs inside updateBaseline", () => {
   // exit check of updateBaseline pinned by nothing, and the sweep showed it.
   // At a count of one Welford's increment is d² / 2 and the fast step's is
   // at most 0.16 × d², so a deviation of 2.5e154 inside a band of 3e154
-  // overflows m2 and neither pair, and only the exit check refuses it.
+  // overflows m2 and neither pair, and only the exit check refuses it. The
+  // squared deviation alone, 6.25e308, is past the largest double: the step
+  // admits the case only because its product associates left, so the weight
+  // is applied before the second factor and 0.2 × 2.5e154 × 2.5e154 is
+  // 1.25e308. Reassociating the product fails this test, and should.
   it("still refuse a non-finite state on exit, on a case the steps themselves admit", () => {
     const s = updateBaseline(emptyBaseline(ns, "volume", "amount/USDC/in"), 0, 1e154, policy);
     expect(() => timescaleStep({ mean: 0, m2: 0 }, 2.5e154, policy.fastAlpha, false)).not.toThrow();
@@ -238,10 +266,19 @@ describe("timescaleDivergence", () => {
   // read. A location apart from the mean is refused by assertBaseline and
   // by every update, and is computed over here; copying that rule in would
   // be the duplication the shared predicate exists to bound.
-  it("does not judge the fields it does not read", () => {
+  it("judges the two pairs and nothing beyond them", () => {
     const apart = { ...steady, medianEst: 200 };
     expect(() => assertBaseline(apart)).toThrow(/apart from mean/);
     expect(timescaleDivergence(apart, floor)).toBe(0);
+  });
+
+  // A negative infinity fails both checks on a variance. The predicate
+  // names it as non-finite, because finiteness is judged before sign, as
+  // the baseline's own helper always did; the agreement table above cannot
+  // see the order, since either wording satisfies it.
+  it("names a negative infinity on a variance as non-finite, not as negative", () => {
+    expect(() => assertTimescales({ ...steady, fastM2: Number.NEGATIVE_INFINITY })).toThrow(/fastM2 must be finite/);
+    expect(() => assertTimescales({ ...steady, slowM2: Number.NEGATIVE_INFINITY })).toThrow(/slowM2 must be finite/);
   });
 
   // Both sides finite and positive, and the quotient still not: the smallest
