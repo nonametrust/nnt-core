@@ -105,9 +105,11 @@ describe("refreshTag", () => {
   it("never sums the two strengths", () => {
     const r = refreshTag(live({ decayedStrength: 0.3 }), 0.4, at, policy);
     expect(r.g0).not.toBeCloseTo(0.7, 6);
+    // g0 is raised to the grid's top so the decayed strength never exceeds
+    // it, which refreshTag refuses; the open path does not read the g0.
     for (const decayed of [0, 0.1, 0.3, 0.5, 0.9]) {
       for (const fresh of [0, 0.1, 0.3, 0.5, 0.9]) {
-        const next = refreshTag(live({ decayedStrength: decayed }), fresh, at, policy);
+        const next = refreshTag(live({ g0: 0.9, decayedStrength: decayed }), fresh, at, policy);
         expect(next.g0).toBeLessThanOrEqual(Math.max(decayed, fresh) + policy.refreshIncrement + 1e-12);
       }
     }
@@ -141,7 +143,7 @@ describe("refreshTag", () => {
   });
 
   it("saturates when the increment can no longer raise the strength in full", () => {
-    const r = refreshTag(live({ decayedStrength: 0.98 }), 0.5, at, policy);
+    const r = refreshTag(live({ g0: 0.98, decayedStrength: 0.98 }), 0.5, at, policy);
     expect(r.g0).toBe(policy.g0Ceiling);
     expect(r.saturationState).toBe("saturated");
   });
@@ -461,6 +463,29 @@ describe("refreshTag's refusals name their cause", () => {
     }
   });
 
+  // A saturated tag is handed back at its own g0, so one above the ceiling
+  // would leave above it on every refresh, unbounded. Refused, not clamped:
+  // a clamp would report a changed value under a policy that did not
+  // produce it. At the ceiling is fine; the brief's saturated test holds it.
+  it("refuses a saturated tag whose g0 lies above the ceiling, naming both", () => {
+    const legacy = live({ g0: 7, decayedStrength: 0.2, saturationState: "saturated" });
+    expect(() => refreshTag(legacy, 0.9, at, policy))
+      .toThrow(/^saturated tag g0 7 lies above policy\.g0Ceiling 1;/);
+    const lowered = live({ g0: 1, decayedStrength: 0.2, saturationState: "saturated" });
+    expect(() => refreshTag(lowered, 0.9, at, { ...policy, g0Ceiling: 0.9 }))
+      .toThrow(/^saturated tag g0 1 lies above policy\.g0Ceiling 0\.9;/);
+    expect(refreshTag(lowered, 0.9, at, policy).g0).toBe(1);
+  });
+
+  // No honest curve returns more than the g0 it started from.
+  it("refuses a decayed strength above the live g0, open or saturated", () => {
+    expect(() => refreshTag(live({ g0: 0.5, decayedStrength: 0.6 }), 0.4, at, policy))
+      .toThrow(/^decayed strength 0\.6 exceeds the live tag g0 0\.5/);
+    expect(() => refreshTag(live({ g0: 0.5, decayedStrength: 0.6, saturationState: "saturated" }), 0.4, at, policy))
+      .toThrow(/^decayed strength 0\.6 exceeds the live tag g0 0\.5/);
+    expect(refreshTag(live({ g0: 0.5, decayedStrength: 0.5 }), 0.4, at, policy).g0).toBeCloseTo(0.55, 12);
+  });
+
   // refreshTag is public and does not pass through tagReading's assertPolicy,
   // so the two fields it reads are checked where they are read, under
   // assertPolicy's own wording.
@@ -493,7 +518,7 @@ describe("refreshTag reads the increment and the ceiling from their own fields",
   it("saturates at the policy's ceiling and not at one", () => {
     const shadow = { ...policy, g0Ceiling: 0.9 };
     expect(shadow.noiseCoefficient).not.toBe(0.9);
-    const r = refreshTag(live({ decayedStrength: 0.88 }), 0.5, at, shadow);
+    const r = refreshTag(live({ g0: 0.88, decayedStrength: 0.88 }), 0.5, at, shadow);
     expect(r.g0).toBe(0.9);
     expect(r.saturationState).toBe("saturated");
   });

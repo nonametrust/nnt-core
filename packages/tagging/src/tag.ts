@@ -92,6 +92,20 @@ function requireRefreshFields(policy: Policy): { increment: number; ceiling: num
  * far it had decayed. That is bounded, at the ceiling, and bounded is what
  * saturation means; the ceiling is the most a pair can ever be worth, and a
  * standing deviation that keeps recurring is worth exactly that.
+ *
+ * Bounded only if the g0 handed back is itself at or below the ceiling, and
+ * that is refused rather than clamped when it is not. A saturated tag above
+ * the ceiling was written under a policy whose ceiling was higher, and
+ * clamping it would report a changed value under the version that did not
+ * produce it. The cost, stated where whoever pays it will look: lowering the
+ * ceiling in a later policy version requires migrating the saturated tags
+ * above it, because this function refuses them until someone does. The
+ * open path is not refused, since it reads the decayed strength and bounds
+ * its result by the arithmetic above.
+ *
+ * The decayed strength is held at or below the live g0. No curve the caller
+ * could honestly run produces more, so a larger one is a mismatched pair or
+ * a bad computation, and it is refused rather than folded in.
  */
 export function refreshTag(live: LiveTagInput, freshG0: number, instant: Date, policy: Policy): TagRefresh {
   requireStrength("live tag g0", live.g0);
@@ -102,12 +116,20 @@ export function refreshTag(live: LiveTagInput, freshG0: number, instant: Date, p
   if (!Number.isSafeInteger(live.refreshCount) || live.refreshCount < 0) {
     throw new RangeError(`refresh count must be a non-negative integer, got ${live.refreshCount}`);
   }
+  if (live.decayedStrength > live.g0) {
+    throw new RangeError(`decayed strength ${live.decayedStrength} exceeds the live tag g0 ${live.g0} it decays from`);
+  }
   const { increment, ceiling } = requireRefreshFields(policy);
 
   const taggedAt = new Date(Math.max(live.taggedAt.getTime(), instant.getTime()));
   const refreshCount = live.refreshCount + 1;
 
   if (live.saturationState === "saturated") {
+    if (live.g0 > ceiling) {
+      throw new RangeError(
+        `saturated tag g0 ${live.g0} lies above policy.g0Ceiling ${ceiling}; a tag saturated under a higher ceiling must be migrated before it is refreshed`,
+      );
+    }
     return { g0: live.g0, taggedAt, refreshCount, saturationState: "saturated" };
   }
   const raised = Math.max(live.decayedStrength, freshG0) + increment;
@@ -188,9 +210,13 @@ function instantOf(o: Observation, at: Date): Date {
  * on a backfill. The decayed strength the caller hands in was computed at
  * the call's instant, so on a refresh the maximum compares a strength
  * decayed to the call's instant against a fresh g0 stamped at the earlier
- * one. That under-credits the standing tag by the gap and never over-credits
- * it, and it is held that way on purpose: the alternative, decaying to the
- * event's instant, would need the curve this package does not have.
+ * one. The decayed operand is under-credited by the gap and never
+ * over-credited. The fresh operand is stamped at the event's instant only
+ * when that instant is at or after the tag's; an event backfilled from
+ * behind the tag is stamped at the tag's instant by the forward-only rule,
+ * later than its own, and that is the one place a fresh strength is dated
+ * after its event. Held that way on purpose: the alternative, decaying to
+ * the event's instant, would need the curve this package does not have.
  */
 function decide(input: ReadingInput, g0: number, surprise: number | null, weightSource: WeightSource): TagDecision {
   const { reading } = input;
