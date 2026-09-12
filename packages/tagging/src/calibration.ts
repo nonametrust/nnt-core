@@ -147,13 +147,36 @@ function isMeasured(channel: Channel): channel is MeasuredChannel {
   return (MEASURED_CHANNELS as readonly string[]).includes(channel);
 }
 
+/** Where a channel's weight came from: the study's measurement, or a number the policy declares. */
+export type WeightSource = "calibration" | "policy";
+
+export interface ChannelWeight {
+  readonly weight: number;
+  readonly source: WeightSource;
+}
+
 /**
- * The weight one channel's g0 is scaled by. Measured channels read the
- * calibration; latency and price read the policy, because the study had no
- * signal on either and calibration cannot carry what was not measured.
+ * The weight one channel's g0 is scaled by, together with where it came
+ * from. Measured channels read the calibration; latency and price read the
+ * policy, because the study had no signal on either and calibration cannot
+ * carry what was not measured.
+ *
+ * The source travels with the weight for one reason. The policy's unmeasured
+ * weight is equal to the weakest measured one, so a latency decision scores
+ * the same as a content decision whose weight the study did measure, and both
+ * name the calibration version; a reader of results cannot tell them apart by
+ * the number. The decision therefore names the source, and the source is set
+ * here, by the same predicate that chooses the number, and nowhere else. A
+ * second membership test in the module that builds the decision would be a
+ * duplicate that nothing holds equal to this one.
  */
-export function channelWeight(channel: Channel, calibration: Calibration, policy: Policy): number {
+export function channelWeightWithSource(channel: Channel, calibration: Calibration, policy: Policy): ChannelWeight {
   return isMeasured(channel)
-    ? calibration.channelWeights[channel].weight
-    : policy.unmeasuredChannelWeight;
+    ? { weight: calibration.channelWeights[channel].weight, source: "calibration" }
+    : { weight: policy.unmeasuredChannelWeight, source: "policy" };
+}
+
+/** The weight alone, through the same predicate. */
+export function channelWeight(channel: Channel, calibration: Calibration, policy: Policy): number {
+  return channelWeightWithSource(channel, calibration, policy).weight;
 }

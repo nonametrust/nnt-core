@@ -7,6 +7,7 @@ import {
   MEASURED_CHANNELS,
   assertCalibration,
   channelWeight,
+  channelWeightWithSource,
   precisionAtEvenPrior,
 } from "./calibration.js";
 import { POLICY_V0, assertPolicy, scaleFloorFor } from "./policy.js";
@@ -177,6 +178,36 @@ describe("channelWeight", () => {
       expect(w).toBeGreaterThan(0);
       expect(w).toBeLessThanOrEqual(1);
     }
+  });
+});
+
+// The weight's source travels with the weight, from the one predicate that
+// chooses it. The decision names the source because the policy's unmeasured
+// weight equals the weakest measured one and every decision names the
+// calibration version, so the number and the version cannot tell a latency
+// decision from a content one. tag.test.ts holds that the decision carries
+// what this returns; this holds what it returns.
+describe("channelWeightWithSource", () => {
+  it("says calibration for exactly the measured channels and policy for the rest", () => {
+    for (const c of CHANNELS) {
+      const measured = (MEASURED_CHANNELS as readonly string[]).includes(c);
+      expect(channelWeightWithSource(c, CALIBRATION_V0, POLICY_V0).source, c).toBe(measured ? "calibration" : "policy");
+    }
+  });
+
+  it("returns the weight channelWeight returns, for every channel, so the two cannot drift", () => {
+    for (const c of CHANNELS) {
+      expect(channelWeightWithSource(c, CALIBRATION_V0, POLICY_V0).weight, c).toBe(channelWeight(c, CALIBRATION_V0, POLICY_V0));
+    }
+  });
+
+  // The policy's weight is deliberately equal to the weakest measured one, so
+  // the number cannot carry the distinction; only the source can.
+  it("returns the same number with a different source for latency and for content", () => {
+    const latency = channelWeightWithSource("latency", CALIBRATION_V0, POLICY_V0);
+    const content = channelWeightWithSource("content", CALIBRATION_V0, POLICY_V0);
+    expect(latency.weight).toBe(content.weight);
+    expect(latency.source).not.toBe(content.source);
   });
 });
 

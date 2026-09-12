@@ -8,3 +8,4 @@ export * from "./scale.js";
 export * from "./timescales.js";
 export * from "./g0.js";
 export * from "./threshold.js";
+export * from "./tag.js";
