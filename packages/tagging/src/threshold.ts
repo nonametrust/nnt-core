@@ -1,26 +1,20 @@
 import { assertBaseline, type BaselineState } from "./baseline.js";
-import type { Policy } from "./policy.js";
+import { requireMinObservations, type Policy } from "./policy.js";
 import type { ContinuousChannel } from "./reading.js";
 import { robustScale, surpriseOf } from "./scale.js";
 
-// This module takes values from baseline.ts and scale.ts and a type each
-// from policy.ts and reading.ts. Nothing here reaches back into any of them,
-// and nothing imports this module yet; tag.ts will.
+// This module takes values from baseline.ts, scale.ts and policy.ts and a
+// type from reading.ts. Nothing here reaches back into any of them, and
+// policy.ts takes only a type from reading.ts, so no cycle is possible.
+// tag.ts takes judgeSurprise from here.
 
 // The three policy fields this module reads are checked where they are
 // read, under the wording assertPolicy gives them, so a refusal reads the
 // same whether the pipeline's entry or the arithmetic notices. A zero
-// minimum count makes the shrinkage divide zero by zero at count zero; a
-// NaN base or coefficient leaves as a NaN threshold. Neither leaves this
-// package.
-function requireMinObservations(policy: Policy): number {
-  const n = policy.minObservations;
-  if (!Number.isSafeInteger(n) || n < 1) {
-    throw new RangeError(`policy.minObservations must be a positive integer, got ${n}`);
-  }
-  return n;
-}
-
+// minimum count makes the shrinkage divide zero by zero at count zero, and
+// is refused by requireMinObservations, the one predicate for it, in
+// policy.ts; a NaN base or coefficient leaves as a NaN threshold, and is
+// refused here. Neither leaves this package.
 function requireNonNegativeField(name: "thresholdBase" | "noiseCoefficient", policy: Policy): number {
   const value = policy[name];
   if (!(value >= 0) || !Number.isFinite(value)) {

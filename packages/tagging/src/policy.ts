@@ -110,6 +110,22 @@ function unit(name: string, value: number, closedAtOne: boolean): void {
 }
 
 /**
+ * The minimum count, refused unless it is a positive integer. Written once
+ * and read from three places: assertPolicy below, the shrinkage in
+ * threshold.ts and the uncertainty in g0.ts, each of which divides by it and
+ * each of which is public and reachable without passing through assertPolicy.
+ * One predicate, so the three cannot drift apart in what they admit or in
+ * what they say.
+ */
+export function requireMinObservations(policy: Policy): number {
+  const n = policy.minObservations;
+  if (!Number.isSafeInteger(n) || n < 1) {
+    throw new RangeError(`policy.minObservations must be a positive integer, got ${n}`);
+  }
+  return n;
+}
+
+/**
  * A policy the arithmetic can use. Refused up front, once, rather than
  * discovered as a NaN three functions deep: a zero floor divides, an alpha
  * of one forgets everything, a slow weight above the fast one inverts the
@@ -119,9 +135,7 @@ export function assertPolicy(policy: Policy): void {
   // The version is what every result names and what the champion-challenger
   // arrangement keys on; an empty one is a result that names nothing.
   if (policy.version.length === 0) throw new RangeError("policy.version must not be empty");
-  if (!Number.isSafeInteger(policy.minObservations) || policy.minObservations < 1) {
-    throw new RangeError(`policy.minObservations must be a positive integer, got ${policy.minObservations}`);
-  }
+  requireMinObservations(policy);
   positive("winsorMadMultiple", policy.winsorMadMultiple);
   for (const [channel, floor] of Object.entries(policy.scaleFloor.byChannel)) {
     positive(`scaleFloor.byChannel.${channel}`, floor);

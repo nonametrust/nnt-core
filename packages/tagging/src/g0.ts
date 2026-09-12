@@ -1,24 +1,17 @@
-import type { Policy } from "./policy.js";
+import { requireMinObservations, type Policy } from "./policy.js";
 
-// This module takes only a type from policy.ts, which is erased, and nothing
-// from any other module of the package. It sits at a leaf of the graph:
-// tag.ts will take calibrateG0 and uncertaintyOf from here as values, and
-// nothing here reaches back.
+// This module takes requireMinObservations and a type from policy.ts, which
+// itself takes only a type from reading.ts, and nothing from any other module
+// of the package, so no cycle is possible. tag.ts takes calibrateG0 and
+// uncertaintyOf from here as values, and nothing here reaches back.
 
 // The two policy fields this module reads are checked where they are read,
 // under the wording assertPolicy gives them, so a refusal reads identically
 // whether the pipeline's entry or the arithmetic itself notices. A zero
-// minimum count divides zero by zero at count zero, and a zero scale divides
-// zero by zero at surprise zero; both would leave as a NaN, and no NaN
-// leaves this package.
-function requireMinObservations(policy: Policy): number {
-  const n = policy.minObservations;
-  if (!Number.isSafeInteger(n) || n < 1) {
-    throw new RangeError(`policy.minObservations must be a positive integer, got ${n}`);
-  }
-  return n;
-}
-
+// minimum count divides zero by zero at count zero, and is refused by
+// requireMinObservations, the one predicate for it, in policy.ts; a zero
+// scale divides zero by zero at surprise zero, and is refused here. Both
+// would leave as a NaN, and no NaN leaves this package.
 function requireSurpriseScale(policy: Policy): number {
   const tau = policy.surpriseScale;
   if (!(tau > 0) || !Number.isFinite(tau)) {
