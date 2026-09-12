@@ -1,4 +1,4 @@
-import type { Policy } from "./policy.js";
+import { requirePositive, type Policy } from "./policy.js";
 import { assertTimescales, timescaleStep } from "./timescales.js";
 
 /**
@@ -85,7 +85,10 @@ function requireFinite(name: string, value: number): void {
   if (!Number.isFinite(value)) throw new RangeError(`${name} must be finite, got ${value}`);
 }
 
-function requireNonNegative(name: string, value: number): void {
+// Two steps rather than the package's one-line predicate, on purpose: a
+// column that is NaN and a column that is negative are two different
+// corruptions of a stored row, and the message names which.
+function requireFiniteNonNegative(name: string, value: number): void {
   requireFinite(name, value);
   if (value < 0) throw new RangeError(`${name} must be non-negative, got ${value}`);
 }
@@ -136,9 +139,11 @@ export function assertBaseline(state: BaselineState): void {
     );
   }
   requireFinite("baseline mean", state.mean);
-  requireNonNegative("baseline m2", state.m2);
-  if (state.medianEst !== null) requireFinite("baseline medianEst", state.medianEst);
-  if (state.madEst !== null) requireNonNegative("baseline madEst", state.madEst);
+  requireFiniteNonNegative("baseline m2", state.m2);
+  // The location's finiteness is the mean's, by the identity refused just
+  // above: a location that is not null equals the mean, and the mean was
+  // checked. A separate check here would look live and never fire.
+  if (state.madEst !== null) requireFiniteNonNegative("baseline madEst", state.madEst);
   // The two pairs are judged by the predicate timescales.ts owns, so that
   // the divergence, which reads only those four fields, refuses exactly what
   // this does on them under the same message.
@@ -165,12 +170,8 @@ export interface ClipRule {
  */
 export function winsorize(x: number, location: number | null, rule: ClipRule): number {
   requireFinite("observation", x);
-  if (!(rule.scale > 0) || !Number.isFinite(rule.scale)) {
-    throw new RangeError(`scale must be positive and finite, got ${rule.scale}`);
-  }
-  if (!(rule.multiple > 0) || !Number.isFinite(rule.multiple)) {
-    throw new RangeError(`multiple must be positive and finite, got ${rule.multiple}`);
-  }
+  requirePositive("scale", rule.scale);
+  requirePositive("multiple", rule.multiple);
   if (location === null) return x;
   requireFinite("location", location);
   const half = rule.multiple * rule.scale;

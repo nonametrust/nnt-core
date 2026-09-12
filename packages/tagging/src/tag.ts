@@ -2,7 +2,7 @@ import { datedAt, type Channel, type EvidenceKind, type Observation } from "@non
 import { assertBaseline, emptyBaseline, updateBaseline, type BaselineState } from "./baseline.js";
 import { assertCalibration, channelWeightWithSource, type Calibration, type WeightSource } from "./calibration.js";
 import { calibrateG0, uncertaintyOf } from "./g0.js";
-import { assertPolicy, scaleFloorFor, type Policy } from "./policy.js";
+import { assertPolicy, requireNonNegative, requireUnitInterval, scaleFloorFor, type Policy } from "./policy.js";
 import { readObservation, type Reading } from "./reading.js";
 import { robustScale } from "./scale.js";
 import { judgeSurprise, type SurpriseVerdict } from "./threshold.js";
@@ -51,23 +51,18 @@ function requireInstant(name: string, value: Date): void {
 }
 
 // The two policy fields refreshTag reads are checked where they are read,
-// under the wording assertPolicy gives them, so a refusal reads the same
-// whether the pipeline's entry or the arithmetic notices. refreshTag is
-// public and reachable without passing through the entry's check; a NaN
+// by the predicates assertPolicy itself applies, so a refusal reads the
+// same whether the pipeline's entry or the arithmetic notices. refreshTag
+// is public and reachable without passing through the entry's check; a NaN
 // increment would leave as a NaN strength, and a ceiling of zero would
 // saturate every tag at nothing. The categorical base is read only below
 // the entry's own assertPolicy and carries no second check: one was
 // written, and the sweep showed it unreachable.
 function requireRefreshFields(policy: Policy): { increment: number; ceiling: number } {
-  const increment = policy.refreshIncrement;
-  if (!(increment >= 0) || !Number.isFinite(increment)) {
-    throw new RangeError(`policy.refreshIncrement must be a non-negative finite number, got ${increment}`);
-  }
-  const ceiling = policy.g0Ceiling;
-  if (!(ceiling > 0 && ceiling <= 1)) {
-    throw new RangeError(`policy.g0Ceiling must lie in (0, 1], got ${ceiling}`);
-  }
-  return { increment, ceiling };
+  return {
+    increment: requireNonNegative("policy.refreshIncrement", policy.refreshIncrement),
+    ceiling: requireUnitInterval("policy.g0Ceiling", policy.g0Ceiling, true),
+  };
 }
 
 /**
@@ -170,7 +165,7 @@ export function refreshTag(live: LiveTagInput, freshG0: number, instant: Date, p
  * set by calibration.ts, from the one predicate that also chooses the
  * number; nothing here decides it.
  */
-interface Provenance {
+export interface Provenance {
   policyVersion: string;
   calibrationVersion: string;
   weightSource: WeightSource;

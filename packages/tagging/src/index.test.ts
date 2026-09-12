@@ -14,6 +14,7 @@ import type {
   LiveTagInput,
   MeasuredChannel,
   Policy,
+  Provenance,
   Reading,
   ReadingResult,
   SurpriseVerdict,
@@ -39,7 +40,8 @@ const RUNTIME_SURFACE = [
   // reading.ts
   "CONTINUOUS_CHANNELS", "CATEGORICAL_CHANNELS", "ASPECT_SHAPES", "shapePattern", "readObservation",
   // policy.ts
-  "POLICY_V0", "requireMinObservations", "assertPolicy", "scaleFloorFor",
+  "POLICY_V0", "requirePositive", "requireNonNegative", "requireUnitInterval", "requireScaleFloor",
+  "requireMinObservations", "assertPolicy", "scaleFloorFor",
   // calibration.ts
   "MEASURED_CHANNELS", "precisionAtEvenPrior", "CALIBRATION_V0", "assertCalibration",
   "channelWeightWithSource", "channelWeight",
@@ -64,7 +66,7 @@ interface TypeSurface {
   baseline: [BaselineState, ClipRule];
   timescales: [Timescale, TimescalePairs];
   threshold: [SurpriseVerdict];
-  tag: [LiveTagInput, TagRefresh, TagDecision, ReadingResult, AspectContext, TaggingInput, TaggingResult];
+  tag: [LiveTagInput, TagRefresh, TagDecision, Provenance, ReadingResult, AspectContext, TaggingInput, TaggingResult];
 }
 
 describe("the public surface", () => {

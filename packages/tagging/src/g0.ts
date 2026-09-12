@@ -1,24 +1,16 @@
-import { requireMinObservations, type Policy } from "./policy.js";
+import { requireMinObservations, requirePositive, type Policy } from "./policy.js";
 
-// This module takes requireMinObservations and a type from policy.ts, which
-// itself takes only a type from reading.ts, and nothing from any other module
-// of the package, so no cycle is possible. tag.ts takes calibrateG0 and
-// uncertaintyOf from here as values, and nothing here reaches back.
+// This module takes two predicates and a type from policy.ts, which takes
+// values from reading.ts and nothing from any other module of the package,
+// so no cycle is possible. tag.ts takes calibrateG0 and uncertaintyOf from
+// here as values, and nothing here reaches back.
 
 // The two policy fields this module reads are checked where they are read,
-// under the wording assertPolicy gives them, so a refusal reads identically
-// whether the pipeline's entry or the arithmetic itself notices. A zero
-// minimum count divides zero by zero at count zero, and is refused by
-// requireMinObservations, the one predicate for it, in policy.ts; a zero
-// scale divides zero by zero at surprise zero, and is refused here. Both
-// would leave as a NaN, and no NaN leaves this package.
-function requireSurpriseScale(policy: Policy): number {
-  const tau = policy.surpriseScale;
-  if (!(tau > 0) || !Number.isFinite(tau)) {
-    throw new RangeError(`policy.surpriseScale must be a positive finite number, got ${tau}`);
-  }
-  return tau;
-}
+// by the predicates assertPolicy itself applies, so a refusal reads
+// identically whether the pipeline's entry or the arithmetic notices. A
+// zero minimum count divides zero by zero at count zero; a zero scale
+// divides zero by zero at surprise zero. Both would leave as a NaN, and no
+// NaN leaves this package.
 
 /**
  * How little history stands behind a baseline, as a number in (0, 1]: one
@@ -65,7 +57,7 @@ export function calibrateG0(surprise: number, uncertainty: number, weight: numbe
     throw new RangeError(`uncertainty must lie in [0, 1], got ${uncertainty}`);
   }
   if (!(weight > 0 && weight <= 1)) throw new RangeError(`weight must lie in (0, 1], got ${weight}`);
-  const tau = requireSurpriseScale(policy);
+  const tau = requirePositive("policy.surpriseScale", policy.surpriseScale);
   const evidence = 1 - Math.exp(-Math.abs(surprise) / tau);
   return weight * (1 - uncertainty) * evidence;
 }

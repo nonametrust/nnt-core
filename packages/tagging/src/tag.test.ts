@@ -632,9 +632,9 @@ describe("the entry", () => {
   // reads it, so the entry check is the only one and its message is pinned.
   it("refuses a policy or a calibration that names nothing", () => {
     expect(() => tagOne({ observation: addressChange, policy: { ...policy, version: "" } }))
-      .toThrow(/^policy\.version must not be empty$/);
+      .toThrow(/^policy\.version must not be blank$/);
     expect(() => tagOne({ observation: addressChange, calibration: { ...calibration, version: "" } }))
-      .toThrow(/^calibration\.version must not be empty$/);
+      .toThrow(/^calibration\.version must not be blank$/);
   });
 
   it("names the versions it was given, not the shipped ones", () => {
@@ -774,9 +774,9 @@ describe("tagObservation's entry and routing", () => {
     expect(() => tagObservation({ namespaceId: ns, observation: unreadable, at, contexts: new Map(), policy, calibration }))
       .toThrow(/^cluster_proximity payload cannot be read/);
     expect(() => tagObservation({ namespaceId: ns, observation: unreadable, at, contexts: new Map(), policy: { ...policy, version: "" }, calibration }))
-      .toThrow(/^policy\.version must not be empty$/);
+      .toThrow(/^policy\.version must not be blank$/);
     expect(() => tagObservation({ namespaceId: ns, observation: unreadable, at, contexts: new Map(), policy, calibration: { ...calibration, version: "" } }))
-      .toThrow(/^calibration\.version must not be empty$/);
+      .toThrow(/^calibration\.version must not be blank$/);
     expect(() => tagObservation({ namespaceId: ns, observation: unreadable, at: new Date("no"), contexts: new Map(), policy, calibration }))
       .toThrow(/^at must be a valid date$/);
   });

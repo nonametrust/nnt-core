@@ -103,8 +103,8 @@ describe("surpriseOf", () => {
   // quotient check still green. Each refusal is matched on its own cause, so
   // the test cannot pass on a later check firing for a different reason.
   it("refuses what robustScale refuses, naming the same cause", () => {
-    refuses(() => surpriseOf(101, withSpread(100, 0), Number.POSITIVE_INFINITY), /^scale floor must be positive and finite/);
-    refuses(() => surpriseOf(101, withSpread(100, 0), 0), /^scale floor must be positive and finite/);
+    refuses(() => surpriseOf(101, withSpread(100, 0), Number.POSITIVE_INFINITY), /^scale floor must be a positive finite number/);
+    refuses(() => surpriseOf(101, withSpread(100, 0), 0), /^scale floor must be a positive finite number/);
     refuses(() => surpriseOf(101, withSpread(100, -1), 0.05), /^baseline madEst must be non-negative/);
     refuses(() => surpriseOf(101, { ...withSpread(100, 2), medianEst: 90 }, 0.05), /has location 90 apart from mean 100/);
   });

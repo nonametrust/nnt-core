@@ -244,7 +244,7 @@ describe("judgeSurprise, beyond the brief", () => {
     for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
       expect(() => judgeSurprise(value, s, "volume", floor, policy)).toThrow(`observation must be finite, got ${value}`);
     }
-    expect(() => judgeSurprise(1, s, "volume", 0, policy)).toThrow("scale floor must be positive and finite, got 0");
+    expect(() => judgeSurprise(1, s, "volume", 0, policy)).toThrow("scale floor must be a positive finite number, got 0");
   });
 
   // The gate is closed at the threshold: a magnitude exactly equal to it
@@ -309,8 +309,8 @@ describe("the fleet prior, beyond the brief", () => {
 
   it("refuses a noise, a prior or a count it cannot shrink, each under its own message", () => {
     for (const bad of [-0.1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(() => shrinkNoise(bad, 10, 0.5, policy)).toThrow(`noise must be non-negative and finite, got ${bad}`);
-      expect(() => shrinkNoise(0.1, 10, bad, policy)).toThrow(`prior must be non-negative and finite, got ${bad}`);
+      expect(() => shrinkNoise(bad, 10, 0.5, policy)).toThrow(`noise must be a non-negative finite number, got ${bad}`);
+      expect(() => shrinkNoise(0.1, 10, bad, policy)).toThrow(`prior must be a non-negative finite number, got ${bad}`);
     }
     for (const count of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
       expect(() => shrinkNoise(0.1, count, 0.5, policy)).toThrow(`count must be a non-negative integer, got ${count}`);
@@ -335,7 +335,7 @@ describe("the fleet prior, beyond the brief", () => {
 describe("tagThreshold, beyond the brief", () => {
   it("refuses under the noise's own message, so the NaN case is not another guard's refusal", () => {
     for (const bad of [-0.1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(() => tagThreshold(bad, policy)).toThrow(`noise must be non-negative and finite, got ${bad}`);
+      expect(() => tagThreshold(bad, policy)).toThrow(`noise must be a non-negative finite number, got ${bad}`);
     }
   });
 

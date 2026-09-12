@@ -1,4 +1,8 @@
-import type { ContinuousChannel } from "./reading.js";
+import { ASPECT_SHAPES, CONTINUOUS_CHANNELS, shapePattern, type ContinuousChannel } from "./reading.js";
+
+// This module takes values from reading.ts, which takes only from schema, and
+// nothing from any other module of the package; every other module may take
+// values from here without a cycle.
 
 /**
  * What the study does not speak to. The backtest measured whether evidence
@@ -92,21 +96,77 @@ export const POLICY_V0: Policy = {
   unmeasuredChannelWeight: 0.6227,
 };
 
-function positive(name: string, value: number): void {
+// The three validity predicates of the package, written once. assertPolicy
+// applies them to every policy field below; g0.ts, threshold.ts and tag.ts
+// apply the same ones to the fields they read, because each is public and
+// reachable without passing through assertPolicy; scale.ts, timescales.ts,
+// baseline.ts and calibration.ts apply them to arguments of their own. One
+// predicate cannot drift from itself, and one phrasing per predicate is
+// what lets a test hold two callers to the same message. The label is the
+// full name a reader will look for, `policy.surpriseScale` or `scale floor`.
+
+/** Refused unless positive and finite. Returns the value for the caller to use. */
+export function requirePositive(label: string, value: number): number {
   if (!(value > 0) || !Number.isFinite(value)) {
-    throw new RangeError(`policy.${name} must be a positive finite number, got ${value}`);
+    throw new RangeError(`${label} must be a positive finite number, got ${value}`);
   }
+  return value;
 }
 
-function nonNegative(name: string, value: number): void {
+/** Refused unless non-negative and finite. Returns the value for the caller to use. */
+export function requireNonNegative(label: string, value: number): number {
   if (!(value >= 0) || !Number.isFinite(value)) {
-    throw new RangeError(`policy.${name} must be a non-negative finite number, got ${value}`);
+    throw new RangeError(`${label} must be a non-negative finite number, got ${value}`);
   }
+  return value;
 }
 
-function unit(name: string, value: number, closedAtOne: boolean): void {
+/** Refused unless in (0, 1) or, when closedAtOne, (0, 1]. Returns the value. */
+export function requireUnitInterval(label: string, value: number, closedAtOne: boolean): number {
   const ok = value > 0 && (closedAtOne ? value <= 1 : value < 1);
-  if (!ok) throw new RangeError(`policy.${name} must lie in (0, ${closedAtOne ? "1]" : "1)"}, got ${value}`);
+  if (!ok) throw new RangeError(`${label} must lie in (0, ${closedAtOne ? "1]" : "1)"}, got ${value}`);
+  return value;
+}
+
+/**
+ * The scale floor as a caller hands it to robustScale or to the divergence,
+ * which is scaleFloorFor's answer on every honest path and a bare number on
+ * a dishonest one. Written here once, next to the function that yields it,
+ * rather than restated in scale.ts and timescales.ts with nothing holding
+ * the two restatements equal.
+ */
+export function requireScaleFloor(floor: number): number {
+  return requirePositive("scale floor", floor);
+}
+
+const positive = (name: string, value: number): number => requirePositive(`policy.${name}`, value);
+const nonNegative = (name: string, value: number): number => requireNonNegative(`policy.${name}`, value);
+const unit = (name: string, value: number, closedAtOne: boolean): number => requireUnitInterval(`policy.${name}`, value, closedAtOne);
+
+/**
+ * The keys of scaleFloor.byAspect, held to the aspect grammar. A key is
+ * `channel/aspect`; the channel must be continuous, since a categorical
+ * channel has no scale to floor, and the aspect must match one of the
+ * shapes reading.ts declares for that channel. Without this a typo'd key,
+ * `volume/ammount/USDC/in`, would validate and then never be looked up,
+ * and every reading it was meant for would take the channel floor at
+ * twenty times the intended value with nothing to say so.
+ *
+ * What the grammar does not hold, stated here rather than discovered: a
+ * braced field admits any non-empty run, so `volume/amount/USDC/inn`
+ * passes as a direction of `inn`. The pattern is a shape check and not a
+ * vocabulary check; provenance.test.ts pins the shipped keys to readings
+ * real observations produce, which is the check for the two that exist.
+ */
+function requireAspectKey(key: string): void {
+  const slash = key.indexOf("/");
+  const channel = slash < 0 ? key : key.slice(0, slash);
+  const aspect = slash < 0 ? "" : key.slice(slash + 1);
+  const continuous = (CONTINUOUS_CHANNELS as readonly string[]).includes(channel);
+  const shaped = continuous && ASPECT_SHAPES[channel as ContinuousChannel].some((shape) => shapePattern(shape).test(aspect));
+  if (!shaped) {
+    throw new RangeError(`policy.scaleFloor.byAspect key ${key} is not channel/aspect for an aspect a continuous channel produces`);
+  }
 }
 
 /**
@@ -133,15 +193,17 @@ export function requireMinObservations(policy: Policy): number {
  */
 export function assertPolicy(policy: Policy): void {
   // The version is what every result names and what the champion-challenger
-  // arrangement keys on; an empty one is a result that names nothing.
-  if (policy.version.length === 0) throw new RangeError("policy.version must not be empty");
+  // arrangement keys on; an empty or whitespace-only one is a result that
+  // names nothing.
+  if (policy.version.trim().length === 0) throw new RangeError("policy.version must not be blank");
   requireMinObservations(policy);
   positive("winsorMadMultiple", policy.winsorMadMultiple);
   for (const [channel, floor] of Object.entries(policy.scaleFloor.byChannel)) {
     positive(`scaleFloor.byChannel.${channel}`, floor);
   }
-  for (const [aspect, floor] of Object.entries(policy.scaleFloor.byAspect)) {
-    positive(`scaleFloor.byAspect.${aspect}`, floor);
+  for (const [key, floor] of Object.entries(policy.scaleFloor.byAspect)) {
+    requireAspectKey(key);
+    positive(`scaleFloor.byAspect.${key}`, floor);
   }
   unit("fastAlpha", policy.fastAlpha, false);
   unit("slowAlpha", policy.slowAlpha, false);

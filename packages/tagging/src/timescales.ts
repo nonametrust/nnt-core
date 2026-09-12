@@ -1,4 +1,5 @@
 import type { BaselineState } from "./baseline.js";
+import { requireScaleFloor } from "./policy.js";
 
 // This module takes only a type from baseline.ts, which is erased, while
 // baseline.ts takes timescaleStep and assertTimescales from here as values.
@@ -6,6 +7,7 @@ import type { BaselineState } from "./baseline.js";
 // baseline.ts here would make a module cycle, which works until a top-level
 // constant or a reordered export makes it fail at load time with an
 // undefined binding, and no test would see it because tests load in one order.
+// The one value taken is from policy.ts, which takes nothing from here.
 
 export interface Timescale {
   mean: number;
@@ -81,9 +83,7 @@ export function timescaleStep(prev: Timescale, x: number, alpha: number, first: 
  */
 export function timescaleDivergence(state: BaselineState, floor: number): number {
   assertTimescales(state);
-  if (!(floor > 0) || !Number.isFinite(floor)) {
-    throw new RangeError(`scale floor must be positive and finite, got ${floor}`);
-  }
+  requireScaleFloor(floor);
   const fast = Math.sqrt(state.fastM2) + floor;
   const slow = Math.sqrt(state.slowM2) + floor;
   const divergence = Math.log(fast / slow);

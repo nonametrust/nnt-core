@@ -1,5 +1,5 @@
 import type { Channel } from "@nonametrust/schema";
-import type { Policy } from "./policy.js";
+import { requirePositive, type Policy } from "./policy.js";
 
 /**
  * What the study measured. Every entry names the result it comes from, and
@@ -117,8 +117,9 @@ export const CALIBRATION_V0: Calibration = {
   halfLifeSource: "github.com/KayaKerem/nonametrust@ee49e18, results/distance_hist.csv, pooled median, vendored as fixtures/study/distance_hist.csv",
 };
 
+// A citation of nothing, and a citation of whitespace, are the same blank.
 function named(name: string, value: string): void {
-  if (value.length === 0) throw new RangeError(`calibration.${name} must not be empty`);
+  if (value.trim().length === 0) throw new RangeError(`calibration.${name} must not be blank`);
 }
 
 /**
@@ -138,9 +139,7 @@ export function assertCalibration(calibration: Calibration): void {
     named(`channelWeights.${c}.source`, entry.source);
   }
   named("halfLifeSource", calibration.halfLifeSource);
-  if (!(calibration.halfLifeMs > 0) || !Number.isFinite(calibration.halfLifeMs)) {
-    throw new RangeError(`calibration.halfLifeMs must be positive and finite, got ${calibration.halfLifeMs}`);
-  }
+  requirePositive("calibration.halfLifeMs", calibration.halfLifeMs);
 }
 
 function isMeasured(channel: Channel): channel is MeasuredChannel {

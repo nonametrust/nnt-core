@@ -233,7 +233,7 @@ describe("timescaleDivergence", () => {
     ["infinite", Number.POSITIVE_INFINITY],
     ["NaN", Number.NaN],
   ])("refuses a floor that is %s by name", (_what, bad) => {
-    expect(() => timescaleDivergence(steady, bad)).toThrow(/scale floor must be positive and finite/);
+    expect(() => timescaleDivergence(steady, bad)).toThrow(/^scale floor must be a positive finite number/);
   });
 
   // The divergence and assertBaseline judge the four timescale fields

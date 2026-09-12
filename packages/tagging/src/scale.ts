@@ -1,10 +1,5 @@
 import { assertBaseline, type BaselineState } from "./baseline.js";
-
-function requireFloor(floor: number): void {
-  if (!(floor > 0) || !Number.isFinite(floor)) {
-    throw new RangeError(`scale floor must be positive and finite, got ${floor}`);
-  }
-}
+import { requireScaleFloor } from "./policy.js";
 
 /**
  * The scale a deviation is measured in: the baseline's spread, or the floor
@@ -32,7 +27,7 @@ function requireFloor(floor: number): void {
  */
 export function robustScale(state: BaselineState, floor: number): number {
   assertBaseline(state);
-  requireFloor(floor);
+  requireScaleFloor(floor);
   return Math.max(state.madEst ?? 0, floor);
 }
 

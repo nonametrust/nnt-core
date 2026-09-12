@@ -1,27 +1,19 @@
 import { assertBaseline, type BaselineState } from "./baseline.js";
-import { requireMinObservations, type Policy } from "./policy.js";
+import { requireMinObservations, requireNonNegative, type Policy } from "./policy.js";
 import type { ContinuousChannel } from "./reading.js";
 import { robustScale, surpriseOf } from "./scale.js";
 
 // This module takes values from baseline.ts, scale.ts and policy.ts and a
 // type from reading.ts. Nothing here reaches back into any of them, and
-// policy.ts takes only a type from reading.ts, so no cycle is possible.
+// policy.ts takes values only from reading.ts, so no cycle is possible.
 // tag.ts takes judgeSurprise from here.
 
 // The three policy fields this module reads are checked where they are
-// read, under the wording assertPolicy gives them, so a refusal reads the
-// same whether the pipeline's entry or the arithmetic notices. A zero
-// minimum count makes the shrinkage divide zero by zero at count zero, and
-// is refused by requireMinObservations, the one predicate for it, in
-// policy.ts; a NaN base or coefficient leaves as a NaN threshold, and is
-// refused here. Neither leaves this package.
-function requireNonNegativeField(name: "thresholdBase" | "noiseCoefficient", policy: Policy): number {
-  const value = policy[name];
-  if (!(value >= 0) || !Number.isFinite(value)) {
-    throw new RangeError(`policy.${name} must be a non-negative finite number, got ${value}`);
-  }
-  return value;
-}
+// read, by the predicates assertPolicy itself applies, so a refusal reads
+// the same whether the pipeline's entry or the arithmetic notices. A zero
+// minimum count makes the shrinkage divide zero by zero at count zero; a
+// NaN base or coefficient leaves as a NaN threshold. Neither leaves this
+// package.
 
 /**
  * The namespace's observed noise on this aspect, as the robust scale over
@@ -57,8 +49,8 @@ export function noiseOf(state: BaselineState, floor: number): number {
  * v0 has no fleet to aggregate and a store read would cross the boundary.
  */
 export function shrinkNoise(noise: number, count: number, prior: number, policy: Policy): number {
-  if (!(noise >= 0) || !Number.isFinite(noise)) throw new RangeError(`noise must be non-negative and finite, got ${noise}`);
-  if (!(prior >= 0) || !Number.isFinite(prior)) throw new RangeError(`prior must be non-negative and finite, got ${prior}`);
+  requireNonNegative("noise", noise);
+  requireNonNegative("prior", prior);
   if (!Number.isSafeInteger(count) || count < 0) throw new RangeError(`count must be a non-negative integer, got ${count}`);
   const m = requireMinObservations(policy);
   const shrunk = (count * noise + m * prior) / (count + m);
@@ -83,9 +75,9 @@ export function shrinkNoise(noise: number, count: number, prior: number, policy:
  * produce.
  */
 export function tagThreshold(noise: number, policy: Policy): number {
-  if (!(noise >= 0) || !Number.isFinite(noise)) throw new RangeError(`noise must be non-negative and finite, got ${noise}`);
-  const base = requireNonNegativeField("thresholdBase", policy);
-  const coefficient = requireNonNegativeField("noiseCoefficient", policy);
+  requireNonNegative("noise", noise);
+  const base = requireNonNegative("policy.thresholdBase", policy.thresholdBase);
+  const coefficient = requireNonNegative("policy.noiseCoefficient", policy.noiseCoefficient);
   const threshold = base * (1 + coefficient * noise);
   if (!Number.isFinite(threshold)) {
     throw new RangeError(`threshold of ${base} raised by ${coefficient} times a noise of ${noise} does not fit a double`);

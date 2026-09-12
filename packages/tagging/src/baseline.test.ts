@@ -157,9 +157,9 @@ describe("winsorize", () => {
   });
 
   it("refuses a scale that is not positive, and a value that is not finite", () => {
-    expect(() => winsorize(1, 0, { multiple: 3, scale: 0 })).toThrow(RangeError);
-    expect(() => winsorize(1, 0, { multiple: 3, scale: Number.NaN })).toThrow(RangeError);
-    expect(() => winsorize(Number.POSITIVE_INFINITY, 0, { multiple: 3, scale: 1 })).toThrow(RangeError);
+    expect(() => winsorize(1, 0, { multiple: 3, scale: 0 })).toThrow("scale must be a positive finite number, got 0");
+    expect(() => winsorize(1, 0, { multiple: 3, scale: Number.NaN })).toThrow("scale must be a positive finite number, got NaN");
+    expect(() => winsorize(Number.POSITIVE_INFINITY, 0, { multiple: 3, scale: 1 })).toThrow("observation must be finite, got Infinity");
   });
 
   // A NaN observation is the case a guard written as `x === Infinity`
@@ -171,9 +171,9 @@ describe("winsorize", () => {
   });
 
   it("refuses a multiple that is not positive and finite, since the band would have no width or no edge", () => {
-    expect(() => winsorize(1, 0, { multiple: 0, scale: 1 })).toThrow(RangeError);
-    expect(() => winsorize(1, 0, { multiple: -3, scale: 1 })).toThrow(RangeError);
-    expect(() => winsorize(1, 0, { multiple: Number.POSITIVE_INFINITY, scale: 1 })).toThrow(RangeError);
+    expect(() => winsorize(1, 0, { multiple: 0, scale: 1 })).toThrow("multiple must be a positive finite number, got 0");
+    expect(() => winsorize(1, 0, { multiple: -3, scale: 1 })).toThrow("multiple must be a positive finite number, got -3");
+    expect(() => winsorize(1, 0, { multiple: Number.POSITIVE_INFINITY, scale: 1 })).toThrow("multiple must be a positive finite number, got Infinity");
   });
 
   // Each factor finite, their product not: the band would have no edge and

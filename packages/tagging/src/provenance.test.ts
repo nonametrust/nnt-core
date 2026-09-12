@@ -11,7 +11,7 @@ import {
   precisionAtEvenPrior,
 } from "./calibration.js";
 import { POLICY_V0, assertPolicy, scaleFloorFor } from "./policy.js";
-import { CONTINUOUS_CHANNELS } from "./reading.js";
+import { CONTINUOUS_CHANNELS, readObservation } from "./reading.js";
 
 const DAY = 24 * 60 * 60 * 1000;
 const study = fileURLToPath(new URL("../fixtures/study/", import.meta.url));
@@ -142,6 +142,23 @@ describe("calibration against the study", () => {
     expect(() => assertCalibration(withVolume({ signal: "" }))).toThrow(RangeError);
     expect(() => assertCalibration(withVolume({ source: "" }))).toThrow(RangeError);
   });
+
+  // The earlier finding asked for empty and got empty. A version of three
+  // spaces names nothing either, and would be written into every result
+  // and every audit entry as the version that produced it.
+  it("refuses a whitespace-only version, signal or source under the same message as an empty one", () => {
+    const withVolume = (over: Partial<(typeof CALIBRATION_V0.channelWeights)["volume"]>) => ({
+      ...CALIBRATION_V0,
+      channelWeights: { ...CALIBRATION_V0.channelWeights, volume: { ...CALIBRATION_V0.channelWeights.volume, ...over } },
+    });
+    for (const blank of ["", " ", "   ", "\t\n"]) {
+      expect(() => assertCalibration({ ...CALIBRATION_V0, version: blank })).toThrow(/^calibration\.version must not be blank$/);
+      expect(() => assertCalibration({ ...CALIBRATION_V0, halfLifeSource: blank })).toThrow(/^calibration\.halfLifeSource must not be blank$/);
+      expect(() => assertCalibration(withVolume({ signal: blank }))).toThrow(/^calibration\.channelWeights\.volume\.signal must not be blank$/);
+      expect(() => assertCalibration(withVolume({ source: blank }))).toThrow(/^calibration\.channelWeights\.volume\.source must not be blank$/);
+    }
+    expect(() => assertCalibration({ ...CALIBRATION_V0, version: " v " })).not.toThrow();
+  });
 });
 
 describe("channelWeight", () => {
@@ -249,5 +266,70 @@ describe("policy", () => {
 
   it("has a fleet prior for every continuous channel and for no other", () => {
     expect(Object.keys(POLICY_V0.fleetPrior).sort()).toEqual([...CONTINUOUS_CHANNELS].sort());
+  });
+
+  it("refuses a whitespace-only version under the same message as an empty one", () => {
+    for (const blank of ["", " ", "   ", "\t\n"]) {
+      expect(() => assertPolicy({ ...POLICY_V0, version: blank })).toThrow(/^policy\.version must not be blank$/);
+    }
+    expect(() => assertPolicy({ ...POLICY_V0, version: " v " })).not.toThrow();
+  });
+
+  // A byAspect key that no reading can produce would validate and never be
+  // looked up, and every reading it was meant for would fall through to
+  // the channel floor, twenty times the intended value here, with nothing
+  // to say so. The keys are held to the aspect grammar reading.ts declares.
+  describe("scaleFloor.byAspect keys are held to the aspect grammar", () => {
+    const withKey = (key: string) => ({
+      ...POLICY_V0,
+      scaleFloor: { ...POLICY_V0.scaleFloor, byAspect: { ...POLICY_V0.scaleFloor.byAspect, [key]: 0.05 } },
+    });
+    const refused = (key: string) =>
+      expect(() => assertPolicy(withKey(key)), key)
+        .toThrow(`policy.scaleFloor.byAspect key ${key} is not channel/aspect for an aspect a continuous channel produces`);
+
+    it("refuses a typo'd quantity, a missing unit field, a bare channel and a key with no channel", () => {
+      refused("volume/ammount/USDC/in");
+      refused("volume/amount/USDC");
+      refused("volume");
+      refused("amount/USDC/in");
+      refused("price/quoted");
+      refused("latency/latency");
+      refused("cluster_proximity/dust");
+    });
+
+    it("refuses a key on a categorical channel, which has no scale to floor", () => {
+      refused("content/field/memo");
+      refused("address_integrity/transition");
+      refused("protocol/event/trustline_created");
+    });
+
+    it("admits every aspect the four continuous channels declare", () => {
+      for (const key of ["volume/amount/XLM/out", "price/quoted/XLM", "latency/latencyMs", "cluster_proximity/hops", "cluster_proximity/amount"]) {
+        expect(() => assertPolicy(withKey(key)), key).not.toThrow();
+      }
+    });
+
+    // The grammar is a shape check and not a vocabulary check: a braced
+    // field admits any run, so a direction of `inn` passes it. Stated as a
+    // test so the limit is on record, and closed for the two shipped keys
+    // by the pin below, which is the check the grammar cannot make.
+    it("does not hold a braced field to its vocabulary, which is the grammar's stated limit", () => {
+      expect(() => assertPolicy(withKey("volume/amount/USDC/inn"))).not.toThrow();
+    });
+
+    it("pins each shipped key to a reading a real observation produces", () => {
+      const base = {
+        schemaVersion: "0.1.0",
+        namespace: { kind: "endpoint", id: "https://data.example/x402" },
+        evidenceKind: "event", observedAt: "2026-09-12T08:14:00.000Z",
+        source: { producer: "x402-gateway", producerVersion: "0.1.0", ref: "req:pin", fetchedAt: "2026-09-12T08:14:00.000Z" },
+      } as const;
+      const payment = { ...base, channel: "volume", kind: "payment", payload: { amount: "0.2500000", assetCode: "USDC", direction: "in" } } as const;
+      const quote = { ...base, channel: "price", kind: "quote", payload: { quoted: "0.25", unit: "USDC" } } as const;
+      const produced = [payment, quote].flatMap((o) => readObservation(o).map((r) => `${r.channel}/${r.aspect}`)).sort();
+      expect(produced).toEqual(Object.keys(POLICY_V0.scaleFloor.byAspect).sort());
+      for (const key of produced) expect(POLICY_V0.scaleFloor.byAspect[key]).toBe(0.05);
+    });
   });
 });
