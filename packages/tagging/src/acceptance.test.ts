@@ -270,10 +270,17 @@ describe("criterion 2: a repeated deviation refreshes rather than stacks", () =>
     const decayed = decayedAt({ ...opened, refreshCount: 0, saturationState: "open" }, refreshed.taggedAt, calibration.halfLifeMs);
     // Eight hours of decay leave the opened strength below the fresh g0, so
     // the maximum is the fresh g0 here; tag.test.ts holds the other operand.
-    // The revert is an event, a second deviation, so it earns the increment;
-    // criterion 4 below holds that a state persisting does not.
+    // No increment: the increment is earned by a threshold crossing, and
+    // address integrity is a categorical channel with no threshold to
+    // cross, so the revert refreshes the instant and the count and leaves
+    // the strength at the weight times the base, 0.63872. The one crossing
+    // in this corpus is the day-twenty-one quote, and it opens a tag rather
+    // than refreshing one, so no decision here reads the increment at all;
+    // tag.test.ts holds the crossing refresh at the maximum plus 0.05.
     expect(decayed).toBeLessThan(opened.g0);
-    expect(refreshed.g0).toBeCloseTo(Math.max(decayed, opened.g0) + policy.refreshIncrement, 12);
+    expect(refreshed.g0).toBe(Math.max(decayed, opened.g0));
+    expect(refreshed.g0).toBe(opened.g0);
+    expect(refreshed.g0).toBeCloseTo(calibration.channelWeights.address_integrity.weight * policy.categoricalBase, 12);
     expect(refreshed.g0).toBeLessThan(decayed + opened.g0);
   });
 
@@ -478,9 +485,10 @@ describe("together", () => {
 
 describe("under another policy and calibration version", () => {
   // The same corpus under values no shipped field shares: a minimum count of
-  // seven and an increment of 0.07. What must move, moves; what must not,
-  // does not; and every result names the versions that produced it rather
-  // than the ones it was written against.
+  // seven and an increment of 0.07. What must move, moves, which is the cold
+  // boundary; what must not, does not, which is every refresh in a corpus
+  // whose one crossing opens a tag; and every result names the versions
+  // that produced it rather than the ones it was written against.
   const overridden: InForce = {
     policy: { ...policy, version: "policy-v0-acceptance-override", minObservations: 7, refreshIncrement: 0.07 },
     calibration: { ...calibration, version: "calibration-v0-acceptance-override" },
@@ -509,21 +517,35 @@ describe("under another policy and calibration version", () => {
     }
   });
 
-  it("refreshes by the overridden increment", () => {
-    const [opened, refreshed] = otherMade.filter((m) => m.channel === "address_integrity").map((m) => m.decision);
-    if (opened?.kind !== "new" || refreshed?.kind !== "refresh") throw new Error("expected new then refresh");
-    expect(refreshed.g0).toBeCloseTo(opened.g0 + 0.07, 12);
+  it("does not read the increment into the address refresh, which nothing gated", () => {
+    // Under the event-versus-state rule this refresh moved by the overridden
+    // 0.07; under the crossing rule a categorical refresh reads no increment,
+    // so it is the shipped decision to the field, versions aside. Asserted
+    // as a whole-decision equality so a refresh that started reading the
+    // increment, or counting or stamping differently, fails here.
+    const shipped = made.filter((m) => m.channel === "address_integrity").map((m) => m.decision);
+    const address = otherMade.filter((m) => m.channel === "address_integrity").map((m) => m.decision);
+    expect(address.map((d) => d.kind)).toEqual(["new", "refresh"]);
+    for (const [i, d] of address.entries()) {
+      const { policyVersion: _p, calibrationVersion: _c, ...rest } = d;
+      const { policyVersion: _sp, calibrationVersion: _sc, ...shippedRest } = shipped[i]!;
+      expect(rest, `decision ${i + 1}`).toEqual(shippedRest);
+    }
+    expect(address[1]!.g0).toBe(address[0]!.g0);
   });
 
   it("does not read the increment into the trustline walk, which is the same morning for morning under 0.07 as under 0.05", () => {
-    // The state path adds no increment, so the override that moves the
-    // address refresh by 0.07 leaves the trustline walk untouched: twenty-
-    // two mornings equal to the shipped run's in g0, instant, count and
-    // saturation state. Asserted as a whole-decision equality rather than
-    // on g0 alone, so a state refresh that started counting or stamping
-    // differently would fail here too. Under this ruling no state
-    // saturates on its own; saturation by genuine repeats is held in
-    // tag.test.ts on a hundred event refreshes.
+    // A categorical refresh adds no increment, so the override leaves the
+    // trustline walk untouched: twenty-two mornings equal to the shipped
+    // run's in g0, instant, count and saturation state. Asserted as a
+    // whole-decision equality rather than on g0 alone, so a refresh that
+    // started counting or stamping differently would fail here too. Under
+    // this ruling no categorical tag saturates by repetition; saturation by
+    // crossings is held in tag.test.ts on a hundred crossing refreshes.
+    // Stated as a limit of this corpus: its one crossing is the day
+    // twenty-one quote, which opens a tag, so no decision in the corpus
+    // reads the increment under either policy, and the increment's positive
+    // case lives in tag.test.ts.
     const shipped = made.filter((m) => m.channel === "protocol").map((m) => m.decision);
     const walk = otherMade.filter((m) => m.channel === "protocol").map((m) => m.decision);
     expect(walk).toHaveLength(22);

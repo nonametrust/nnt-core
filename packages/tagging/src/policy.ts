@@ -63,7 +63,12 @@ export interface Policy {
    * times this base, and this base is the one place the spec left open.
    */
   readonly categoricalBase: number;
-  /** A refresh adds this on top of the maximum, and it is what saturates. */
+  /**
+   * A refresh earned by a threshold crossing adds this on top of the
+   * maximum, and it is what saturates. A refresh nothing gated adds nothing,
+   * and every refresh on a categorical channel is one of those, since a
+   * categorical channel has no threshold.
+   */
   readonly refreshIncrement: number;
   /** Where the increment saturates; a refreshed g0 never exceeds it. */
   readonly g0Ceiling: number;

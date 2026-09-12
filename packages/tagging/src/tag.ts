@@ -1,4 +1,4 @@
-import { datedAt, type Channel, type EvidenceKind, type Observation } from "@nonametrust/schema";
+import { datedAt, type Channel, type Observation } from "@nonametrust/schema";
 import { assertBaseline, emptyBaseline, updateBaseline, type BaselineState } from "./baseline.js";
 import { assertCalibration, channelWeightWithSource, type Calibration, type WeightSource } from "./calibration.js";
 import { calibrateG0, uncertaintyOf } from "./g0.js";
@@ -102,25 +102,52 @@ function requireRefreshFields(policy: Policy): { increment: number; ceiling: num
  * could honestly run produces more, so a larger one is a mismatched pair or
  * a bad computation, and it is refused rather than folded in.
  *
- * Whether the increment is added depends on what refreshed the tag, and
- * this is a ruling rather than a reading of section 10. A state that is
- * still holding tomorrow is one fact, not one fact per morning: the
- * increment exists so that a genuinely repeated deviation accumulates, and
- * a trustline that is simply still open is not a new deviation. Composed
- * with section 4, where a state refreshes every time it is seen, an
- * increment on persistence would let every standing condition climb from
- * its channel weight to the ceiling in a few weeks and sit there in front
- * of every future decision, which is a brief nobody reads. So a state
- * refresh takes the maximum of the decayed strength and the fresh g0, moves
- * the instant and the count, and adds nothing. The maximum is what stops it
- * fading, which is the defect M1's own refresh had while a condition still
- * held; the fresh g0 is what the condition is worth today, and the decayed
- * strength is what an earlier repeat earned, and the tag keeps the larger.
- * An event refresh is a repeat and keeps the increment.
+ * Whether the increment is added is one rule, and it is a ruling rather
+ * than a reading of section 10: the increment is earned by a deviation
+ * that crossed a threshold, not by an observation arriving. The caller
+ * says whether this one crossed, and the composing function below is where
+ * that is known. On a continuous channel the thing that crossed is the
+ * surprise against the noise-adaptive threshold, and a refresh reached
+ * that way earns the increment. On a categorical channel nothing crosses,
+ * because nothing gates a categorical channel: no baseline, no threshold,
+ * no minimum count. So a categorical refresh takes the maximum of the
+ * decayed strength and the fresh g0, moves the instant and the count, and
+ * adds nothing. The maximum is what stops a standing condition fading,
+ * which is the defect M1's own refresh had while a condition still held;
+ * the fresh g0 is what the deviation is worth today, the decayed strength
+ * is what an earlier crossing earned, and the tag keeps the larger.
+ *
+ * This rule replaces an earlier one drawn on the wrong axis. The earlier
+ * ruling took the increment off the state path and kept it on the event
+ * path, on the reasoning that a state still holding tomorrow is one fact
+ * and not one fact per morning, and that an increment on persistence would
+ * let every standing condition climb from its channel weight to the
+ * ceiling and sit in front of every future decision, which is a brief
+ * nobody reads. The reasoning was right and the axis was wrong, because it
+ * applies verbatim to a routine recurring event on an ungated channel:
+ * fourteen ordinary daily memos on the content channel, every one an
+ * event, climbed from 0.4982 through 0.7663 to the ceiling, after which
+ * every later memo revived the saturated tag to full strength. What marks
+ * a repeat worth crediting is that a gate said so, and event-versus-state
+ * is not a gate. A state on a categorical channel crosses nothing, so the
+ * state path behaves exactly as it did under the earlier ruling.
+ *
+ * A limit, stated here rather than discovered: no categorical tag is ever
+ * raised past its weight times the categorical base by repetition, however
+ * often the deviation recurs, until a later milestone gives categorical
+ * channels a threshold. The specification has no rule for what makes a
+ * categorical observation a deviation, and inventing one here would be
+ * inventing a number with no source. Under this limit the day-twelve
+ * address change and its revert are one tag at 0.6387 and not 0.6887.
+ *
+ * The argument is refused unless it is a boolean, because this function is
+ * public and its fifth argument used to be the evidence kind: a caller
+ * still passing "event" would otherwise be truthy and earn an increment
+ * nothing gated.
  */
-export function refreshTag(live: LiveTagInput, freshG0: number, instant: Date, policy: Policy, evidence: EvidenceKind): TagRefresh {
-  if (evidence !== "event" && evidence !== "state") {
-    throw new RangeError(`evidence must be "event" or "state", got ${String(evidence)}`);
+export function refreshTag(live: LiveTagInput, freshG0: number, instant: Date, policy: Policy, crossed: boolean): TagRefresh {
+  if (typeof crossed !== "boolean") {
+    throw new RangeError(`crossed must be true or false, got ${String(crossed)}`);
   }
   requireStrength("live tag g0", live.g0);
   requireStrength("decayed strength", live.decayedStrength);
@@ -147,7 +174,7 @@ export function refreshTag(live: LiveTagInput, freshG0: number, instant: Date, p
     return { g0: live.g0, taggedAt, refreshCount, saturationState: "saturated" };
   }
   const held = Math.max(live.decayedStrength, freshG0);
-  const raised = evidence === "event" ? held + increment : held;
+  const raised = crossed ? held + increment : held;
   const g0 = Math.min(raised, ceiling);
   return {
     g0,
@@ -246,8 +273,11 @@ function instantOf(o: Observation, at: Date): Date {
 /**
  * The decision for one g0: a new tag when the pair has none, a refresh of
  * the live one otherwise. Either way the instant is the observation's own,
- * as instantOf gives it, and the refresh is told whether an event or a
- * state produced it, which is what decides whether the increment applies.
+ * as instantOf gives it, and the refresh is told whether the observation
+ * crossed a threshold, which is what decides whether the increment
+ * applies. Only tagReading knows that, and it says so per path: the
+ * verdict's own answer on a continuous channel, and false on a categorical
+ * one, where there is no threshold to cross.
  *
  * A consequence worth stating. For an event that instant is the event's,
  * and the call's instant may be later: minutes on a synchronous path, days
@@ -272,7 +302,7 @@ function instantOf(o: Observation, at: Date): Date {
  * refreshTag, which is public, trusts the instant it is handed the way it
  * trusts the live tag's own.
  */
-function decide(input: ReadingInput, g0: number, surprise: number | null, weightSource: WeightSource): TagDecision {
+function decide(input: ReadingInput, g0: number, surprise: number | null, weightSource: WeightSource, crossed: boolean): TagDecision {
   const { reading } = input;
   const instant = instantOf(input.observation, input.at);
   const provenance: Provenance = {
@@ -283,7 +313,7 @@ function decide(input: ReadingInput, g0: number, surprise: number | null, weight
   if (input.liveTag === null) {
     return { kind: "new", channel: reading.channel, aspect: reading.aspect, g0, taggedAt: instant, surprise, ...provenance };
   }
-  const refreshed = refreshTag(input.liveTag, g0, instant, input.policy, input.observation.evidenceKind);
+  const refreshed = refreshTag(input.liveTag, g0, instant, input.policy, crossed);
   return { kind: "refresh", channel: reading.channel, aspect: reading.aspect, ...refreshed, surprise, ...provenance };
 }
 
@@ -312,9 +342,23 @@ function decide(input: ReadingInput, g0: number, surprise: number | null, weight
  *
  * On a categorical channel there is no baseline, no surprise and no
  * threshold: the observation tags from day one at its channel weight times
- * the policy's categorical base, and a live tag on the pair is refreshed.
- * A baseline offered for a categorical reading is a key the caller got
- * wrong, and is refused rather than dropped.
+ * the policy's categorical base, and a live tag on the pair is refreshed
+ * in instant and count but never raised, because nothing crossed and the
+ * increment is earned by a crossing. That is a stated limit and not a
+ * property: a categorical deviation that genuinely recurs is worth no more
+ * on its hundredth day than on its first, until a later milestone gives
+ * categorical channels a threshold of their own. None is invented here;
+ * the specification has no rule for what makes a categorical observation
+ * a deviation. A baseline offered for a categorical reading is a key the
+ * caller got wrong, and is refused rather than dropped.
+ *
+ * The schema does not couple the evidence kind to the channel, so a state
+ * carrying a continuous payload is valid and takes the continuous path:
+ * judged, folded into the baseline, and able to cross. Under the one rule
+ * a crossing state earns the increment like any crossing, and the tag test
+ * pins that consequence so nobody discovers it. No producer emits one
+ * today, and whether a standing condition should enter a continuous
+ * baseline at all is a schema question this milestone does not answer.
  *
  * The timescale divergence is computed on the next state and carried out.
  * Nothing below reads it into the decision; tag.test.ts holds that two
@@ -331,7 +375,7 @@ function tagReading(input: ReadingInput): ReadingResult {
       );
     }
     const g0 = weight * policy.categoricalBase;
-    return { reading, baseline: null, verdict: null, timescaleDivergence: null, decision: decide(input, g0, null, source) };
+    return { reading, baseline: null, verdict: null, timescaleDivergence: null, decision: decide(input, g0, null, source, false) };
   }
 
   if (input.baseline !== null) {
@@ -353,7 +397,7 @@ function tagReading(input: ReadingInput): ReadingResult {
   let decision: TagDecision | null = null;
   if (verdict.kind === "measured" && verdict.crosses) {
     const g0 = calibrateG0(verdict.surprise, uncertaintyOf(before.count, policy), weight, policy);
-    decision = decide(input, g0, verdict.surprise, source);
+    decision = decide(input, g0, verdict.surprise, source, verdict.crosses);
   }
   return { reading, baseline: next, verdict, timescaleDivergence: divergence, decision };
 }

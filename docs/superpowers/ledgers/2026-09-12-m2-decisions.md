@@ -1,8 +1,9 @@
 # M2 decision ledger
 
-**Milestone:** M2, the tagging arithmetic. Branch `m2-tagging`, 28 commits from
+**Milestone:** M2, the tagging arithmetic. Branch `m2-tagging`, 31 commits from
 `bc49359`, in the worktree `.worktrees/m2-tagging`, awaiting merge after the
-whole-branch review and its fix wave.
+whole-branch review, its fix wave, and the two HIGH fixes from the independent
+review that followed.
 **Spec:** `docs/superpowers/specs/2026-09-08-m2-tagging-design.md`
 **Plan:** `docs/superpowers/plans/2026-09-08-m2-tagging.md`
 **Code:** `packages/tagging`, one new root gate under `gates/`.
@@ -266,6 +267,14 @@ walk is flat where it used to climb. If M3 finds a standing condition that
 should climb, this is the ruling to reopen, and the increment on a state is the
 one line to change.
 
+*Corrected the same day.* The reasoning above was right and the axis was
+wrong: it applies verbatim to a routine recurring event on an ungated channel,
+and an independent review showed fourteen ordinary memos pumping a content tag
+to the ceiling under this very ruling. The split is no longer on the evidence
+kind at all; see "Two HIGH findings after the fix wave" below for the rule
+that replaced it. The paragraph stands as written because the ledger is a
+record of what was decided, not of what turned out right.
+
 **Stale events keep their increments** (fix wave, ruled when the implementer
 correctly refused to change it without asking). A stale event is a real
 deviation, and a backfill should reach the state live observation would have
@@ -327,6 +336,103 @@ instant the package touches is the caller's `at` or a tag's own `taggedAt`.
 What the clamp cannot undo is a tag already written with a future instant;
 none has been, since no engine has written a tag from this package yet, and M3
 should know that the forward-only rule would preserve one if it ever were.
+
+**The increment is earned by a deviation that crossed a threshold, not by an
+observation arriving** (HIGH 2, mine, and a correction of the state ruling
+above, which the review caught with my own words). A categorical reading tags
+unconditionally at its channel weight times the categorical base, and the
+composing function passed the observation's evidence kind to the refresh, so
+an event on a categorical channel earned the increment on every single
+observation. Reproduced: fourteen ordinary daily memos on the content channel
+climbed from 0.4982 through 0.7663 to the ceiling, after which every later
+memo revived the saturated tag to full strength. Continuous channels are
+protected by the threshold verdict; categorical channels have no threshold, no
+minimum count, and nothing else in the path. The docstring I wrote for the
+state ruling said that an increment on persistence would let every standing
+condition climb from its channel weight to the ceiling and sit in front of
+every future decision, a brief nobody reads. That argument applies verbatim to
+a routine recurring event on an ungated channel. I drew the line on
+event-versus-state when the line that matters is gated-versus-ungated.
+
+Ruling: one rule instead of two. On a continuous channel the thing that
+crossed is the surprise against the noise-adaptive threshold, and a refresh
+reached that way earns the increment. On a categorical channel nothing
+crosses, because nothing gates a categorical channel, so no increment is
+earned. `refreshTag`'s fifth argument is now `crossed: boolean` rather than
+the evidence kind, refused unless it is a boolean, because a caller still
+passing `"event"` would be truthy and earn an increment nothing gated. The
+composing function is where the answer is known and it says so per path: the
+verdict's own `crosses` on the continuous path, `false` on the categorical.
+Every categorical state behaves exactly as under the earlier ruling. No gate
+was invented for categorical channels: the specification has no rule for what
+makes a categorical observation a deviation, and inventing one would be
+inventing numbers with no source. So the stated limit, in the code and here:
+a categorical tag opens at its weight times the base and is refreshed in
+instant and count but never raised, until a later milestone gives categorical
+channels a threshold of their own. That is carried into M3 below.
+
+The corpus moved, and by the arithmetic rather than by a loosened assertion:
+the day-twelve address refresh is 0.63872 where it was 0.68872, exactly the
+weight times the base, asserted with `toBe` against the maximum and with the
+decayed operand asserted strictly below it; under the 0.07 override it is
+0.63872 where it was 0.70872, asserted as whole-decision equality with the
+shipped run. The trustline walk is unchanged at 0.51968, the day-twenty-one
+price decision is unchanged, the decision summary is unchanged, and all six
+criteria hold together. One loss to state plainly: no decision in the corpus
+now reads the increment under either policy, because the corpus's one
+crossing, the day-twenty-one quote, opens a tag rather than refreshing one.
+The increment's positive case is held in `tag.test.ts`, on the continuous
+refresh at 0.6949 and on a hundred crossing refreshes to saturation, and the
+corpus test says so where the override used to move a number. Four mutants
+were run against the new tests and each died: the increment always added,
+eleven failures; the boolean refusal removed, one; the categorical path
+claiming a crossing, seven; the continuous path denying one, two.
+
+Cost if wrong: a categorical deviation that genuinely recurs, an address that
+flips every day, is worth no more on its hundredth day than on its first;
+the instant and the count move, and only the count records the repetition. If
+M3 or the shadow evaluation finds that too weak, the fix is a categorical
+threshold with a source, not the increment back on the ungated path.
+
+**The premise "a state never crosses either" was false, and the one rule
+was kept anyway** (mine, made while applying HIGH 2, and the place this
+correction can be wrong again). The brief for the fix said the state path
+must keep behaving as it does because a state never crosses. The schema does
+not couple the evidence kind to the channel: a state carrying a volume payload
+is valid, reads as continuous, is judged against the baseline and folded into
+it, and can cross. Under the one rule such a state earns the increment on
+every morning it still crosses. Measured: a standing five-hundred-unit state
+against twenty quarter-unit payments crosses on sixty of sixty mornings and
+saturates on the forty-eighth; under the earlier ruling it never saturated but
+reached 0.83 by the fortieth morning regardless, because the fresh g0 grows
+as the count rises and the maximum keeps it. No producer emits such a state,
+no fixture holds one, and the corpus has none. I did not pass `false` for
+every state at the seam, because that would be the event-versus-state axis
+back through a side door, and the real question, whether a standing condition
+belongs in a continuous baseline at all when every morning's re-evaluation
+enters the history it is judged against, needs a ruling rather than a
+boolean. A test pins the consequence so nobody discovers it, and it is
+carried below. Cost if wrong: a producer that emits standing conditions on a
+continuous channel pumps a pair to the ceiling in seven weeks, on a path that
+today no producer uses.
+
+**Six findings from the same review, carried and not fixed.** A channel weight
+is the precision of one specific study signal but is applied to any
+observation on that channel, and the categorical path derives no signal
+determination from the payload, so a memo that is not a memo anomaly is
+scored at the memo-anomaly weight; this is the one of the six that changes
+what a number means rather than what an edge case does, and M3's plan should
+treat the categorical weights as an upper bound on what the study measured
+until the payload is read into a signal. The other five: the decision is
+keyed on the channel and the aspect while the store's tag row is keyed on the
+channel alone, already carried above as the missing column; the band-endpoint
+guard checks the half-width but not the endpoints, so an exported function's
+documented bound can be infinite on inputs the pipeline cannot produce; a zero
+threshold base is admissible and would open a zero-strength tag on every
+observation; a state refresh can flip a tag to saturated without adding
+anything, when the decayed operand and the fresh g0 already sit at the
+ceiling; and the two constant singletons are not frozen, so a shallow spread
+shares their nested objects.
 
 ---
 
@@ -490,9 +596,11 @@ whole root suite. At `fd19e5a`, the end of Task 11: build and typecheck green,
 schema 105, tagging 306, store 243, root gates 7, 661 tests, nothing skipped,
 including the store's lock and audit-chain suites. At `f6d0c0b`, the end of the
 fix wave: schema 105, tagging 322, store 243, root gates 7, **677 tests, exit
-0, nothing skipped.** The branch is green end to end, and the claim is now
-checked rather than stated. M3 writes to the database and cannot carry the
-same constraint; its worktree needs the cluster from Task 1.
+0, nothing skipped.** After the two HIGH fixes: build and typecheck clean,
+schema 105, tagging 329, store 243, root gates 7, **684 tests, exit 0, nothing
+skipped.** The branch is green end to end, and the claim is now checked
+rather than stated. M3 writes to the database and cannot carry the same
+constraint; its worktree needs the cluster from Task 1.
 
 ---
 
@@ -531,7 +639,32 @@ can be found.
   written, and M3 must not read `refresh_count` as a count of repeated
   deviations for a state. If that column is to mean repeats, the state path
   stops incrementing it, and that is a one-line decision M3 should make on
-  purpose.
+  purpose. After the crossing rule the same holds one level up: the count
+  moves on every categorical refresh, gated or not, so for any categorical
+  tag `refresh_count` counts observations and not earned repeats.
+- **Categorical channels have no threshold, so no categorical tag is ever
+  raised by repetition.** The increment is earned by a crossing and nothing
+  gates a categorical channel, so an address that flips daily is worth its
+  weight times the base on day one hundred as on day one. The specification
+  has no rule for what makes a categorical observation a deviation; the
+  milestone that gives categorical channels one must give it a source, and
+  until then the categorical base is the whole of a categorical tag's
+  strength. This is the stated limit of the second HIGH fix.
+- **A state on a continuous channel is schema-valid, crosses, and earns the
+  increment while it crosses.** No producer emits one. Whether a standing
+  condition belongs in a continuous baseline at all, when each morning's
+  re-evaluation enters the history it is judged against, is a question for
+  the schema card or M3, and the answer decides whether `tagReading` should
+  refuse such a state, skip the baseline update, or leave it. Pinned by a
+  test in `tag.test.ts`; measured at saturation on the forty-eighth morning.
+- **A categorical weight is the precision of one study signal applied to
+  every observation on its channel.** The categorical path derives no signal
+  from the payload, so any memo scores at the memo-anomaly weight and any
+  protocol state at the atypical-trustline weight. M3 should treat the
+  categorical weights as an upper bound on what the study measured until a
+  reading of the payload into a signal exists, and the shadow evaluation
+  should expect the categorical channels to over-tag for that reason before
+  any other.
 - **Two aspects wait on a schema tightening that cannot happen before the
   indexer's delivery.** The volume payload needs an issuer beside the asset
   code, and the cluster-proximity payload needs an asset at all. Both are on
