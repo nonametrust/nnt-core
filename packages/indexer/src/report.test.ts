@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { renderReport } from "./report.js";
 import { Counters } from "./counters.js";
-import { randomAccount } from "./testing/keys.js";
+import { randomAccount, randomContract } from "./testing/keys.js";
 
 const meta = {
   network: "stellar:pubnet" as const, fromIso: "2026-08-01T00:00:00.000Z", toIso: "2026-08-31T00:00:00.000Z",
@@ -30,11 +30,15 @@ describe("renderReport", () => {
     expect(JSON.parse(json)).toMatchObject({ meta, counts: { requests: 40 } });
   });
 
-  it("never renders an account id, even when a drop sample carried one", () => {
+  it("never renders an account or contract id, even when a drop sample carried one", () => {
     const c = new Counters();
     c.drop("invalid_account_id", `op:1 ${randomAccount()}`);
+    // The other side of a Soroban transfer is routinely a contract, so a
+    // `not_followed` sample carries a C-shaped id and it must be scrubbed
+    // exactly like an account id (root gate, same shapes).
+    c.drop("not_followed", `op:2#0 ${randomContract()}`);
     const { markdown, json } = renderReport(c.snapshot(), meta);
-    const shape = /G[A-Z2-7]{55}|M[A-Z2-7]{68}/;
+    const shape = /G[A-Z2-7]{55}|M[A-Z2-7]{68}|C[A-Z2-7]{55}/;
     expect(markdown).not.toMatch(shape);
     expect(json).not.toMatch(shape);
   });

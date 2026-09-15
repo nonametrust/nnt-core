@@ -22,13 +22,17 @@ export interface ReportMeta {
   compare?: { previous: string; onlyInPrevious: number; onlyInCurrent: number };
 }
 
-const STRKEY = /G[A-Z2-7]{55}|M[A-Z2-7]{68}|g[a-z2-7]{55}|m[a-z2-7]{68}/g;
+// The shapes of the root gate, contract ids included: the other side of a
+// Soroban transfer is routinely a contract, and a contract id names a real
+// counterparty of a real wallet just as an account id does.
+const STRKEY = /G[A-Z2-7]{55}|M[A-Z2-7]{68}|C[A-Z2-7]{55}|g[a-z2-7]{55}|m[a-z2-7]{68}|c[a-z2-7]{55}/g;
 
 /**
  * The delivery table of the developer brief (section 7), filled from the
- * counters. Aggregates only: every string that reaches the output is scrubbed
- * of the account-id shape, so a drop sample that carried an id cannot leak
- * it into a file that someone then commits or pastes.
+ * counters. Aggregates only: every string that reaches the output is
+ * scrubbed of the account, muxed and contract id shapes, so a drop sample
+ * that carried an id cannot leak it into a file that someone then commits
+ * or pastes.
  */
 export function renderReport(snapshot: CountersSnapshot, meta: ReportMeta): { json: string; markdown: string } {
   const scrubbed: CountersSnapshot = {

@@ -330,9 +330,11 @@ cost in the report. The cache is gitignored.
 
 ## 8. Privacy: the address gate and this package
 
-`gates/no-stellar-address.test.ts` refuses any G+55 or M+68 base32 shape in a
-tracked file. Consequences for the indexer, each decided rather than
-discovered:
+`gates/no-stellar-address.test.ts` refuses any G+55, M+68 or C+55 base32
+shape in a tracked file: a contract id names the other side of a Soroban
+transfer, which is a real counterparty of a real wallet, so it is covered by
+the same rule as an account id (and the report scrubs the same three shapes).
+Consequences for the indexer, each decided rather than discovered:
 
 - The followed-account list, the state file, the cache and the NDJSON output
   are untracked (`packages/indexer/{accounts.txt,state*.json,cache/,out/}` in
