@@ -5,14 +5,15 @@ import type { AccountId, LedgerRange } from "./source/types.js";
 
 /**
  * The indexer ends in shadow mode, so it resumes rather than restarts. The
- * state holds, per followed account, the last cursor consumed on each
- * stream and the ranges completed. It is written after every page (run.ts),
- * so a kill loses at most one page and never leaves a gap. It names accounts
- * and is therefore gitignored.
+ * state holds, per followed account, the ranges completed; it is written
+ * after each completed account (run.ts), never mid-account. A kill therefore
+ * loses no completed account and leaves no gap, at the price of re-reading
+ * the interrupted account from the range start on resume: its already
+ * written lines are recognised by key, not by cursor (`resumeKeys` in
+ * run.ts), which is why no per-stream cursor is stored. The file names
+ * accounts and is therefore gitignored.
  */
 export interface AccountState {
-  paymentsCursor?: string;
-  effectsCursor?: string;
   completed: LedgerRange[];
 }
 

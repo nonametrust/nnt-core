@@ -87,6 +87,31 @@ describe("backfill", () => {
     expect([...(await readKeys(join(dir, "c1.ndjson")))].sort()).toEqual([...(await readKeys(join(dir, "c3.ndjson")))].sort());
   });
 
+  it("recognises the lines an interrupted run already wrote instead of appending them again", async () => {
+    const s = scenario();
+    const path = join(dir, "resume.ndjson");
+    const first = await run(path, s, { network: "stellar:pubnet", accounts: {} });
+    const linesAfterFirst = readFileSync(path, "utf8").trim().split("\n").length;
+    expect(linesAfterFirst).toBe(first.result.written);
+    // The interrupted account is re-read from the range start with a fresh
+    // state, exactly as a resumed run does it; only the keys already in the
+    // file stop the lines from being written twice.
+    const counters = new Counters();
+    const sink = openSink(path, { append: true });
+    const second = await backfill({
+      reader: fakeReader(s.payments, s.effects), accounts: [s.g], range: { from: 10, to: 12 },
+      ctx: { network: "stellar:pubnet", producerVersion: "0.1.0" }, sink,
+      state: { network: "stellar:pubnet", accounts: {} }, saveState: async () => {},
+      counters, clock: fixedClock(new Date("2026-09-08T00:00:00.000Z")),
+      resumeKeys: await readKeys(path),
+    });
+    await sink.close();
+    expect(readFileSync(path, "utf8").trim().split("\n").length).toBe(linesAfterFirst);
+    expect(counters.get("resumed_line_skipped")).toBe(linesAfterFirst);
+    expect(second.written).toBe(0);
+    expect(counters.drops()["duplicate_key_in_run"]).toBeUndefined();
+  });
+
   it("holds the identity read == written + dropped per stream", async () => {
     const s = scenario();
     const { counters } = await run(join(dir, "d.ndjson"), s, { network: "stellar:pubnet", accounts: {} });

@@ -296,20 +296,30 @@ The acceptance test is the contract's: process the same range twice, collect
 
 ## 7. State and resumability
 
-`state.json`, one per network, holds for each followed account the last
-paging token consumed for payments and for effects, and the list of
-completed ranges. A run:
+`state.json`, one per network, holds for each followed account the list of
+completed ranges, and nothing else: no paging cursor is stored, because none
+would be written at a point where it could be trusted. A run:
 
 1. reads the state, skips accounts whose range is complete,
-2. resumes each account from its stored cursor,
-3. writes the state after every page, so a kill between pages loses at most
-   one page of work and never produces a gap,
-4. marks the range complete for the account when the source returns a
-   record past `range.to` or an empty page.
+2. reads each remaining account from the range start,
+3. marks the range complete for the account when the source stops (a record
+   past `range.to`, or an exhausted page sequence) and writes the state
+   then, after the completed account and never mid-account,
+4. so a kill loses no completed account and leaves no gap; what it costs is
+   that the interrupted account is re-read from the range start on the next
+   run.
 
-Re-running a completed range with `--force` ignores the state; this is how the
-two-run comparison is produced. The state file contains account ids and is
-therefore gitignored (section 8).
+Re-reading is safe because the output file is the second half of the
+mechanism. Without `--force` the sink appends to the interrupted run's file
+and the run first loads that file's `idempotencyKey` set (`readKeys`, the
+helper `--compare` uses) as `resumeKeys`. An observation whose key is already
+in the file is not written again and is counted `resumed_line_skipped` — a
+plain counter, not a drop: the observation exists, in the file. A key this
+process produces twice is still `duplicate_key_in_run`, which is a defect.
+
+Re-running a completed range with `--force` ignores the state and truncates
+the file; this is how the two-run comparison is produced. The state file
+contains account ids and is therefore gitignored (section 8).
 
 Horizon's raw responses are cached on disk under `cache/` keyed by the
 request URL's sha256, written only on HTTP 200, as the backtest did: the

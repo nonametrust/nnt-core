@@ -31,6 +31,17 @@ export interface BackfillOptions {
    * naming and reporting.
    */
   rangeFor?: (account: AccountId) => LedgerRange;
+  /**
+   * The keys already present in the output file, when the sink appends to an
+   * interrupted run's file. State is saved per completed account, so the
+   * account a kill interrupted is re-read from the range start; every
+   * observation of it that the previous run already wrote would otherwise be
+   * written a second time. An observation whose key is in this set is not
+   * written and is counted `resumed_line_skipped`: it is not a drop, the
+   * line exists in the file. `duplicate_key_in_run` keeps its own meaning,
+   * a key this process produced twice.
+   */
+  resumeKeys?: ReadonlySet<string>;
 }
 
 export interface BackfillResult {
@@ -38,6 +49,8 @@ export interface BackfillResult {
   accountsDone: number;
   accountsSkipped: number;
   duplicateKeys: number;
+  /** Observations this run produced that the file already held (`resumeKeys`). */
+  resumedSkipped: number;
 }
 
 /**
@@ -57,7 +70,7 @@ export interface BackfillResult {
  */
 export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
   const keys = new KeySet();
-  const result: BackfillResult = { written: 0, accountsDone: 0, accountsSkipped: 0, duplicateKeys: 0 };
+  const result: BackfillResult = { written: 0, accountsDone: 0, accountsSkipped: 0, duplicateKeys: 0, resumedSkipped: 0 };
   o.counters.inc("accounts_followed", o.accounts.length);
 
   for (const account of o.accounts) {
@@ -81,6 +94,11 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
       if (!keys.add(v.value.idempotencyKey)) {
         o.counters.drop("duplicate_key_in_run", r.observation.source.ref);
         result.duplicateKeys++;
+        return;
+      }
+      if (o.resumeKeys?.has(v.value.idempotencyKey)) {
+        o.counters.inc("resumed_line_skipped");
+        result.resumedSkipped++;
         return;
       }
       o.sink.write(v.value);

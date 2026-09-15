@@ -14,7 +14,7 @@ describe("state", () => {
     const s = await loadState(path, "stellar:pubnet");
     expect(s).toEqual({ network: "stellar:pubnet", accounts: {} });
     const g = randomAccount();
-    s.accounts[g] = { paymentsCursor: "123", completed: [] };
+    s.accounts[g] = { completed: [{ from: 10, to: 20 }] };
     await saveState(path, s);
     expect(await loadState(path, "stellar:pubnet")).toEqual(s);
   });

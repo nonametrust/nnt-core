@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
@@ -199,6 +200,11 @@ async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<num
 
   const name = follow ? `${net.replace(":", "-")}_follow_${range.from}_${range.to}.ndjson` : outputFileName(net, fromIso, toIso);
   const outPath = join(values["out-dir"], name);
+  // Without --force the run appends to whatever an interrupted run left in
+  // the file, and re-reads the interrupted account from the range start
+  // (state is saved per completed account). The keys already in the file are
+  // what stops those lines from being written a second time.
+  const resumeKeys = !values.force && existsSync(outPath) ? await readKeys(outPath) : undefined;
   const sink = openSink(outPath, { append: !values.force });
   const result = await backfill({
     reader,
@@ -212,6 +218,7 @@ async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<num
     clock: systemClock,
     force: values.force,
     ...(rangeFor ? { rangeFor } : {}),
+    ...(resumeKeys ? { resumeKeys } : {}),
   });
   const { lines } = await sink.close();
 
@@ -236,7 +243,7 @@ async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<num
   await writeFile(outPath.replace(/\.ndjson$/, ".counters.json"), json, "utf8");
   await writeFile(outPath.replace(/\.ndjson$/, ".report.md"), markdown, "utf8");
   io.log(
-    `${lines} observations -> ${outPath}; ${result.accountsDone} accounts done, ${result.accountsSkipped} skipped; ${counters.totalDrops()} drops; ${counters.get("requests")} requests`,
+    `${lines} observations -> ${outPath}; ${result.accountsDone} accounts done, ${result.accountsSkipped} skipped, ${result.resumedSkipped} already in the file; ${counters.totalDrops()} drops; ${counters.get("requests")} requests`,
   );
   if (result.duplicateKeys > 0) {
     io.error(`${result.duplicateKeys} duplicate keys inside one run: a contract question, not a warning`);
