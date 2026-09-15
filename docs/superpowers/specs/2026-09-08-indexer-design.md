@@ -127,7 +127,7 @@ packages/indexer/
     accounts.ts              the deterministic selection rule for followed accounts
     run.ts                   backfill and follow: read -> map -> validate -> dedupe -> sink
   test/
-    horizon-fixtures.ts      builders that make Horizon-shaped records from run-time keys
+    horizon/fixtures.ts      builders that make Horizon-shaped records from run-time keys (inside horizon/, so the record types never leave it)
 ```
 
 Dependencies: `@nonametrust/schema` (workspace), `@stellar/stellar-sdk`
@@ -327,7 +327,7 @@ discovered:
   `.gitignore`). The **selection rule** is tracked (section 9), so anyone
   regenerates the same list.
 - Test fixtures are built at run time from `Keypair.random()`; no Horizon
-  response is ever recorded into the repository. `test/horizon-fixtures.ts`
+  response is ever recorded into the repository. `horizon/fixtures.ts`
   is the one builder, so a future recording tool has one place to be refused.
 - The known-issuer list stores digests, not addresses (section 5.4).
 - The report (`report.json`, `report.md`) carries counts only, never an
@@ -370,7 +370,7 @@ delivery metric.
 | `accounts_followed`, `days_covered` | the coverage row: >= 100 x 30 |
 | `records_read` per type | payment-family records and effects the reader returned |
 | `observations_written` per channel | lines in the NDJSON |
-| `dropped` per reason | `validation_failed`, `memo_non_text`, `memo_empty`, `trustline_updated_skipped`, `claimable_creator_unresolved`, `sac_multi_asset`, `invalid_account_id`, `self_payment`, `unsupported_type` and any reason section 5 names; a drop without a reason is a bug and the run fails |
+| `dropped` per reason | `validation_failed`, `memo_non_text`, `memo_empty`, `trustline_updated_skipped`, `claimable_creator_unresolved`, `sac_non_transfer`, `not_followed`, `invalid_account_id`, `muxed_base_address`, `unsupported_type`, `duplicate_key_in_run` and any reason section 5 names; a drop without a reason is a bug and the run fails |
 | `coverage_ratio` | `observations_written.volume / records_read.payment_family` |
 | `muxed_records`, `muxed_resolved` | records with a muxed side, and how many were mapped with `muxedId` set |
 | `requests`, `cache_hits`, `pages_truncated`, `retention_refusals` | request cost, and the traps' footprint |
@@ -451,9 +451,10 @@ its own.
 
 - If Kerem rules for `op:` references on memos, `content.ts` changes and the
   first-run keys are discarded; nothing else moves.
-- If the 100-account run shows `sac_multi_asset` above a handful, the summing
-  rule is wrong for real traffic and the schema needs a per-asset key part,
-  which is a contract change and is raised, not worked around.
+- Settled 2026-09-15: the summing rule is gone; each Soroban transfer entry
+  is its own observation with `op:<id>#<index>` (section 5.6). The 100-account
+  run reports how many invocations carried more than one movement for the
+  same account, as the measure of what the old rule would have lost.
 - If Horizon's public instance rate-limits below 0.8 per second in practice,
   the 100-account run takes longer than a day; the report says so and the
   limiter setting is a flag.

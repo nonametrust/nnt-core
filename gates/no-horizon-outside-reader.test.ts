@@ -14,7 +14,9 @@ import { describe, it, expect } from "vitest";
 // day Horizon's shape moves and two places need fixing instead of one.
 //
 // The rule, lexical over every tracked packages/indexer/src/**/*.ts file
-// outside packages/indexer/src/horizon/:
+// outside packages/indexer/src/horizon/ (lexical means a comment that spells
+// out an offending import line trips it too; that fails safe, and such a
+// comment has no reason to exist):
 //   - no import or re-export whose specifier contains "horizon/records" —
 //     the raw Horizon record types never leave horizon/, not even to the
 //     composition root;
