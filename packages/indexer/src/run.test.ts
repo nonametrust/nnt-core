@@ -98,7 +98,7 @@ describe("backfill", () => {
     expect((c.counts["observations_written.content"] ?? 0) + (c.drops["memo_non_text"] ?? 0)).toBe(2);
   });
 
-  it("merges two sac_transfer records of the same operation and asset into one volume observation", async () => {
+  it("writes a separate volume observation per sac_transfer record of the same operation, and does not count sac_transfers_merged", async () => {
     const g = randomAccount();
     const other = randomAccount();
     const issuer = randomAccount();
@@ -118,9 +118,9 @@ describe("backfill", () => {
       counters, clock: fixedClock(new Date("2026-09-08T00:00:00.000Z")),
     });
     await sink.close();
-    expect(result.written).toBe(1);
-    expect(counters.get("observations_written.volume")).toBe(1);
-    expect(counters.get("sac_transfers_merged")).toBe(1);
+    expect(result.written).toBe(2);
+    expect(counters.get("observations_written.volume")).toBe(2);
+    expect(counters.snapshot().counts["sac_transfers_merged"]).toBeUndefined();
   });
 
   it("maps a self-payment as one written volume observation, no drops, and counts it as a diagnostic", async () => {

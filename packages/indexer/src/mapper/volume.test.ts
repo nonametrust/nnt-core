@@ -91,55 +91,54 @@ describe("mapVolume", () => {
     expect(mapVolume([p], randomAccount(), ctx)[0]).toEqual({ ok: false, reason: "not_followed", ref: "op:214720397313" });
   });
 
-  it("sums several SAC transfers to one account in one invocation into one observation", () => {
+  it("maps two SAC transfers of the same asset to one account as two observations, one ref per index", () => {
     const g = randomAccount();
     const issuer = randomAccount();
     const a = payment({ kind: "sac_transfer", to: g, amount: "1.5000000", asset: { code: "KALE", issuer }, transferIndex: 0 });
     const b = payment({ kind: "sac_transfer", to: g, amount: "2.2500000", asset: { code: "KALE", issuer }, transferIndex: 1 });
     const rs = mapVolume([a, b], g, ctx);
-    expect(rs).toHaveLength(1);
-    const o = ok(rs[0]!);
-    expect(o.kind).toBe("sac_transfer");
-    expect(o.payload).toEqual({ amount: "3.7500000", assetCode: "KALE", direction: "in" });
+    expect(rs).toHaveLength(2);
+    const first = ok(rs[0]!);
+    const second = ok(rs[1]!);
+    expect(first.kind).toBe("sac_transfer");
+    expect(first.payload).toEqual({ amount: "1.5000000", assetCode: "KALE", direction: "in" });
+    expect(first.source.ref).toBe("op:214720397313#0");
+    expect(second.payload).toEqual({ amount: "2.2500000", assetCode: "KALE", direction: "in" });
+    expect(second.source.ref).toBe("op:214720397313#1");
   });
 
-  it("drops a second asset inside one invocation rather than inventing a key", () => {
-    const g = randomAccount();
-    const a = payment({ kind: "sac_transfer", to: g, amount: "1.0000000", asset: { code: "KALE", issuer: randomAccount() }, transferIndex: 0 });
-    const b = payment({ kind: "sac_transfer", to: g, amount: "2.0000000", asset: { code: "USDC", issuer: randomAccount() }, transferIndex: 1 });
-    const rs = mapVolume([a, b], g, ctx);
-    expect(rs.map((r) => r.ok)).toEqual([true, false]);
-    expect(rs[1]).toMatchObject({ ok: false, reason: "sac_multi_asset" });
-  });
-
-  it("resolves a swap through a contract to the in side, dropping the out side as bidirectional", () => {
+  it("maps a SAC transfer in and a SAC transfer out in one invocation as one in and one out, different refs", () => {
     const g = randomAccount();
     const a = payment({ kind: "sac_transfer", to: g, amount: "1.0000000", asset: { code: "KALE", issuer: randomAccount() }, transferIndex: 0 });
     const b = payment({ kind: "sac_transfer", from: g, amount: "2.0000000", asset: { code: "USDC", issuer: randomAccount() }, transferIndex: 1 });
     const rs = mapVolume([a, b], g, ctx);
     expect(rs).toHaveLength(2);
-    const o = ok(rs[0]!);
-    expect(o.payload).toMatchObject({ direction: "in", assetCode: "KALE" });
-    expect(rs[1]).toEqual({ ok: false, reason: "sac_bidirectional", ref: "op:214720397313" });
+    const first = ok(rs[0]!);
+    const second = ok(rs[1]!);
+    expect(first.payload).toMatchObject({ direction: "in", assetCode: "KALE" });
+    expect(first.source.ref).toBe("op:214720397313#0");
+    expect(second.payload).toMatchObject({ direction: "out", assetCode: "USDC" });
+    expect(second.source.ref).toBe("op:214720397313#1");
   });
 
-  it("sums same-asset ins and drops a differing-asset in per record", () => {
+  it("maps a SAC self-transfer as one in observation", () => {
     const g = randomAccount();
-    const issuer = randomAccount();
-    const a = payment({ kind: "sac_transfer", to: g, amount: "1.0000000", asset: { code: "KALE", issuer }, transferIndex: 0 });
-    const b = payment({ kind: "sac_transfer", to: g, amount: "2.0000000", asset: { code: "KALE", issuer }, transferIndex: 1 });
-    const c = payment({ kind: "sac_transfer", to: g, amount: "3.0000000", asset: { code: "USDC", issuer: randomAccount() }, transferIndex: 2 });
-    const rs = mapVolume([a, b, c], g, ctx);
-    expect(rs).toHaveLength(2);
-    expect(ok(rs[0]!).payload).toEqual({ amount: "3.0000000", assetCode: "KALE", direction: "in" });
-    expect(rs[1]).toMatchObject({ ok: false, reason: "sac_multi_asset" });
+    const p = payment({ kind: "sac_transfer", from: g, to: g, amount: "1.0000000", asset: { code: "KALE", issuer: randomAccount() }, transferIndex: 0 });
+    const rs = mapVolume([p], g, ctx);
+    expect(rs).toHaveLength(1);
+    expect(ok(rs[0]!).payload).toMatchObject({ direction: "in" });
   });
 
-  it("keeps seven decimals when summing", () => {
+  it("drops a SAC record the followed account is not a party to", () => {
+    const p = payment({ kind: "sac_transfer", amount: "1.0000000", asset: { code: "KALE", issuer: randomAccount() }, transferIndex: 0 });
+    const rs = mapVolume([p], randomAccount(), ctx);
+    expect(rs).toEqual([{ ok: false, reason: "not_followed", ref: "op:214720397313" }]);
+  });
+
+  it("drops a SAC record with no transferIndex as validation_failed against the operation ref", () => {
     const g = randomAccount();
-    const issuer = randomAccount();
-    const a = payment({ kind: "sac_transfer", to: g, amount: "0.0000001", asset: { code: "KALE", issuer }, transferIndex: 0 });
-    const b = payment({ kind: "sac_transfer", to: g, amount: "0.0000002", asset: { code: "KALE", issuer }, transferIndex: 1 });
-    expect((ok(mapVolume([a, b], g, ctx)[0]!).payload as { amount: string }).amount).toBe("0.0000003");
+    const p = payment({ kind: "sac_transfer", to: g, amount: "1.0000000", asset: { code: "KALE", issuer: randomAccount() } });
+    const rs = mapVolume([p], g, ctx);
+    expect(rs).toEqual([{ ok: false, reason: "validation_failed", ref: "op:214720397313" }]);
   });
 });

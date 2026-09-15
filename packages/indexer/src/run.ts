@@ -47,15 +47,13 @@ export interface BackfillResult {
  * kill loses at most one account's partial work and never leaves a gap.
  *
  * `mapVolume` groups payment-family records by operation id: for a Soroban
- * invocation, several transfers of the same asset to the followed account
- * collapse into one written observation (context.ts, mapper/volume.ts).
- * `sac_transfers_merged` counts the records that vanished into that sum, so
- * that the per-stream identity
- * records_read.payments == observations_written.volume + drops(volume) + sac_transfers_merged
- * still holds. `self_payments` is counted separately from the records
- * themselves (a self-payment maps to exactly one "in" observation and no
- * drop, so it already satisfies the identity on its own); it is a
- * diagnostic count, not a term of the identity.
+ * invocation, each transfer maps to its own observation, one per record
+ * (mapper/volume.ts). The per-stream identity is
+ * records_read.payments == observations_written.volume + drops(volume reasons).
+ * `self_payments` is counted separately from the records themselves (a
+ * self-payment maps to exactly one "in" observation and no drop, so it
+ * already satisfies the identity on its own); it is a diagnostic count, not
+ * a term of the identity.
  */
 export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
   const keys = new KeySet();
@@ -102,10 +100,6 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
       for (const r of results) emit(r);
       if (g.length === 1 && g[0]!.from === g[0]!.to) {
         o.counters.inc("self_payments");
-      }
-      const merged = g.length - results.length;
-      if (merged > 0) {
-        o.counters.inc("sac_transfers_merged", merged);
       }
     };
     for await (const p of o.reader.payments(account, range)) {

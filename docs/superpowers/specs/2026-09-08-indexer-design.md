@@ -184,7 +184,7 @@ bounded by `created_at`, with the cursor recorded per account.
 | `payment` | `kind: "payment"`; `amount`, `assetCode` (`"XLM"` for `native`, else `asset_code`); `direction: "in"` if the followed account is `to`, `"out"` if it is `from`. A self-payment is one namespace and one key, so one observation, `direction: "in"`, counted as `self_payment` (section 5.6) |
 | `path_payment_strict_send`, `path_payment_strict_receive` | `kind: "path_payment"`; receiver side uses `amount` and the destination asset, sender side uses `source_amount` and the source asset |
 | `create_account` | `kind: "create_account"`; `account` side `"in"`, `funder` side `"out"`, `starting_balance`, `"XLM"` |
-| `invoke_host_function` with `asset_balance_changes` | **Measured on 8 September 2026: Horizon's `/payments` now returns Soroban invocations that moved a Stellar asset through its asset contract**, with `asset_balance_changes[]` entries of type `transfer`, `mint`, `burn`, `clawback` carrying `from`, `to`, `amount`, asset. This is a fourth member of the payment family the brief did not list. `transfer` entries whose `from` or `to` is the followed account become one `volume` observation per (operation, namespace, direction) with `kind: "sac_transfer"`, `ref: "op:<id>"`; several transfers to one account in one invocation are summed (section 5.6). `mint`, `burn` and `clawback` entries are counted, not mapped, in v0 |
+| `invoke_host_function` with `asset_balance_changes` | **Measured on 8 September 2026: Horizon's `/payments` now returns Soroban invocations that moved a Stellar asset through its asset contract**, with `asset_balance_changes[]` entries of type `transfer`, `mint`, `burn`, `clawback` carrying `from`, `to`, `amount`, asset. This is a fourth member of the payment family the brief did not list. **Settled 2026-09-15: `ref` names a value movement, not an operation.** Each `transfer` entry is its own movement, mapped independently: an entry whose `to` is the followed account becomes one `volume` observation, `direction: "in"`; an entry whose `from` is the followed account (and `to` is not) becomes one `direction: "out"` observation; a self-transfer (`from === to ===` followed) becomes one `"in"` observation; an entry the followed account is not party to is a `not_followed` drop. `kind: "sac_transfer"`, `ref: "op:<id>#<transferIndex>"`, where `transferIndex` is the entry's position in `asset_balance_changes` — Horizon derives that position from the transaction meta's event order, which is immutable once the ledger closes and identical in any source reading the same meta, so it is a stable separator where a semantic one (asset plus direction) is not unique. A `transfer` entry with no `transferIndex` is a `validation_failed` drop against the operation's own ref, `op:<id>`. `mint`, `burn` and `clawback` entries are counted, not mapped, in v0 |
 | `account_merge` | Not returned by `/payments`; invisible, as the brief says. Counted from `/operations` only if the run enables `--merges`; off by default in v0 |
 
 `ref` is `op:<id>` (the Horizon operation id), `observedAt` is `created_at`,
@@ -258,15 +258,12 @@ Both are gated here.
 The key admits at most one observation per `(ref, channel, namespace)`
 (contract section 9). Two places would violate it:
 
-- A Soroban invocation carrying several `transfer` entries to the same
-  account. **Ruling:** the entries are summed into one `volume` observation
-  per (operation, namespace, direction), `kind: "sac_transfer"`, with
-  `payload.amount` the sum and the count recorded in counters as
-  `sac_transfers_merged`. Summing is a mapping choice, not a contract
-  change, and the operation id stays the ref. If a single invocation moves
-  two different assets to one account, the second asset is dropped with
-  reason `sac_multi_asset` and the case is reported; it is not invented
-  around.
+- A Soroban invocation carrying several `transfer` entries. **Ruling (settled
+  2026-09-15): `ref` names a value movement, not an operation.** Each
+  `transfer` entry is its own movement and gets its own observation, `kind:
+  "sac_transfer"`, `ref: "op:<id>#<transferIndex>"` — the entry's position in
+  the operation's `asset_balance_changes`, which is what makes the ref unique
+  per movement rather than per operation (section 5.2).
 - A self-payment (followed account is both `from` and `to`): one observation,
   `direction: "in"`, counted `self_payment`.
 
@@ -416,8 +413,8 @@ plants the violation, watches the test fail, and reverts.
    mirroring `volume`. Until then the indexer records the memo for every
    followed party of the transaction.
 3. **Soroban asset transfers.** `/payments` returns them; the brief's
-   "payment family is three types" is four on today's Horizon. Proposal:
-   `kind: "sac_transfer"`, summed per (operation, namespace, direction).
+   "payment family is three types" is four on today's Horizon. **Settled
+   2026-09-15: ref per movement, `op:<id>#<index>`.**
 4. **Account flags.** No field for which flag changed; the indexer records
    only that they changed, as the contract says.
 5. **Horizon end-of-life.** Issue #3.

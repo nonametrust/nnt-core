@@ -12,8 +12,6 @@ export const DROP_REASONS = [
   "trustline_updated_skipped",
   "effect_ignored",
   "claimable_creator_unresolved",
-  "sac_multi_asset",
-  "sac_bidirectional",
   "sac_non_transfer",
   "invalid_account_id",
   "muxed_base_address",
