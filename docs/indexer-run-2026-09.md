@@ -78,7 +78,7 @@ comes from one build. The counters below are that run's
 | Deduplication | same range run a second time with `--force --compare`: 0 keys only in the previous file, 0 only in the current, exit 0; the file itself holds 646,890 distinct keys |
 | Dropped records with reason | 3,676,280, every one with a reason (table below); no `duplicate_key_in_run`, no `claimable_creator_unresolved`, no `invalid_account_id` |
 | Coverage ratio | 420,356 volume observations from 420,474 payment-family records read: 0.9997; the 118 records that did not become observations are Soroban transfer entries between two contracts inside an invocation the followed wallet took part in (`not_followed`) |
-| Muxed share | 1 of 420,474 payment-family records carried a muxed side (`to_muxed_id`), and it was the counterparty's side, so no observation carries `muxedId`; 0 resolved |
+| Muxed share | 1 of 420,474 payment-family records carried a muxed side (`to_muxed_id`), and it was the counterparty's side: `muxed_followed` 0, `muxed_resolved` 0, so the criterion `muxed_resolved == muxed_followed` holds and no observation carries a `muxedId` |
 | Cost | 8,782 distinct Horizon pages for the 100 accounts, 87.8 per account, 0.0136 per observation; at Horizon's pace (1.25 s per request) about 3 h 03 min of request time; the live fetch was spread over four days by the stops in section 4a (the last live run: 1,452 requests, 2,610 s wall for 12 accounts) |
 
 Observations by channel and kind:
@@ -109,11 +109,33 @@ Drops by reason:
 | `not_followed` | 118 | Soroban transfer entries between two contract addresses in an invocation the followed wallet took part in |
 | `trustline_updated_skipped` | 36 | contract rule: `trustline_updated` yields nothing in v0 |
 | `memo_empty` | 15 | text memos of length zero |
+| `failed_transaction` | 0 | records of a transaction Horizon returned with `transaction_successful: false`; the reader refuses them before they reach a stream. The counter is absent from this run's file, so the count is zero |
 
-Identities that hold on the counters: payments 420,474 = volume 420,356 +
-`not_followed` 118; memos read 251,417 = content 220,668 + `memo_non_text`
-30,734 + `memo_empty` 15; effects read 5,902 = protocol 5,866 +
-`trustline_updated_skipped` 36. `retries` 1, `page_limit_reduced` 1.
+Identities that hold on the counters. They are structural, not a property of
+this particular run: for each of the three streams the run asserts
+`records_read.<stream> == written.<stream> + dropped.<stream>` at exit, and a
+stream that does not balance aborts the run with `IdentityError` and exit
+code 3 instead of producing a report (spec 13.3). Every record read into a
+stream therefore ends as a written observation or as a drop with a reason
+from the stream's closed list, and a resumed line — an observation the file
+already held — counts as written, because it exists.
+
+- **payments** 420,474 = 420,356 written + 118 dropped. The reasons that can
+  enter `dropped.payments`: `not_followed` (118 here), `invalid_account_id`,
+  `validation_failed`, `duplicate_key_in_run` (none here). `sac_non_transfer`
+  and `failed_transaction` are counted by the reader, before the record is
+  read into the payments stream, so they say what Horizon returned and the
+  indexer refused and sit outside this identity by construction.
+- **memos** 251,417 = 220,668 written + 30,749 dropped. The reasons that can
+  enter `dropped.memos`: `memo_non_text` (30,734), `memo_empty` (15),
+  `invalid_account_id`, `validation_failed`, `duplicate_key_in_run` (none).
+- **effects** 5,902 = 5,866 written + 36 dropped. The reasons that can enter
+  `dropped.effects`: `trustline_updated_skipped` (36),
+  `claimable_creator_unresolved`, `invalid_account_id`, `validation_failed`,
+  `duplicate_key_in_run` (none). `effect_ignored` is counted by the reader
+  before the effects stream, like `sac_non_transfer` above.
+
+`retries` 1, `page_limit_reduced` 1, `retention_refusals` 0.
 
 ## 4. Open points seen in the data
 
@@ -153,12 +175,17 @@ One line per open point of spec section 12, with what the run showed:
 - **A resume that truncated.** Resuming a range reopened the output file
   with the write flag and discarded the completed accounts' lines; a resume
   now appends and only `--force` rewrites.
-- **An interrupted account leaves its partial lines behind.** Resume appends
-  and re-processes the interrupted account from its start, so its first
-  partial lines stay in the file; the old-code file had three accounts
-  written twice (state is saved after an account's lines are flushed). The
-  remedy is the forced run that produced the delivered file, and the
-  key-set comparison that would have shown the duplicates.
+- **An interrupted account left its partial lines behind.** Resume appends
+  and re-processes the interrupted account from its start, and the run that
+  produced the numbers above wrote those first partial lines a second time:
+  the old-code file had three accounts written twice (state is saved after
+  an account's lines are flushed, never mid-account). The delivered file is
+  the forced run, which is why the duplicates are not in it, and the key-set
+  comparison is what would have shown them. The code no longer depends on
+  either: a resumed run loads the output file's key set before it starts and
+  skips an observation the file already holds, counting
+  `resumed_line_skipped`; `duplicate_key_in_run` keeps its meaning, a key
+  this process produced twice.
 - **The retry ladder as a flag.** `--max-retries` defaults to 8 on the CLI
   (about ten minutes of backoff) since a minute-long public-Horizon outage
   is ordinary.

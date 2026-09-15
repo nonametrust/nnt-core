@@ -25,8 +25,17 @@ it must parse as a number or the command exits 2 before making a request.
 the CLI; direct callers of `HorizonClient` still default to 5); it must
 parse as a number or the command exits 2 before making a request.
 
-`backfill` and `follow` resume from `state-*.json`; without `--force` the
-output file is appended, with `--force` it is rewritten.
+`backfill` and `follow` resume from `state-*.json`, which records completed
+ranges per account and nothing else: it is written after each completed
+account, so a kill leaves no gap and the interrupted account is re-read from
+the range start. Without `--force` the output file is appended and the run
+first loads its keys, so an observation the file already holds is not
+written again (`resumed_line_skipped`); with `--force` the file is rewritten.
+
+Exit codes: 0 success, 2 a usage error, 3 a stream whose records do not add
+up (`records_read` != written + dropped, which aborts the run), 1 anything
+else, including a key produced twice inside one run or a `--compare` that
+found differing key sets.
 
 ## What is measured
 

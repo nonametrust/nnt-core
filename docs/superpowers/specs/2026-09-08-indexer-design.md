@@ -228,7 +228,11 @@ memo; that is raised as an open point in section 12.
 
 `issuerKnown` is filled on every observation that carries an `assetCode`:
 `true` when the issuer is on the known-issuer list, `false` otherwise, never
-absent. The list lives in `mapper/issuers.ts`, short, with a comment naming
+absent. Native XLM has no issuer at all, and is `issuerKnown: true` by
+definition: the payload carries no `assetIssuer`, and the alternative,
+`false`, would read as "an issuer nobody recognises" and make the airdrop
+trap (which turns on `issuerKnown === false`) fire on the network's own
+asset. Gated in `mapper/protocol.test.ts`. The list lives in `mapper/issuers.ts`, short, with a comment naming
 each entry's source; issuer addresses are Stellar account ids, so **the list
 cannot contain them literally** (section 8). It holds `sha256(issuer)` hex
 digests instead, with the asset code and home domain beside each for a human
@@ -401,7 +405,7 @@ one observation per Soroban transfer entry, memos text-only).
 
 | Trap (measured in the backtest, confirmed against the docs) | Handling | Gate |
 |---|---|---|
-| History before the retention wall returns HTTP 410 | `RetentionBoundary` error naming the ledger; the run records `retention_refusals` and marks the account's range as `unreachable_before <ledger>`, never as empty | a stubbed 410 produces the error class and the counter, and no "empty range" completion |
+| History before the retention wall returns HTTP 410 | Not marked, refused. `HorizonReader.assertServed` compares the range against the served floor before any page is fetched and throws `RetentionBoundary` naming both ledgers, which aborts the run: the account's range is never marked complete, so nothing records an empty range where history was simply out of reach. The CLI's `resolveRange` bisects between the served floor and the latest ledger, so a backfill started from the CLI never asks below the floor in the first place. `retention_refusals` counts the 410 answers seen while paging, which is structurally zero unless the wall moves mid-run; a 410 while paging is final and propagates at once, with no second pass through the retry ladder | a range starting below the floor raises `RetentionBoundary` from the reader before a page is fetched (`reader.test.ts`); a stubbed 410 gives `RetentionBoundary` and exactly one `retention_refusals` in exactly one request (`client.test.ts`) |
 | Page caps and `limit` silently truncate | The client requests `limit=200`, follows `next` until an empty page, and counts `pages_truncated` when a page returns fewer than requested while `next` still yields records | a stubbed short page followed by a non-empty page increments the counter and loses nothing |
 | Path payments are absent from plain payment views | The reader takes the whole payment family from `/payments`, which returns them; the mapper handles both strict types | a synthetic strict-send record yields two correctly sided observations |
 | Soroban asset transfers appear in `/payments` as `invoke_host_function` | Section 5.2 and 5.6 | a synthetic invocation with two transfers to one account yields two observations with refs `#0` and `#1` |
