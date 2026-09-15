@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, afterAll } from "vitest";
-import { backfill } from "./run.js";
+import { backfill, IdentityError } from "./run.js";
 import { openSink } from "./sink.js";
 import { readKeys } from "./dedupe.js";
 import { Counters } from "./counters.js";
@@ -121,6 +121,31 @@ describe("backfill", () => {
     expect(c.counts["observations_written.volume"]).toBe(3);
     expect(c.counts["records_read.memos"]).toBe(2);
     expect((c.counts["observations_written.content"] ?? 0) + (c.drops["memo_non_text"] ?? 0)).toBe(2);
+    // The same identity as the run asserts it at exit, on its own tallies.
+    expect([c.counts["written.payments"], c.counts["dropped.payments"]]).toEqual([3, 0]);
+    expect([c.counts["written.memos"], c.counts["dropped.memos"]]).toEqual([1, 1]);
+    expect([c.counts["written.effects"], c.counts["dropped.effects"]]).toEqual([1, 0]);
+  });
+
+  it("fails at exit when a stream's records do not balance", async () => {
+    const s = scenario();
+    const counters = new Counters();
+    // One payment record read that no outcome will ever account for: the
+    // shape of a record silently lost between the reader and the sink.
+    counters.inc("records_read.payments");
+    const sink = openSink(join(dir, "identity.ndjson"));
+    const thrown = await backfill({
+      reader: fakeReader(s.payments, s.effects), accounts: [s.g], range: { from: 10, to: 12 },
+      ctx: { network: "stellar:pubnet", producerVersion: "0.1.0" }, sink,
+      state: { network: "stellar:pubnet", accounts: {} }, saveState: async () => {},
+      counters, clock: fixedClock(new Date("2026-09-08T00:00:00.000Z")),
+    }).then(() => null, (e: unknown) => e);
+    await sink.close();
+    expect(thrown).toBeInstanceOf(IdentityError);
+    const e = thrown as IdentityError;
+    expect(e.stream).toBe("payments");
+    expect([e.read, e.written, e.dropped]).toEqual([4, 3, 0]);
+    expect(e.message).toContain("payments");
   });
 
   it("writes a separate volume observation per sac_transfer record of the same operation, and does not count sac_transfers_merged", async () => {

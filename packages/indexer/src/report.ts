@@ -1,5 +1,6 @@
 import type { CountersSnapshot } from "./counters.js";
 import type { Network } from "./mapper/context.js";
+import { STREAMS } from "./run.js";
 import type { LedgerRange } from "./source/types.js";
 
 export interface ReportMeta {
@@ -45,6 +46,11 @@ export function renderReport(snapshot: CountersSnapshot, meta: ReportMeta): { js
   const muxedFollowed = c["muxed_followed"] ?? 0;
   const totalObs = Object.entries(c).filter(([k]) => k.startsWith("observations_written.")).reduce((a, [, v]) => a + v, 0);
   const requests = c["requests"] ?? 0;
+  // The three identities the run asserts at exit (run.ts), printed so a
+  // reader of the report sees the numbers rather than the promise.
+  const identity = STREAMS
+    .map((s) => `${s} ${c[`records_read.${s}`] ?? 0} = ${c[`written.${s}`] ?? 0} + ${c[`dropped.${s}`] ?? 0}`)
+    .join("; ");
   const dropRows = Object.entries(scrubbed.drops).map(([k, v]) => `| ${k} | ${v} |`).join("\n");
   const compare = meta.compare
     ? `| Deduplication | ${meta.compare.onlyInPrevious} keys only in previous, ${meta.compare.onlyInCurrent} only in current (against ${meta.compare.previous}) |`
@@ -66,6 +72,7 @@ Horizon served ledgers from ${meta.retentionFloor} on that day.
 |---|---|
 ${coverageRow}
 ${compare}
+| Identity | ${identity} |
 | Dropped records with reason | ${Object.values(scrubbed.drops).reduce((a, b) => a + b, 0)} (table below) |
 | Coverage ratio | ${ratio.toFixed(2)} (${written} volume observations from ${read} payment-family records) |
 | Muxed share | ${muxed} of ${read} records carried a muxed side (${(read === 0 ? 0 : muxed / read).toFixed(2)}), ${muxedFollowed} on the followed side, ${c["muxed_resolved"] ?? 0} resolved |

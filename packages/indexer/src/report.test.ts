@@ -17,12 +17,15 @@ describe("renderReport", () => {
     c.inc("muxed_records", 2);
     c.inc("muxed_followed", 1);
     c.inc("muxed_resolved", 1);
+    c.inc("written.payments", 8);
+    c.inc("dropped.payments", 2);
     c.inc("requests", 40);
     c.drop("memo_non_text", "tx:1");
     const { markdown, json } = renderReport(c.snapshot(), meta);
     expect(markdown).toContain("| Coverage | 100 accounts");
     expect(markdown).toContain("| Coverage ratio | 0.80");
     expect(markdown).toContain("| Muxed share | 2 of 10 records carried a muxed side (0.20), 1 on the followed side, 1 resolved");
+    expect(markdown).toContain("| Identity | payments 10 = 8 + 2; memos 0 = 0 + 0; effects 0 = 0 + 0 |");
     expect(markdown).toContain("memo_non_text | 1");
     expect(JSON.parse(json)).toMatchObject({ meta, counts: { requests: 40 } });
   });

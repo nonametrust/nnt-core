@@ -11,7 +11,7 @@ import { HorizonClient } from "./horizon/client.js";
 import { HorizonReader } from "./horizon/reader.js";
 import type { Network } from "./mapper/context.js";
 import { renderReport } from "./report.js";
-import { backfill } from "./run.js";
+import { backfill, IdentityError } from "./run.js";
 import { openSink, outputFileName } from "./sink.js";
 import type { AccountId, LedgerRange } from "./source/types.js";
 import { loadState, saveState } from "./state.js";
@@ -50,8 +50,18 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv, io: Io = cons
     }
   } catch (e) {
     io.error(e instanceof Error ? e.message : String(e));
-    return 1;
+    return exitCodeFor(e);
   }
+}
+
+/**
+ * A stream whose records do not add up is a different failure from a run
+ * that could not read Horizon, and a caller that chains runs has to be able
+ * to tell them apart without parsing a message: exit 3 says the numbers are
+ * wrong, exit 1 says the run did not finish.
+ */
+export function exitCodeFor(e: unknown): number {
+  return e instanceof IdentityError ? 3 : 1;
 }
 
 function network(value: string | undefined, io: Io): Network | null {

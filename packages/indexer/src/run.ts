@@ -44,6 +44,32 @@ export interface BackfillOptions {
   resumeKeys?: ReadonlySet<string>;
 }
 
+/**
+ * The three streams a run reads. Every record of a stream ends as a written
+ * observation or as a counted drop, so `records_read.<stream>` must equal
+ * `written.<stream> + dropped.<stream>` when the run ends.
+ */
+export const STREAMS = ["payments", "memos", "effects"] as const;
+export type Stream = (typeof STREAMS)[number];
+
+/**
+ * A stream whose records do not add up. This is not a warning: a record that
+ * produced neither an observation nor a drop is a record the pipeline lost
+ * without saying so, and every number the report prints about coverage is
+ * then unfounded. The run aborts and the CLI exits 3.
+ */
+export class IdentityError extends Error {
+  constructor(
+    readonly stream: Stream,
+    readonly read: number,
+    readonly written: number,
+    readonly dropped: number,
+  ) {
+    super(`identity broken on ${stream}: records_read ${read} != written ${written} + dropped ${dropped}`);
+    this.name = "IdentityError";
+  }
+}
+
 export interface BackfillResult {
   written: number;
   accountsDone: number;
@@ -61,8 +87,13 @@ export interface BackfillResult {
  *
  * `mapVolume` groups payment-family records by operation id: for a Soroban
  * invocation, each transfer maps to its own observation, one per record
- * (mapper/volume.ts). The per-stream identity is
- * records_read.payments == observations_written.volume + drops(volume reasons).
+ * (mapper/volume.ts). The per-stream identity,
+ * records_read.<stream> == written.<stream> + dropped.<stream>, is asserted
+ * at exit (`assertIdentity`); a stream that does not balance aborts the run
+ * with an `IdentityError` instead of reporting coverage nobody can trust.
+ * The reader drops records of its own (`sac_non_transfer`, `effect_ignored`,
+ * `failed_transaction`, an unsupported type) before they are ever read here,
+ * so those sit outside this identity by construction.
  * `self_payments` is counted per record, separately from the outcome (a
  * self-payment maps to exactly one "in" observation and no drop, so it
  * already satisfies the identity on its own); it is a diagnostic count, not
@@ -72,6 +103,14 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
   const keys = new KeySet();
   const result: BackfillResult = { written: 0, accountsDone: 0, accountsSkipped: 0, duplicateKeys: 0, resumedSkipped: 0 };
   o.counters.inc("accounts_followed", o.accounts.length);
+  // Seeded at zero so that the three identities are in the counters file of
+  // every run, including a run where a stream saw nothing: an absent number
+  // and a zero read the same to a person and differently to a reader.
+  for (const stream of STREAMS) {
+    o.counters.inc(`records_read.${stream}`, 0);
+    o.counters.inc(`written.${stream}`, 0);
+    o.counters.inc(`dropped.${stream}`, 0);
+  }
 
   for (const account of o.accounts) {
     const range = o.rangeFor ? o.rangeFor(account) : o.range;
@@ -81,28 +120,38 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
       continue;
     }
     const ctx: MapContext = { ...o.ctx, fetchedAt: o.clock.now().toISOString() };
-    const emit = (r: MapResult): void => {
+    // Each outcome tallies its own stream at the site where it is decided,
+    // so the identity cannot be satisfied by a number computed afterwards
+    // from the same facts it is supposed to check.
+    const emit = (r: MapResult, stream: Stream): void => {
       if (!r.ok) {
         o.counters.drop(r.reason, r.ref);
+        o.counters.inc(`dropped.${stream}`);
         return;
       }
       const v = validateObservation(r.observation);
       if (!v.ok) {
         o.counters.drop("validation_failed", `${r.observation.source.ref} ${v.errors[0] ?? ""}`);
+        o.counters.inc(`dropped.${stream}`);
         return;
       }
       if (!keys.add(v.value.idempotencyKey)) {
         o.counters.drop("duplicate_key_in_run", r.observation.source.ref);
+        o.counters.inc(`dropped.${stream}`);
         result.duplicateKeys++;
         return;
       }
       if (o.resumeKeys?.has(v.value.idempotencyKey)) {
+        // Written, for the identity: the observation exists, in the file a
+        // previous run wrote. Only the second copy is what does not happen.
         o.counters.inc("resumed_line_skipped");
+        o.counters.inc(`written.${stream}`);
         result.resumedSkipped++;
         return;
       }
       o.sink.write(v.value);
       o.counters.inc(`observations_written.${v.value.channel}`);
+      o.counters.inc(`written.${stream}`);
       if (v.value.namespace.muxedId !== undefined) o.counters.inc("muxed_resolved");
       result.written++;
     };
@@ -115,7 +164,7 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
       const g = group;
       group = [];
       const results = mapVolume(g, account, ctx);
-      for (const r of results) emit(r);
+      for (const r of results) emit(r, "payments");
     };
     for await (const p of o.reader.payments(account, range)) {
       o.counters.inc("records_read.payments");
@@ -136,19 +185,35 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
       if (p.memo && !memoSeen.has(p.txHash)) {
         memoSeen.add(p.txHash);
         o.counters.inc("records_read.memos");
-        emit(mapContent(p.memo, account, p.createdAt, ctx));
+        emit(mapContent(p.memo, account, p.createdAt, ctx), "memos");
       }
     }
     flush();
 
     for await (const e of o.reader.effects(account, range)) {
       o.counters.inc("records_read.effects");
-      emit(mapProtocol(e, ctx));
+      emit(mapProtocol(e, ctx), "effects");
     }
 
     markCompleted(accountState, range);
     await o.saveState();
     result.accountsDone++;
   }
+  assertIdentity(o.counters);
   return result;
+}
+
+/**
+ * The claim of section 13.3, as an assertion rather than as prose: for each
+ * stream, every record read became exactly one outcome. It runs at the end
+ * of the run, on the counters the report is rendered from, so a report can
+ * never be produced from numbers that do not add up.
+ */
+export function assertIdentity(counters: Counters): void {
+  for (const stream of STREAMS) {
+    const read = counters.get(`records_read.${stream}`);
+    const written = counters.get(`written.${stream}`);
+    const dropped = counters.get(`dropped.${stream}`);
+    if (read !== written + dropped) throw new IdentityError(stream, read, written, dropped);
+  }
 }
