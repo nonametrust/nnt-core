@@ -2,8 +2,8 @@
 // 2026-09-08 (sampled live: payment, path_payment_strict_send, create_account,
 // invoke_host_function with asset_balance_changes; effects trustline_created
 // and trustline_removed; a transaction joined onto a payment with memo_type
-// and memo). Only horizon/ and the test fixture builders in testing/ import
-// this file.
+// and memo). Only modules inside horizon/ import this file (gates/no-horizon-
+// outside-reader.test.ts enforces it at the root).
 
 export interface HorizonPaymentRecord {
   id: string;

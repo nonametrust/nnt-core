@@ -3,7 +3,7 @@ import { HorizonClient, HorizonStatusError, RetentionBoundary } from "./client.j
 import { HorizonReader, cursorForLedger, ledgerOfOperation } from "./reader.js";
 import { fixedClock } from "../clock.js";
 import { Counters } from "../counters.js";
-import { effectRecord, fakeHorizon, nextOpId, paymentRecord } from "../testing/horizon-fixtures.js";
+import { effectRecord, fakeHorizon, nextOpId, paymentRecord } from "./fixtures.js";
 import { muxedFor, randomAccount } from "../testing/keys.js";
 
 // A floor far below any ledger these tests use, so assertServed's strict,

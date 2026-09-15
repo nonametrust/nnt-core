@@ -1,5 +1,5 @@
-import type { HorizonEffectRecord, HorizonPaymentRecord } from "../horizon/records.js";
-import { randomAccount } from "./keys.js";
+import type { HorizonEffectRecord, HorizonPaymentRecord } from "./records.js";
+import { randomAccount } from "../testing/keys.js";
 
 // Builders for Horizon-shaped records made at run time. No Horizon response
 // is ever recorded into the repository: a recording carries real account ids
