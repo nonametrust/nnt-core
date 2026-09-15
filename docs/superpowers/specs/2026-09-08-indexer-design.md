@@ -381,7 +381,7 @@ delivery metric.
 
 `report.md` renders the delivery table of the brief's section 7 with these
 numbers filled in and the limits stated (Horizon dependency, selection rule,
-SAC transfers summed, memos text-only).
+one observation per Soroban transfer entry, memos text-only).
 
 ---
 
@@ -392,7 +392,7 @@ SAC transfers summed, memos text-only).
 | History before the retention wall returns HTTP 410 | `RetentionBoundary` error naming the ledger; the run records `retention_refusals` and marks the account's range as `unreachable_before <ledger>`, never as empty | a stubbed 410 produces the error class and the counter, and no "empty range" completion |
 | Page caps and `limit` silently truncate | The client requests `limit=200`, follows `next` until an empty page, and counts `pages_truncated` when a page returns fewer than requested while `next` still yields records | a stubbed short page followed by a non-empty page increments the counter and loses nothing |
 | Path payments are absent from plain payment views | The reader takes the whole payment family from `/payments`, which returns them; the mapper handles both strict types | a synthetic strict-send record yields two correctly sided observations |
-| Soroban asset transfers appear in `/payments` as `invoke_host_function` | Section 5.2 and 5.6 | a synthetic invocation with two transfers to one account yields one summed observation |
+| Soroban asset transfers appear in `/payments` as `invoke_host_function` | Section 5.2 and 5.6 | a synthetic invocation with two transfers to one account yields two observations with refs `#0` and `#1` |
 | Claimable-balance creator not always resolvable | v0 maps the claimant side from the effect and needs no creator; if a later channel needs it, the resolution failure is a counted drop | the counter exists and the effect maps without an operation lookup |
 | Account merges invisible | Documented; `--merges` reads `/operations` for `account_merge` and counts them, off by default | a synthetic merge is counted and not mapped |
 | Muxed addresses | Section 5.5 | two gates in 5.5 |
