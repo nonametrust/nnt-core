@@ -91,6 +91,16 @@ describe("mapVolume", () => {
     expect(mapVolume([p], randomAccount(), ctx)[0]).toEqual({ ok: false, reason: "not_followed", ref: "op:214720397313" });
   });
 
+  it("maps every record of a classic group, not only the first, so no record is silently lost", () => {
+    const g = randomAccount();
+    const a = payment({ to: g, amount: "1.0000000" });
+    const b = payment({ opId: "214720397314", to: g, amount: "2.0000000" });
+    const rs = mapVolume([a, b], g, ctx);
+    expect(rs).toHaveLength(2);
+    expect(rs.map((r) => (ok(r).payload as { amount: string }).amount)).toEqual(["1.0000000", "2.0000000"]);
+    expect(rs.map((r) => ok(r).source.ref)).toEqual(["op:214720397313", "op:214720397314"]);
+  });
+
   it("maps two SAC transfers of the same asset to one account as two observations, one ref per index", () => {
     const g = randomAccount();
     const issuer = randomAccount();

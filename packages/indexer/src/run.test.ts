@@ -170,6 +170,54 @@ describe("backfill", () => {
     expect(counters.get("self_payments")).toBe(1);
   });
 
+  it("counts a self-payment per record, so a SAC self-transfer inside a two-entry invocation is seen", async () => {
+    const g = randomAccount();
+    const other = randomAccount();
+    const createdAt = "2026-09-06T00:00:00.000Z";
+    const asset = { code: "KALE", issuer: randomAccount() };
+    const payments: SourcePayment[] = [
+      { opId: "400", ledger: 40, txHash: "34".repeat(32), createdAt, kind: "sac_transfer", from: other, to: g,
+        amount: "1.0000000", asset, transferIndex: 0 },
+      { opId: "400", ledger: 40, txHash: "34".repeat(32), createdAt, kind: "sac_transfer", from: g, to: g,
+        amount: "2.0000000", asset, transferIndex: 1 },
+    ];
+    const counters = new Counters();
+    const sink = openSink(join(dir, "h.ndjson"));
+    await backfill({
+      reader: fakeReader(payments, []), accounts: [g], range: { from: 40, to: 40 },
+      ctx: { network: "stellar:pubnet", producerVersion: "0.1.0" }, sink,
+      state: { network: "stellar:pubnet", accounts: {} }, saveState: async () => {},
+      counters, clock: fixedClock(new Date("2026-09-08T00:00:00.000Z")),
+    });
+    await sink.close();
+    expect(counters.get("self_payments")).toBe(1);
+  });
+
+  it("counts a muxed side on the followed account apart from a muxed counterparty", async () => {
+    const g = randomAccount();
+    const other = randomAccount();
+    const createdAt = "2026-09-07T00:00:00.000Z";
+    const asset = { code: "XLM", issuer: null };
+    const payments: SourcePayment[] = [
+      { opId: "500", ledger: 50, txHash: "56".repeat(32), createdAt, kind: "payment", from: g, to: other,
+        amount: "1.0000000", asset, toMuxedId: "7" },
+      { opId: "501", ledger: 50, txHash: "78".repeat(32), createdAt, kind: "payment", from: other, to: g,
+        amount: "2.0000000", asset, toMuxedId: "9" },
+    ];
+    const counters = new Counters();
+    const sink = openSink(join(dir, "i.ndjson"));
+    await backfill({
+      reader: fakeReader(payments, []), accounts: [g], range: { from: 50, to: 50 },
+      ctx: { network: "stellar:pubnet", producerVersion: "0.1.0" }, sink,
+      state: { network: "stellar:pubnet", accounts: {} }, saveState: async () => {},
+      counters, clock: fixedClock(new Date("2026-09-08T00:00:00.000Z")),
+    });
+    await sink.close();
+    expect(counters.get("muxed_records")).toBe(2);
+    expect(counters.get("muxed_followed")).toBe(1);
+    expect(counters.get("muxed_resolved")).toBe(1);
+  });
+
   it("reads each account from its own frontier when rangeFor is given, not the pooled range", async () => {
     const g1 = randomAccount();
     const g2 = randomAccount();

@@ -450,8 +450,13 @@ The brief's section 7 table, as tests and measurements:
    the run asserts it at exit.
 4. **Coverage ratio.** Reported, with the drop reasons that explain the
    remainder.
-5. **Muxed share.** `muxed_records / records_read.payment_family`, and
-   `muxed_resolved == muxed_records`.
+5. **Muxed share.** `muxed_records / records_read.payments`, the share of
+   records that carried a muxed side at all, and
+   `muxed_resolved == muxed_followed`. Only a muxed side *on the followed
+   account* can become a `muxedId` on an observation: a record whose
+   counterparty is muxed is counted in `muxed_records` and in nothing else,
+   so the criterion is stated against `muxed_followed`, the records whose
+   muxed side is the followed account's.
 6. **Cost.** `requests` per observation and `wall_clock_ms` for the run.
 
 And the gates of sections 5.5, 5.6, 6, 8, 9 and 11, each failing the suite on

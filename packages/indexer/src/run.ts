@@ -63,7 +63,7 @@ export interface BackfillResult {
  * invocation, each transfer maps to its own observation, one per record
  * (mapper/volume.ts). The per-stream identity is
  * records_read.payments == observations_written.volume + drops(volume reasons).
- * `self_payments` is counted separately from the records themselves (a
+ * `self_payments` is counted per record, separately from the outcome (a
  * self-payment maps to exactly one "in" observation and no drop, so it
  * already satisfies the identity on its own); it is a diagnostic count, not
  * a term of the identity.
@@ -116,13 +116,21 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
       group = [];
       const results = mapVolume(g, account, ctx);
       for (const r of results) emit(r);
-      if (g.length === 1 && g[0]!.from === g[0]!.to) {
-        o.counters.inc("self_payments");
-      }
     };
     for await (const p of o.reader.payments(account, range)) {
       o.counters.inc("records_read.payments");
+      // Per record, not per group: a SAC self-transfer sits inside an
+      // invocation that also moved value between other parties, and a group
+      // rule would miss it.
+      if (p.from === account && p.to === account) o.counters.inc("self_payments");
       if (p.toMuxedId !== undefined || p.fromMuxedId !== undefined) o.counters.inc("muxed_records");
+      // `muxed_records` is the share of records that carried a muxed side at
+      // all; only a muxed side *on the followed account* can become a
+      // `muxedId` on an observation, so that is the number
+      // `muxed_resolved` is measured against (spec 13.5).
+      if ((p.toMuxedId !== undefined && p.to === account) || (p.fromMuxedId !== undefined && p.from === account)) {
+        o.counters.inc("muxed_followed");
+      }
       if (group.length > 0 && group[0]!.opId !== p.opId) flush();
       group.push(p);
       if (p.memo && !memoSeen.has(p.txHash)) {

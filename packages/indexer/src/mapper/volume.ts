@@ -12,9 +12,13 @@ import { source, type MapContext, type MapResult } from "./context.js";
  * both; this mapper produces only the followed side.
  *
  * `group` holds every SourcePayment of one operation. For the classic
- * payment family that is one record. For a Soroban invocation it is one
- * record per asset_balance_changes transfer, and each transfer is mapped to
- * its own observation, one per record (section below on `ref`).
+ * payment family that is one record on today's Horizon. For a Soroban
+ * invocation it is one record per asset_balance_changes transfer, and each
+ * transfer is mapped to its own observation, one per record (section below
+ * on `ref`). Either way every record of the group is mapped and yields
+ * exactly one result, an observation or a drop with a reason; a classic
+ * group that ever held two records would otherwise lose the second one
+ * silently.
  */
 export function mapVolume(group: SourcePayment[], followed: AccountId, ctx: MapContext): MapResult[] {
   const first = group[0];
@@ -22,7 +26,12 @@ export function mapVolume(group: SourcePayment[], followed: AccountId, ctx: MapC
   const ref = `op:${first.opId}`;
   if (!isBaseAccount(followed)) return [{ ok: false, reason: "invalid_account_id", ref }];
   if (first.kind === "sac_transfer") return group.map((p) => mapSacRecord(p, followed, ctx));
-  return mapClassic(first, followed, ctx, ref);
+  // Every record of the group, not just the first: a record that is mapped
+  // by nobody is a record that left the identity
+  // records_read.payments == written.payments + dropped.payments (run.ts)
+  // one short, and it would be invisible, having produced neither an
+  // observation nor a drop.
+  return group.flatMap((p) => mapClassic(p, followed, ctx, `op:${p.opId}`));
 }
 
 function mapClassic(p: SourcePayment, followed: AccountId, ctx: MapContext, ref: string): MapResult[] {

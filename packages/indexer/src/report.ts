@@ -42,6 +42,7 @@ export function renderReport(snapshot: CountersSnapshot, meta: ReportMeta): { js
   const written = c["observations_written.volume"] ?? 0;
   const ratio = read === 0 ? 0 : written / read;
   const muxed = c["muxed_records"] ?? 0;
+  const muxedFollowed = c["muxed_followed"] ?? 0;
   const totalObs = Object.entries(c).filter(([k]) => k.startsWith("observations_written.")).reduce((a, [, v]) => a + v, 0);
   const requests = c["requests"] ?? 0;
   const dropRows = Object.entries(scrubbed.drops).map(([k, v]) => `| ${k} | ${v} |`).join("\n");
@@ -67,7 +68,7 @@ ${coverageRow}
 ${compare}
 | Dropped records with reason | ${Object.values(scrubbed.drops).reduce((a, b) => a + b, 0)} (table below) |
 | Coverage ratio | ${ratio.toFixed(2)} (${written} volume observations from ${read} payment-family records) |
-| Muxed share | ${muxed} of ${read} (${(read === 0 ? 0 : muxed / read).toFixed(2)}), ${c["muxed_resolved"] ?? 0} resolved |
+| Muxed share | ${muxed} of ${read} records carried a muxed side (${(read === 0 ? 0 : muxed / read).toFixed(2)}), ${muxedFollowed} on the followed side, ${c["muxed_resolved"] ?? 0} resolved |
 | Cost | ${requests} requests, ${totalObs === 0 ? "n/a" : (requests / totalObs).toFixed(2)} per observation, ${(meta.wallClockMs / 1000).toFixed(0)} s wall clock |
 
 ## Drops
