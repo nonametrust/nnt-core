@@ -134,7 +134,8 @@ describe("HorizonReader.payments", () => {
     const rows = [paymentRecord({ id: nextOpId(100, 1), to: g, transaction_successful: false })];
     const { r, counters } = reader({ [`/accounts/${g}/payments`]: rows });
     expect(await collect(r.payments(g, { from: 100, to: 100 }))).toEqual([]);
-    expect(counters.get("records_failed_tx")).toBe(1);
+    expect(counters.drops()["failed_transaction"]).toBe(1);
+    expect(counters.snapshot().dropSamples["failed_transaction"]).toEqual([`op:${rows[0]!.id}`]);
   });
 
   it("raises RetentionBoundary when the range starts before the retention floor", async () => {
@@ -156,7 +157,7 @@ describe("HorizonReader.globalPayments", () => {
     const { r, counters } = reader({ "/payments": rows });
     const got = await collect(r.globalPayments({ from: 100, to: 100 }));
     expect(got.length).toBe(1);
-    expect(counters.get("records_failed_tx")).toBe(1);
+    expect(counters.drops()["failed_transaction"]).toBe(1);
     expect(counters.get("records_read.payment")).toBe(2);
   });
 });

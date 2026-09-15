@@ -1,9 +1,16 @@
 /**
  * Every record the indexer reads ends as an observation or as a drop with a
  * reason from this list. A drop with no reason is a bug: the run fails at
- * exit if the identity records_read == written + dropped does not hold per
- * channel (run.ts). The list is closed so that a new reason is a decision
- * that shows up in the report, not a string someone typed once.
+ * exit (`assertIdentity`, run.ts) if the identity
+ * records_read.<stream> == written.<stream> + dropped.<stream> does not hold
+ * for any of the three streams. The list is closed so that a new reason is a
+ * decision that shows up in the report, not a string someone typed once.
+ *
+ * Some reasons are counted by the reader before the record is ever read into
+ * a stream (`failed_transaction`, `sac_non_transfer`, `effect_ignored`,
+ * `unsupported_type`, and its own `invalid_account_id`): they explain what
+ * Horizon returned and the indexer refused, and sit outside that identity by
+ * construction.
  */
 export const DROP_REASONS = [
   "validation_failed",
@@ -18,6 +25,7 @@ export const DROP_REASONS = [
   "unsupported_type",
   "not_followed",
   "duplicate_key_in_run",
+  "failed_transaction",
 ] as const;
 export type DropReason = (typeof DROP_REASONS)[number];
 

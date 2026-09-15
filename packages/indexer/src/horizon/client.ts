@@ -171,8 +171,8 @@ export class HorizonClient {
    * retry ladder, so a genuine outage still surfaces as a failure. Only a
    * 503 is read as "shrink the page": any other error from the
    * single-attempt ladder (a 429, a 5xx that is not 503, a dropped
-   * connection) gets one retry with the client's full normal ladder before
-   * it is allowed to propagate, so the short ladder used to probe page
+   * connection) gets the client's full normal ladder before it is allowed
+   * to propagate, except a 410, which is final and propagates at once, so the short ladder used to probe page
    * size never undoes the retry behaviour the rest of the client relies on
    * for ordinary transient failures. The truncation heuristic compares
    * against the limit actually used for the page that came back, not the
@@ -197,9 +197,14 @@ export class HorizonClient {
               this.counters.inc("page_limit_reduced");
               continue;
             }
-            // Not a 503: the short ladder just probed page size, it did
-            // not decide this was an outage. Give the full normal ladder
-            // one chance before this error is allowed to propagate.
+            // A retention refusal is final: the history is gone, no ladder
+            // brings it back, and a second attempt would only count
+            // `retention_refusals` twice and spend a request on a question
+            // already answered.
+            if (err instanceof RetentionBoundary || (err instanceof HorizonStatusError && err.status === 410)) throw err;
+            // Not a 503 and not final: the short ladder just probed page
+            // size, it did not decide this was an outage. Give the full
+            // normal ladder its one run before this error propagates.
             raw = await this.getJson<RawPage<T>>(currentUrl);
             break;
           }

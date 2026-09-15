@@ -79,7 +79,10 @@ export class HorizonReader implements SourceReader {
     if (ledger < range.from) return [];
     this.counters.inc(`records_read.${rec.type}`);
     if (!rec.transaction_successful) {
-      this.counters.inc("records_failed_tx");
+      // A drop with a reason, not a bare counter: the record was read and
+      // refused, so it belongs in the report's drop table like every other
+      // record the indexer decided not to map.
+      this.counters.drop("failed_transaction", `op:${rec.id}`);
       return [];
     }
     return this.normalisePayment(rec, ledger);

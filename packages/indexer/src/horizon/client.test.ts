@@ -173,6 +173,16 @@ describe("HorizonClient", () => {
     expect(h.counters.get("retries")).toBe(2);
   });
 
+  it("a 410 on a big page is final: one request, one refusal, no second ladder", async () => {
+    const h = harness(() => ({ status: 410, body: { title: "Gone" } }));
+    const drain = async (): Promise<void> => {
+      for await (const _p of h.client.pages<number>("/p?limit=200")) { /* the first page never arrives */ }
+    };
+    await expect(drain()).rejects.toBeInstanceOf(RetentionBoundary);
+    expect(h.counters.get("retention_refusals")).toBe(1);
+    expect(h.urls).toHaveLength(1);
+  });
+
   it("a 429 on a big page gets the full ladder, not the short one", async () => {
     let n = 0;
     const h = harness((url) => {
