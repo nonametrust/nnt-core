@@ -4,7 +4,7 @@ import { HorizonReader, cursorForLedger, ledgerOfOperation } from "./reader.js";
 import { fixedClock } from "../clock.js";
 import { Counters } from "../counters.js";
 import { effectRecord, fakeHorizon, nextOpId, paymentRecord } from "./fixtures.js";
-import { muxedFor, randomAccount } from "../testing/keys.js";
+import { muxedFor, randomAccount, randomContract } from "../testing/keys.js";
 
 // A floor far below any ledger these tests use, so assertServed's strict,
 // unconditional lookup (Task 9 fix round 1, finding 3) never blocks a test
@@ -89,6 +89,36 @@ describe("HorizonReader.payments", () => {
     const got = await collect(r.payments(g, { from: 100, to: 100 }));
     expect(got.map((p) => [p.kind, p.transferIndex])).toEqual([["sac_transfer", 0], ["sac_transfer", 2]]);
     expect(counters.drops()["sac_non_transfer"]).toBe(1);
+  });
+
+  it("keeps a contract address verbatim as a Soroban transfer counterparty", async () => {
+    const g = randomAccount();
+    const contract = randomContract();
+    const opId = nextOpId(100, 1);
+    const rows = [paymentRecord({
+      id: opId, type: "invoke_host_function", from: undefined, to: undefined, amount: undefined,
+      asset_balance_changes: [
+        { type: "transfer", from: contract, to: g, amount: "1.0000000", asset_type: "credit_alphanum4", asset_code: "KALE", asset_issuer: randomAccount() },
+      ],
+    })];
+    const { r } = reader({ [`/accounts/${g}/payments`]: rows });
+    const [p] = await collect(r.payments(g, { from: 100, to: 100 }));
+    expect(p).toMatchObject({ kind: "sac_transfer", from: contract, to: g, transferIndex: 0 });
+  });
+
+  it("still drops a Soroban transfer entry whose side is none of G, M or C", async () => {
+    const g = randomAccount();
+    const opId = nextOpId(100, 1);
+    const rows = [paymentRecord({
+      id: opId, type: "invoke_host_function", from: undefined, to: undefined, amount: undefined,
+      asset_balance_changes: [
+        { type: "transfer", from: "NOTANADDRESS", to: g, amount: "1.0000000", asset_type: "credit_alphanum4", asset_code: "KALE", asset_issuer: randomAccount() },
+      ],
+    })];
+    const { r, counters } = reader({ [`/accounts/${g}/payments`]: rows });
+    expect(await collect(r.payments(g, { from: 100, to: 100 }))).toEqual([]);
+    expect(counters.drops()["invalid_account_id"]).toBe(1);
+    expect(counters.snapshot().dropSamples["invalid_account_id"]).toEqual([`op:${opId}#0`]);
   });
 
   it("counts a record type it does not handle", async () => {

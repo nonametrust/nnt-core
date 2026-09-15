@@ -3,7 +3,7 @@ import { validateObservation } from "@nonametrust/schema";
 import { mapVolume } from "./volume.js";
 import type { MapContext } from "./context.js";
 import type { SourcePayment } from "../source/types.js";
-import { randomAccount } from "../testing/keys.js";
+import { randomAccount, randomContract } from "../testing/keys.js";
 
 const ctx: MapContext = { network: "stellar:pubnet", producerVersion: "0.1.0", fetchedAt: "2026-09-08T10:00:00.000Z" };
 
@@ -133,6 +133,22 @@ describe("mapVolume", () => {
     const p = payment({ kind: "sac_transfer", amount: "1.0000000", asset: { code: "KALE", issuer: randomAccount() }, transferIndex: 0 });
     const rs = mapVolume([p], randomAccount(), ctx);
     expect(rs).toEqual([{ ok: false, reason: "not_followed", ref: "op:214720397313" }]);
+  });
+
+  it("maps a SAC transfer from a contract counterparty to the followed account as in, and to a contract as out", () => {
+    const g = randomAccount();
+    const contract = randomContract();
+    const inP = payment({ kind: "sac_transfer", from: contract, to: g, amount: "1.0000000", asset: { code: "KALE", issuer: randomAccount() }, transferIndex: 0 });
+    const inRs = mapVolume([inP], g, ctx);
+    expect(inRs).toHaveLength(1);
+    expect(ok(inRs[0]!).payload).toMatchObject({ direction: "in" });
+    expect(ok(inRs[0]!).source.ref).toBe("op:214720397313#0");
+
+    const outP = payment({ kind: "sac_transfer", from: g, to: contract, amount: "1.0000000", asset: { code: "KALE", issuer: randomAccount() }, transferIndex: 1 });
+    const outRs = mapVolume([outP], g, ctx);
+    expect(outRs).toHaveLength(1);
+    expect(ok(outRs[0]!).payload).toMatchObject({ direction: "out" });
+    expect(ok(outRs[0]!).source.ref).toBe("op:214720397313#1");
   });
 
   it("drops a SAC record with no transferIndex as validation_failed against the operation ref", () => {

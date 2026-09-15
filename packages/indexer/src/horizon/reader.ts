@@ -1,5 +1,5 @@
 import type { Counters } from "../counters.js";
-import { resolveAccount } from "../mapper/address.js";
+import { isContractAddress, resolveAccount } from "../mapper/address.js";
 import type { SourceReader } from "../source/reader.js";
 import type {
   AccountId, EffectType, LedgerRange, MemoType, SourceAsset, SourceEffect, SourceMemo, SourcePayment,
@@ -128,8 +128,8 @@ export class HorizonReader implements SourceReader {
         const changes = rec.asset_balance_changes ?? [];
         for (const [i, c] of changes.entries()) {
           if (c.type !== "transfer") { this.counters.drop("sac_non_transfer", `op:${rec.id}#${i}`); continue; }
-          const from = side(c.from, undefined);
-          const to = side(c.to, c.destination_muxed_id);
+          const from = side(c.from, undefined) ?? contractSide(c.from);
+          const to = side(c.to, c.destination_muxed_id) ?? contractSide(c.to);
           if (!from || !to) { this.counters.drop("invalid_account_id", `op:${rec.id}#${i}`); continue; }
           yield withMemo({
             ...base, kind: "sac_transfer", from: from.base, to: to.base,
@@ -259,6 +259,18 @@ function side(id: string | undefined, muxedId: string | undefined): { base: Acco
   if (r === null) return null;
   if (muxedId !== undefined) return { base: r.base, muxedId };
   return r;
+}
+
+/**
+ * `invoke_host_function` only: a Soroban transfer's other side is routinely a
+ * contract (a pool or a DEX paying the followed wallet, or the wallet paying
+ * one). Kept verbatim, with no muxed id — a contract is never muxed. Not
+ * folded into `side()`, which stays G/M only for the classic payment family,
+ * where a contract can never be a party.
+ */
+function contractSide(id: string | undefined): { base: AccountId; muxedId?: string } | null {
+  if (id === undefined) return null;
+  return isContractAddress(id) ? { base: id } : null;
 }
 
 function memoOf(tx: { hash: string; memo_type: string; memo?: string }): SourceMemo {

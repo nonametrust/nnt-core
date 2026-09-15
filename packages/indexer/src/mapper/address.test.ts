@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { isBaseAccount, isMuxedAccount, resolveAccount } from "./address.js";
-import { muxedFor, randomAccount } from "../testing/keys.js";
+import { isBaseAccount, isContractAddress, isMuxedAccount, resolveAccount } from "./address.js";
+import { muxedFor, randomAccount, randomContract } from "../testing/keys.js";
 
 describe("address helpers", () => {
   it("accepts a checksum-valid base account and refuses a corrupted one", () => {
@@ -30,5 +30,12 @@ describe("address helpers", () => {
   it("returns null for anything else", () => {
     expect(resolveAccount("not-an-address")).toBeNull();
     expect(resolveAccount("")).toBeNull();
+  });
+
+  it("recognises a contract address but never resolves it as a namespace id", () => {
+    const c = randomContract();
+    expect(isContractAddress(c)).toBe(true);
+    expect(isBaseAccount(c)).toBe(false);
+    expect(resolveAccount(c)).toBeNull();
   });
 });

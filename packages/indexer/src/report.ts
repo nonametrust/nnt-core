@@ -80,7 +80,7 @@ ${dropRows || "| none | 0 |"}
 
 - Reads the SDF public Horizon, which serves about a year of history and is on its way to end-of-life (issue #3).
 - Followed accounts chosen by the tracked selection rule, not by a pilot's real counterparties.
-- Soroban asset transfers to one account in one invocation are summed; memos are recorded for text memos only.
+- Each Soroban transfer entry is its own observation (\`op:<id>#<index>\`); memos are recorded for text memos only.
 `;
   const json = JSON.stringify({ meta, ...scrubbed }, null, 2);
   return { json, markdown };

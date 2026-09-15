@@ -263,7 +263,9 @@ The key admits at most one observation per `(ref, channel, namespace)`
   `transfer` entry is its own movement and gets its own observation, `kind:
   "sac_transfer"`, `ref: "op:<id>#<transferIndex>"` — the entry's position in
   the operation's `asset_balance_changes`, which is what makes the ref unique
-  per movement rather than per operation (section 5.2).
+  per movement rather than per operation (section 5.2). A contract address on
+  the other side of the transfer is a valid counterparty and the entry is
+  observed; only the followed wallet side must be a base account.
 - A self-payment (followed account is both `from` and `to`): one observation,
   `direction: "in"`, counted `self_payment`.
 

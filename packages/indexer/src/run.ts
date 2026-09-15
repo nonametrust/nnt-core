@@ -89,7 +89,7 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
       result.written++;
     };
 
-    // Payments, grouped by operation so Soroban transfers are summed; memos once per transaction.
+    // Payments, grouped by operation; each Soroban transfer entry maps to its own observation; memos once per transaction.
     let group: SourcePayment[] = [];
     const memoSeen = new Set<string>();
     const flush = (): void => {
