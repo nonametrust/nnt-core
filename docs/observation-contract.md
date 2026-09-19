@@ -182,6 +182,13 @@ geçerli: bir durum değiştiyse değişimi yaz, bayrak koyma.
 
 ## 6. Horizon kaydından eşleme: `volume` ve `protocol`
 
+Bu bölüm v0'ın kaynağı olan Horizon kayıtlarına göre yazıldı. SDF Horizon'u
+ömrünün sonuna yaklaşmış sayıyor ve yerine Stellar RPC'yi gösteriyor; kapanma
+tarihi yok, bugün çalışıyor. Kural Horizon'a değil gözleme bağlı: aşağıdaki
+tablolar hangi zincir olgusunun hangi alana gittiğini söylüyor, Horizon alan
+adları o olguyu bugün nereden aldığını. Kaynak değişirse tablonun sol sütunu
+değişir, sağ sütunu değişmez. Eşleyiciyi kaynak okuyucudan ayrı yaz.
+
 ### `volume`: yön namespace'e göre
 
 `direction` **namespace'e göre**dir, ödeyene göre değil. `"in"`: değer karşı
@@ -218,11 +225,25 @@ gözlem üret**; karşı taraf takipte değilse o tarafın gözlemi yoktur.
 
 ### `protocol`: hangi kayıt, hangi aralık, `event`'te ne var
 
-`payload.event`, Horizon'un **effect tipi adını** taşır, olduğu gibi:
-`trustline_created`, `trustline_removed`, `claimable_balance_claimant_created`,
-`account_flags_updated`. `kind` ise bizim olay türü adımız (`trustline_open`).
-İkisi ayrı çünkü biri Horizon'un sözlüğü, biri bizim; Horizon adı değişirse
-`kind` değişmez.
+`payload.event` **bizim sözlüğümüzden** bir ad taşır, kaynağın kendi adını
+değil. Aşağıdaki tablo bugün Horizon effect adlarını gösteriyor ve o adlar
+eşlemenin girdisi, çıktısı değil.
+
+Sebebi motorun tarafında: etiketleme, taban çizgisini `(namespace, kanal,
+aspect)` üçlüsü üzerine kuruyor ve `protocol` kanalında aspect'i `event`
+veriyor. `event` kaynağın sözlüğü olursa taban çizgisinin anahtarı da kaynağa
+bağlı olur, ve aynı olgu iki kaynaktan okunduğunda tek karşı tarafın geçmişi
+iki ayrı taban çizgisine bölünür. Hiçbir test bunu yakalamaz, çünkü ikisi de
+geçerli.
+
+`kind` yine bizim olay türü adımız (`trustline_open`) ve değişmiyor. İkisi
+ayrı kalıyor: `kind` olayın ne olduğunu, `event` protokol olgusunun hangisi
+olduğunu söylüyor.
+
+**Uyarı, önceden:** şema bugün `event`'i serbest metin olarak kabul ediyor.
+Sözlük eşleyicinin ürettiği gerçek liste görüldükten sonra enum olarak
+şemaya girecek, ve o bir sıkılaştırma olacak. Uydurulmuş bir enum sonra
+tekrar daralacağı için bugün konmuyor.
 
 | Horizon kaydı | Gözlem |
 |---|---|
@@ -284,8 +305,8 @@ v0'da yazmana gerek yok.
 |---|---|
 | `producer` | Çıplak isim: `stellar-indexer`. Küçük harf, rakam, tek tire. Versiyon **buraya girmez**; girerse reddedilir. |
 | `producerVersion` | `"0.1.0"`. Ayrı alan, çünkü anahtara girmiyor: versiyon yükselttiğinde depodaki her şeyin kopyası doğmasın. |
-| `network` | `"stellar:pubnet"` ya da `"stellar:testnet"`; şema sadece boş olmadığına bakar, bu iki yazım bizim sözümüz (bölüm 11). Sen her zaman yaz; Horizon operasyon id'leri iki ağda çakışır. Gateway'in ağı yok, o yazmıyor; isteğe bağlılığı bundan. |
-| `ref` | Kaynak olayın kararlı referansı: `"op:214720397313"`. Aynı olayı yeniden okuduğunda **birebir aynı** çıkmalı. Operasyon id bunu sağlar; paging token da olur ama birini seç ve değiştirme. NUL içeremez. |
+| `network` | `"stellar:pubnet"` ya da `"stellar:testnet"`; şema sadece boş olmadığına bakar, bu iki yazım bizim sözümüz (bölüm 11). Sen her zaman yaz; Stellar operasyon id'leri iki ağda çakışır, hangi API'den okunursa okunsun. Gateway'in ağı yok, o yazmıyor; isteğe bağlılığı bundan. |
+| `ref` | Kaynak olayın kararlı referansı: `"op:214720397313"`. Aynı olayı yeniden okuduğunda **birebir aynı** çıkmalı. SEP-35 operasyon id bunu sağlar ve kaynaktan bağımsızdır, çünkü defter, işlem ve operasyon sırasından türüyor. Paging token Horizon'a özgü: kaynak değiştiği gün her anahtar değişir, o yüzden operasyon id'yi seç. **`ref` bir değer hareketini tanımlar, bir operasyonu değil:** bir operasyon birden fazla hareket taşıyorsa, `invoke_host_function`'ın bakiye değişimlerinde olduğu gibi, `ref` hangisi olduğunu da söyler. NUL içeremez. |
 | `fetchedAt` | Sen okuduğun an, UTC `Z`. Anahtara girmez; iki kez okuman iki gözlem doğurmaz. |
 
 ## 9. Anahtar, ve yeniden koşma garantisi
@@ -412,16 +433,30 @@ dolandırılmış hesapları tanımlıyor.
 
 ## 14. Açık noktalar, birlikte kapatacağız
 
-- **Memo op'a mı işleme mi bağlı?** Memo işlemin (transaction) özelliği, ödeme
-  operasyonun. Fixture memo'yu ödeme op'unun ref'iyle yazıyor ki `volume` ile
-  `content` aynı `source`'u paylaşsın. Bir işlemde aynı karşı tarafa birden
-  fazla op varsa memo kaç gözlem olur, ilk gün konuşalım.
-- **Aynı op, aynı kanal, aynı karşı taraf için iki gözlem gerekirse ne olur?**
-  Anahtar buna yer bırakmıyor (bölüm 9). Bugün böyle bir durum bilmiyoruz;
-  eşleyiciyi yazarken çıkarsa mekanizma uydurmadan getir, sözleşmede çözelim.
+- **Memo op'a mı işleme mi bağlı: cevaplandı.** Memo işlemin özelliği, ödeme
+  operasyonun, ve `content` gözleminin ref'i `tx:<hash>`, işlem başına bir
+  gözlem. Fixture'ın `volume` ile `content`'i aynı `source` altında
+  eşleştirmesi bir varsayımdı ve düştü; bir işlemde aynı karşı tarafa birden
+  fazla ödeme op'u varsa memo yine tek gözlem olur, ki doğrusu bu.
+- **Aynı op, aynı kanal, aynı karşı taraf için iki gözlem: kapandı.** Durum
+  çıktı. Horizon `/payments` artık `invoke_host_function` kayıtlarını da
+  döndürüyor ve bir kontrat takasında aynı hesabın giden ve gelen bacağı aynı
+  operasyonda; ikisi de aynı namespace, aynı kanal, aynı `ref`, yani biri
+  anahtarda düşüyordu. Çözüm anahtarı genişletmek değil: yön ya da varlık
+  eklemek yükü tek bir kanal için anahtara sokar ve türetimi kanala bağlı
+  hale getirir. Yanlış olan varsayım `ref`'in bir hareketi tanımladığıydı;
+  düz ödemede doğru, çok etkili operasyonda değil. Bölüm 8'deki `ref` kuralı
+  buna göre yazıldı. Ayırıcının ne olacağı eşleyicide: Horizon'un bakiye
+  değişimi sırası garantili değilse indeks kararlı değildir.
 - **Hesap bayrakları.** `protocol` payload'ında hangi bayrağın değiştiğini
   taşıyacak alan yok; v0 sadece değiştiğini kaydediyor. Alan gerekirse şemaya
   ekleriz, sen `event`'e sıkıştırma.
+- **Horizon sonrası okuyucu.** v0 Horizon'dan okuyor. Yerine gösterilen Stellar
+  RPC işlem ve olay geçmişini yalnızca yedi gün tutuyor ve hesaba göre ödeme ya
+  da efekt ucu vermiyor, yani 30 günlük geri doldurma bugün Horizon'a bağlı.
+  Kapanma duyurulduğunda seçenekler RPC `getLedgers` artı ham XDR ayrıştıran bir
+  veri gölü, ya da ücretli indeksli bir API. Kararı şimdi vermiyoruz; verilmesi
+  gereken tek şey kaynak okuyucunun ayrı bir katman olması.
 - **`kind` sözlüğü** bölüm 12'de; ilk eşleyici çıktısından sonra donduracağız.
 
 Sorusu olan yeri işaretle, oturup konuşalım. Fixture'la çelişen bir şey görürsen
