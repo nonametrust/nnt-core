@@ -374,8 +374,12 @@ değerli" burada geçerli.
    olmasına bakar, çünkü gateway'in ağı yok. Boş bırakırsan pubnet ve testnet
    operasyonları aynı anahtara düşer ve biri sessizce kaybolur; farklı yazarsan
    aynı ağ iki ağ sayılır.
-9. **`payload.event`'in Horizon effect adı olması** (bölüm 6). Şema boş olmayan
-   string görüyor.
+9. **`payload.event`'in bizim sözlüğümüzden olması, kaynağın effect adı
+   olmaması** (bölüm 6). Şema boş olmayan string görüyor. Bu maddeyi yanlış
+   uygulamanın bedeli sessizdir: `event`, `protocol` kanalında taban çizgisinin
+   aspect'idir, yani kaynağın adı buraya girerse anahtar kaynağa bağlı olur ve
+   tek bir karşı taraf iki kaynaktan okununca iki geçmişe bölünür. Sözlük
+   dondurulduğunda madde şemada enum'a çevrilecek ve bu listeden düşecek.
 10. **Bir state'in hiç yeniden yazılmaması, bitişin ayrı event olması** (bölüm 4).
     Şema iki gözlemi ayrı ayrı doğrular; ilişkiyi motor M1'de kurar.
 11. **`protocol` payload'ında `issuerKnown`'ın varlıklı her kayıtta yazılması**
