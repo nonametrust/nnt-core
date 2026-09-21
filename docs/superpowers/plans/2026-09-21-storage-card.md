@@ -132,6 +132,19 @@ Raised in TypeScript, no SQLSTATE: `PayloadExpired`, `SourceRateExceeded`, `TagR
 
 ---
 
+## 3b. The mutation step is not optional, and was skipped once
+
+Tasks 1 and 2 were committed without it and review found four surviving
+mutants: the exact equality rewritten as a tolerance, the `tag_id` line
+removed from the guard, `tag_aspect_nonempty` deleted, and all six guard
+messages replaced with `'generic'` — each passed the whole suite. Every one
+was a test asserting a class or a code where it should have asserted the rule.
+
+So for every task from here: after green, delete or weaken each rule the task
+added, one at a time, run the suite, and record which test went red. A rule
+whose removal leaves the suite green is not held, whatever the migration
+comment says about it.
+
 ## 4. Tasks
 
 Eleven, a fresh implementer each, a review after each, a whole-branch review at the end. Each ends at a gate a reviewer can reject.
