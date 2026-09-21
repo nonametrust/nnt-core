@@ -78,6 +78,28 @@ function requireInstant(name: string, value: Date): void {
   }
 }
 
+// The clock stopped stamping tags when `open` began taking the instant from
+// the decision, and this is what it does instead. A tag stamped in the future
+// is full strength forever -- the decay curve reads any instant before the
+// tag as g0 -- and it cannot be retired either, because the guard refuses a
+// retirement before the tag's own instant. M2 never produces one, since its
+// `decide` clamps an event to the caller's `at`; the database cannot hold the
+// rule without reading a wall clock, which the injected-clock discipline
+// forbids. So it is held here.
+//
+// What it costs if wrong: an engine whose clock runs ahead of the store's
+// would have legitimate decisions refused. In v0 both are the same process
+// and the same clock, and a RangeError naming the two instants is a better
+// failure than a tag that never decays.
+function requireNotAfter(name: string, value: Date, now: Date): void {
+  if (value.getTime() > now.getTime()) {
+    throw new RangeError(
+      `${name} ${value.toISOString()} is after the clock ${now.toISOString()}: ` +
+        `a tag stamped in the future never decays and cannot be retired`,
+    );
+  }
+}
+
 function requireFinite(name: string, value: number, floor: number): void {
   if (!Number.isFinite(value) || value < floor) {
     throw new RangeError(`${name} must be a finite number no less than ${floor}, got ${value}`);
@@ -85,7 +107,8 @@ function requireFinite(name: string, value: number, floor: number): void {
 }
 
 /**
- * The tag repository. Its prototype carries `open`, `get`, `suppress`,
+ * The tag repository. Its prototype carries `open`, `get`, `findLive`,
+ * `suppress`,
  * `refresh` and `listLive`, and nothing that deletes: suppression is
  * accelerated decay and the row stays, and retirement from the bounded
  * window is a separate, named operation that belongs to the nightly job of a
@@ -99,7 +122,9 @@ export class TagRepository {
   ) {}
 
   /**
-   * Opens a tag at the clock's instant with the defaults a fresh tag carries.
+   * Opens a tag at the instant the decision stamps -- the event's own, not
+   * the clock's -- with the defaults a fresh tag carries. The clock is still
+   * read, but only as a bound: a tag stamped ahead of it never decays.
    * A missing namespace or observation, or an observation that does not
    * belong to the namespace, is refused by the foreign keys and raised as
    * ConstraintViolation with SQLSTATE 23503 and the key's name on it: an
@@ -109,6 +134,7 @@ export class TagRepository {
   async open(input: OpenTag): Promise<StoredTag> {
     requireFinite("g0", input.g0, 0);
     requireInstant("taggedAt", input.taggedAt);
+    requireNotAfter("taggedAt", input.taggedAt, this.clock.now());
     const tag: StoredTag = {
       tagId: randomUUID(),
       namespaceId: input.namespaceId,
@@ -159,8 +185,9 @@ export class TagRepository {
    * It only ever raises: the larger of the stored factor and the requested
    * one is kept, so a second suppression with a smaller factor cannot slow a
    * tag's decay back down, which would be a way to revive evidence that
-   * nothing in the design asks for. One statement, for the same reason as
-   * `refresh`.
+   * nothing in the design asks for; the guard holds the same rule against a
+   * raw writer. One statement, because a suppression is a maximum the store
+   * may compute -- unlike a refresh, which is M2's arithmetic.
    */
   async suppress(tagId: string, factor: number): Promise<void> {
     requireFinite("suppression factor", factor, 1);
@@ -175,14 +202,6 @@ export class TagRepository {
   }
 
   /**
-   * A repeated deviation on an already-tagged pair refreshes rather than
-   * stacks. The new g0 is the larger of the two, computed in the database in
-   * one statement so that two concurrent refreshes cannot lose one: the row
-   * lock serialises them and the second re-evaluates against the first's
-   * result. A read in TypeScript followed by a write would let both read the
-   * same count and the same g0, and one of the two would vanish.
-   */
-  /**
    * Writes what M2's decision returned, and computes nothing.
    *
    * Optimistic on the count: the caller was handed `refreshCount`, so it read
@@ -196,31 +215,47 @@ export class TagRepository {
   async refresh(tagId: string, next: TagRefresh): Promise<void> {
     requireFinite("g0", next.g0, 0);
     requireInstant("taggedAt", next.taggedAt);
+    requireNotAfter("taggedAt", next.taggedAt, this.clock.now());
     if (!Number.isSafeInteger(next.refreshCount) || next.refreshCount < 1) {
       throw new RangeError(
         `refreshCount must be a safe integer of at least 1, got ${next.refreshCount}`,
       );
     }
-    const result = await this.db
-      .updateTable("tag")
-      .set({
-        g0: next.g0,
-        tagged_at: next.taggedAt,
-        refresh_count: next.refreshCount,
-        saturation_state: next.saturationState,
-      })
-      .where("tag_id", "=", tagId)
-      .where("refresh_count", "=", next.refreshCount - 1)
-      .executeTakeFirst();
+    // Mapped, like every other write here: the guard refuses a backward
+    // instant, a retired tag and a saturation that reopens, and those must
+    // reach the caller as TagAltered. M3 retries on TagRefreshStale and must
+    // not retry on a guard refusal; told apart only by a SQLSTATE string on a
+    // driver error, it would retry forever or give up wrongly.
+    let result;
+    try {
+      result = await this.db
+        .updateTable("tag")
+        .set({
+          g0: next.g0,
+          tagged_at: next.taggedAt,
+          refresh_count: next.refreshCount,
+          saturation_state: next.saturationState,
+        })
+        .where("tag_id", "=", tagId)
+        .where("refresh_count", "=", next.refreshCount - 1)
+        .executeTakeFirst();
+    } catch (e) {
+      throw mapPgError(e) ?? e;
+    }
     if (result.numUpdatedRows !== 0n) return;
     // Zero rows is two different conditions with two different cures, and a
     // caller told the wrong one retries forever or gives up wrongly.
     const live = await this.db
       .selectFrom("tag").select("tag_id").where("tag_id", "=", tagId).executeTakeFirst();
     if (live === undefined) throw new TagNotFound(`no tag ${tagId} to refresh`);
+    // Deliberately says what is true rather than what is likely: the row is
+    // not at the count this decision was built on. Usually that is another
+    // refresh landing first; it is also what a caller handing a count that
+    // skips a step sees, and telling that caller someone else refreshed the
+    // tag would send it to retry a read that will not help.
     throw new TagRefreshStale(
-      `tag ${tagId} was refreshed by someone else since this decision read it; ` +
-        `re-read the live tag and decide again`,
+      `tag ${tagId} is not at refresh count ${next.refreshCount - 1}, which this ` +
+        `decision was built on; re-read the live tag and decide again`,
     );
   }
 

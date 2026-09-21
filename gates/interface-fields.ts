@@ -21,8 +21,13 @@
  * them.
  */
 export function fieldsOf(source: string, name: string, where: string): string[] {
+  // Comments are stripped before the search, not after. Stripped after, a
+  // declaration wholly inside a block comment reads as live -- and a second,
+  // real declaration below it in another form would never be compared. That
+  // is the one failure a gate may not have: a silent pass.
+  const live = source.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "));
   const pattern = new RegExp(`export interface ${name} \\{([\\s\\S]*?)\\n\\}`, "g");
-  const blocks = [...source.matchAll(pattern)];
+  const blocks = [...live.matchAll(pattern)];
   if (blocks.length === 0) {
     throw new Error(`${where}: no \`export interface ${name} {\` block found`);
   }

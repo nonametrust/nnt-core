@@ -75,6 +75,41 @@ These are mine, could be overturned, and each says what it costs. They are the p
 
 ---
 
+## 2b. Rulings added during execution, not in the plan's own list
+
+Each came from review and each is recorded here because a guard rule nobody
+argued for is a rule nobody can revisit.
+
+**R9. The tag guard refuses a falling `suppression_factor`.** The repository
+took the greater of the two and its own test called lowering one "a way to
+revive evidence that nothing in the design asks for" — held only there, it was
+a promise a raw writer could break.
+
+**R10. A retired tag is not refreshed, and one statement may not retire and
+refresh at once.** The first rule alone reads `old.retired_at`, so a single
+statement that does both passed it: the row was live when the statement began.
+The result would be a retired row carrying a strength no decision produced.
+
+**R11. `retired_at` is not before `tagged_at`.** A tag cannot retire before it
+was opened. This is also what makes a future-dated tag unretirable, which is
+why R12 exists.
+
+**R12. A tag may not be stamped after the store's clock**, refused in
+TypeScript by `open` and `refresh`. A future-dated tag is full strength
+forever, because the decay curve reads any instant before the tag as `g0`, and
+under R11 it cannot be retired either. M2 never produces one, since `decide`
+clamps an event to the caller's `at`; the database cannot hold the rule
+without a wall clock, which the injected-clock discipline forbids. **This is
+what the repository's `Clock` is for now that `open` takes its instant from
+the decision** — the alternative was to delete a constructor parameter that
+had quietly become dead. Cost if wrong: an engine whose clock runs ahead of
+the store's has legitimate decisions refused; in v0 both are one process.
+
+**Carried, not ruled:** a tag may still move from `open` to `saturated` with
+the count unchanged. Nothing in M2's arithmetic produces it and nothing
+refuses it; it belongs on M4's card beside retirement rather than being
+invented here.
+
 ## 3. Global constraints for every task
 
 - Everything M1 and M2 fixed: Node 22, pnpm, strict TS, `tsconfig.test.json` with `"exclude": []`, build before typecheck, Apache-2.0, English in code, Turkish on the board, no Stellar-shaped id in a tracked file.

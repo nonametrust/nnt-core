@@ -53,6 +53,17 @@ describe("the tag refresh shape", () => {
     expect(declared("tagging")).toEqual(declared("store"));
   });
 
+  // Found by review: the extractor strips comments INSIDE a block, so a
+  // declaration wholly inside a block comment used to read as live while a
+  // second, real declaration sat below it in another form. Contrived, but a
+  // silent lexical pass is the one failure a gate may not have.
+  it("does not read a declaration that is itself inside a block comment", () => {
+    const hidden =
+      "/*\nexport interface TagRefresh {\n  g0: number;\n}\n*/\n" +
+      "export type TagRefresh = { drift: number };\n";
+    expect(() => fieldsOf(hidden, "TagRefresh", "hidden")).toThrow(/no .*TagRefresh/);
+  });
+
   // The extractor is shared with the baseline gate, so its self-checks live
   // beside it there. What is checked here is that it is reading THIS name:
   // pointed at an interface the file does not declare it must fail loudly

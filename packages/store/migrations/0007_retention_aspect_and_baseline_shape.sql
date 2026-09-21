@@ -12,6 +12,7 @@
 --
 -- Sections, in the order they were grown:
 --   1. baseline: the two shapes M2's arithmetic refuses
+--   2. tag: the aspect it was always keyed on, retirement, and the guard
 
 -- === 1. baseline: the two shapes M2's arithmetic refuses =====================
 --
@@ -134,6 +135,18 @@ begin
     raise exception using
       errcode = 'NNT07',
       message = 'a retired tag is not refreshed: strength does not move after retirement';
+  end if;
+  -- The rule above reads old.retired_at, so one statement that retires and
+  -- refreshes at once passes it: the row was live when the statement began.
+  -- Retirement is M4's nightly operation and writes nothing but the instant.
+  if old.retired_at is null and new.retired_at is not null
+     and (new.g0 is distinct from old.g0
+          or new.tagged_at is distinct from old.tagged_at
+          or new.refresh_count is distinct from old.refresh_count
+          or new.saturation_state is distinct from old.saturation_state) then
+    raise exception using
+      errcode = 'NNT07',
+      message = 'one statement retires and refreshes: retirement writes its instant and nothing else';
   end if;
   if new.retired_at is not null and new.retired_at < new.tagged_at then
     raise exception using

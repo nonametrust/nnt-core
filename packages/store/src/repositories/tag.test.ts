@@ -6,7 +6,7 @@ import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
-import { ConstraintViolation, StoreError, TagNotFound, TagRefreshStale } from "../errors.js";
+import { ConstraintViolation, StoreError, TagAltered, TagNotFound, TagRefreshStale } from "../errors.js";
 import { strengthAt } from "../strength.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
@@ -350,6 +350,20 @@ describe("opening and reading", () => {
       ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("not refreshed") });
     });
 
+    // Found by review. The retired-tag rule reads old.retired_at, so a single
+    // statement that retires and refreshes at once passes it: the row was
+    // live when the statement began. The result is a retired row carrying a
+    // strength no decision produced, which is the same defect from the other
+    // direction.
+    it("refuses retiring and refreshing in one statement", async () => {
+      const t = await aTag("g:retire-and-refresh");
+      await expect(
+        sql`update tag set retired_at = ${clock.now()}, g0 = 0.99, refresh_count = 1,
+            tagged_at = ${new Date(t.taggedAt.getTime() + 1)} where tag_id = ${t.tagId}`.execute(db),
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("retires and refreshes") });
+      expect((await repo.get(t.tagId)).g0).toBe(0.5);
+    });
+
     it("refuses a retirement instant before the tag's own", async () => {
       const t = await aTag("g:retired-before");
       await expect(
@@ -452,12 +466,18 @@ describe("findLive", () => {
 });
 
 describe("refresh", () => {
+  // Opened a day back so a refresh at the clock's own instant moves forward
+  // without landing in the future, which is the shape of the real thing: the
+  // tag was opened when the observation happened and the repeat is later.
   function aLive(aspect: string, g0 = 0.4) {
-    return repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", aspect, g0, taggedAt: clock.now() });
+    return repo.open({
+      namespaceId: ns, observationId: obs2, channel: "volume", aspect, g0,
+      taggedAt: new Date(clock.now().getTime() - DAY),
+    });
   }
   function next(t: { g0: number; taggedAt: Date; refreshCount: number }, over: Partial<TagRefresh> = {}): TagRefresh {
     return {
-      g0: t.g0, taggedAt: new Date(t.taggedAt.getTime() + DAY),
+      g0: t.g0, taggedAt: clock.now(),
       refreshCount: t.refreshCount + 1, saturationState: "open", ...over,
     };
   }
@@ -478,7 +498,8 @@ describe("refresh", () => {
 
   it("writes the instant, the count and the saturation state the decision returns", async () => {
     const t = await aLive("r:fields");
-    const at = new Date(t.taggedAt.getTime() + 3 * DAY);
+    const at = clock.now();
+    expect(at.getTime()).toBeGreaterThan(t.taggedAt.getTime());
     await repo.refresh(t.tagId, { g0: 0.8, taggedAt: at, refreshCount: 1, saturationState: "saturated" });
     expect(await repo.get(t.tagId)).toMatchObject({
       g0: 0.8, taggedAt: at, refreshCount: 1, saturationState: "saturated",
@@ -500,6 +521,47 @@ describe("refresh", () => {
     await expect(repo.refresh(t.tagId, next(t, { refreshCount: 1.5 })))
       .rejects.toBeInstanceOf(RangeError);
     expect(await repo.get(t.tagId)).toMatchObject({ refreshCount: 0 });
+  });
+
+  // The guard's refusals reach the caller through `refresh`, so they must
+  // arrive as the class and not as a driver error. M3 retries on
+  // TagRefreshStale and must not retry on a guard refusal; told apart only by
+  // a SQLSTATE string, it would either retry forever or give up wrongly.
+  it("raises a guard refusal as its class, not as a driver error", async () => {
+    const t = await aLive("r:mapped");
+    const back = repo.refresh(t.tagId, next(t, { taggedAt: new Date(t.taggedAt.getTime() - 1) }));
+    // The class, and the message that names which rule. TagAltered is a
+    // plain StoreError like NamespaceAltered beside it, so there is no
+    // sqlstate to assert; the class is the contract and the message is the
+    // rule.
+    await expect(back).rejects.toBeInstanceOf(TagAltered);
+    await expect(back).rejects.toThrowError(/only moves forward/);
+  });
+
+  // Not the clock's instant but the clock's bound. A tag stamped in the
+  // future is full strength forever, because the decay curve reads any
+  // instant before the tag as g0, and it cannot be retired either, since the
+  // guard refuses a retirement before the tag's own instant. M2 never
+  // produces one -- its decide clamps an event to the caller's `at` -- and
+  // the database cannot hold the rule without reading a wall clock, which
+  // every simulated day in this suite forbids. So it is refused here, where
+  // the clock is injected. This is also what the repository's Clock is for
+  // now that `open` no longer stamps from it.
+  it("refuses a tag stamped after the clock, which would never decay", async () => {
+    const ahead = new Date(clock.now().getTime() + DAY);
+    await expect(repo.open({
+      namespaceId: ns, observationId: obs, channel: "price", aspect: "future",
+      g0: 0.5, taggedAt: ahead,
+    })).rejects.toBeInstanceOf(RangeError);
+    const t = await aLive("r:future");
+    await expect(repo.refresh(t.tagId, next(t, { taggedAt: ahead }))).rejects.toBeInstanceOf(RangeError);
+  });
+
+  it("refuses a count below one, because a refresh is never the first write", async () => {
+    const t = await aLive("r:floor");
+    for (const refreshCount of [0, -1]) {
+      await expect(repo.refresh(t.tagId, next(t, { refreshCount }))).rejects.toBeInstanceOf(RangeError);
+    }
   });
 
   it("names a missing tag by class rather than updating nothing quietly", async () => {
