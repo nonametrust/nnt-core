@@ -37,11 +37,13 @@ export interface Schema {
     namespace_id: string;
     observation_id: string;
     channel: string;
+    aspect: string;
     g0: number;
     tagged_at: Date;
     refresh_count: number;
     saturation_state: "open" | "saturated";
     suppression_factor: number;
+    retired_at: Date | null;
   };
   // rescued_by is a plain uuid here; the foreign key arrived with 0006, the
   // migration that created trigger_event, and the type did not change then.

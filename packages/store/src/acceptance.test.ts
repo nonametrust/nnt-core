@@ -288,8 +288,12 @@ describe("2. a tag's strength is derivable at an arbitrary instant", () => {
     // alerts nobody. Lowering the provider's brief threshold on its account
     // is M2's arithmetic and is not stored here.
     limboTag = await tags.open({
+      // The aspect the tagging vocabulary gives this channel: address_integrity
+      // is categorical and one transition is one aspect, so a revert is a
+      // second observation on the same aspect, which is what refresh is for
+      // (tagging reading.ts, the address_integrity template).
       namespaceId: provider, observationId: idOf(stored.movedAway!),
-      channel: "address_integrity", g0: 0.6,
+      channel: "address_integrity", aspect: "transition", g0: 0.6,
     });
     await audit("tag.opened", {
       tagId: limboTag.tagId, observationId: limboTag.observationId,

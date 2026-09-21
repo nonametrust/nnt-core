@@ -18,6 +18,10 @@ export class NamespaceShredded extends StoreError {}
 // meant to be updated, and an operator must be able to tell the two apart
 // by class.
 export class NamespaceAltered extends StoreError {}
+// Raised by the tag guard, under its own SQLSTATE rather than the append-only
+// one: the tag table is meant to be updated, so a refusal here says an update
+// broke a rule the arithmetic holds, not that the row was immutable.
+export class TagAltered extends StoreError {}
 // Raised in TypeScript, like NamespaceShredded, so it carries no SQLSTATE. It
 // exists because an erasure request naming a subject that has no row must not
 // resolve as success: nothing was examined, and "the data is gone" would be
@@ -108,6 +112,7 @@ const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreErro
   NNT03: ChainBroken,
   NNT04: TimestampAltered,
   NNT05: NamespaceAltered,
+  NNT07: TagAltered,
 };
 
 /**

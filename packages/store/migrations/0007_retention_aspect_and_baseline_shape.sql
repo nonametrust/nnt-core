@@ -44,3 +44,85 @@ alter table baseline
 alter table baseline
   add constraint baseline_location_is_mean
   check (median_est is null or median_est = mean);
+
+-- === 2. tag: the aspect it was always keyed on, and retirement ==============
+--
+-- M2 keys the live tag on (namespace, channel, aspect) and tagReading takes
+-- one live tag or none for that triple. The table carried only the channel,
+-- so a deviation on one asset would refresh a tag another asset opened,
+-- pooling at the tag layer exactly what the aspect vocabulary exists to keep
+-- apart. The column is the fix; the unique index is what turns "the
+-- arithmetic assumes one live tag per pair" from a promise into a constraint.
+-- Added nullable, then made not-null, rather than with a default: the only
+-- default that would satisfy the check below is a made-up aspect, and one
+-- that does not satisfy it would be a column whose default its own constraint
+-- refuses. The table is empty here and `set not null` says so out loud; over
+-- rows it would fail rather than invent an aspect for them.
+alter table tag add column aspect text;
+alter table tag alter column aspect set not null;
+alter table tag add constraint tag_aspect_nonempty check (length(aspect) > 0);
+
+-- Retirement is named in the M0 spec, the M1 spec and the repository's own
+-- docstring, and existed nowhere. The column lands here because the unique
+-- index below is partial on it; the nightly operation that sets it is M4's.
+alter table tag add column retired_at timestamptz;
+
+-- Partial, so a retired tag frees the pair rather than blocking it forever.
+create unique index tag_one_live_per_pair
+  on tag (namespace_id, channel, aspect)
+  where retired_at is null;
+
+-- The guard. Every rule here is one M2's arithmetic computes, held against a
+-- writer that does not go through it. NNT07 rather than NNT01: this table is
+-- meant to be updated, so a refusal here is not an append-only violation and
+-- an operator reading the class must not be told that it is. The application
+-- maps it to TagAltered.
+--
+-- The forward-only instant is the load-bearing one. strengthAt reads the
+-- decay curve from tagged_at, so a tag moved backward is credited with a
+-- future it did not have, and the resulting strength is not wrong by a little.
+create function tag_guard() returns trigger language plpgsql as $$
+begin
+  if tg_op = 'DELETE' then
+    raise exception using
+      errcode = 'NNT07',
+      message = 'a tag is never deleted; suppression is accelerated decay and retirement is a column';
+  end if;
+  if new.tag_id is distinct from old.tag_id
+     or new.namespace_id is distinct from old.namespace_id
+     or new.observation_id is distinct from old.observation_id
+     or new.channel is distinct from old.channel
+     or new.aspect is distinct from old.aspect then
+    raise exception using
+      errcode = 'NNT07',
+      message = 'tag identity is fixed: tag_id, namespace_id, observation_id, channel and aspect do not change';
+  end if;
+  if new.tagged_at < old.tagged_at then
+    raise exception using
+      errcode = 'NNT07',
+      message = 'tagged_at only moves forward: a refresh restamps the tag at the later instant, never at an earlier one';
+  end if;
+  -- A refresh moves the count by one; a suppression leaves it where it is.
+  -- Nothing moves it by two, and nothing moves it down.
+  if new.refresh_count not in (old.refresh_count, old.refresh_count + 1) then
+    raise exception using
+      errcode = 'NNT07',
+      message = 'refresh_count stands or rises by one: a refresh is one repeat and a suppression is none';
+  end if;
+  if old.saturation_state = 'saturated' and new.saturation_state <> 'saturated' then
+    raise exception using
+      errcode = 'NNT07',
+      message = 'saturation is one-way: a saturated tag does not return to open';
+  end if;
+  if old.retired_at is not null and new.retired_at is distinct from old.retired_at then
+    raise exception using
+      errcode = 'NNT07',
+      message = 'retirement is one-way: the instant does not move and a retired tag is not revived';
+  end if;
+  return new;
+end
+$$;
+
+create trigger tag_guard_trigger
+  before update or delete on tag
+  for each row execute function tag_guard();

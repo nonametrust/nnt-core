@@ -13,23 +13,28 @@ export interface StoredTag {
   namespaceId: string;
   observationId: string;
   channel: string;
+  aspect: string;
   g0: number;
   taggedAt: Date;
   refreshCount: number;
   saturationState: "open" | "saturated";
   suppressionFactor: number;
+  /** Set once by M4's nightly retirement; a retired tag is no longer live. */
+  retiredAt: Date | null;
 }
 
 export interface OpenTag {
   namespaceId: string;
   observationId: string;
   channel: string;
+  aspect: string;
   g0: number;
 }
 
 const COLUMNS = [
-  "tag_id", "namespace_id", "observation_id", "channel", "g0",
+  "tag_id", "namespace_id", "observation_id", "channel", "aspect", "g0",
   "tagged_at", "refresh_count", "saturation_state", "suppression_factor",
+  "retired_at",
 ] as const;
 
 // Postgres's `check (g0 >= 0)` admits NaN and Infinity, because it orders NaN
@@ -73,11 +78,13 @@ export class TagRepository {
       namespaceId: input.namespaceId,
       observationId: input.observationId,
       channel: input.channel,
+      aspect: input.aspect,
       g0: input.g0,
       taggedAt: this.clock.now(),
       refreshCount: 0,
       saturationState: "open",
       suppressionFactor: 1,
+      retiredAt: null,
     };
     try {
       await this.db
@@ -87,6 +94,7 @@ export class TagRepository {
           namespace_id: tag.namespaceId,
           observation_id: tag.observationId,
           channel: tag.channel,
+          aspect: tag.aspect,
           g0: tag.g0,
           tagged_at: tag.taggedAt,
           refresh_count: tag.refreshCount,
@@ -163,6 +171,7 @@ export class TagRepository {
       .selectFrom("tag")
       .select(COLUMNS)
       .where("namespace_id", "=", namespaceId)
+      .where("retired_at", "is", null)
       .orderBy("tagged_at", "desc");
     if (since !== undefined) q = q.where("tagged_at", ">=", since);
     const rows = await q.execute();
@@ -178,10 +187,12 @@ function toStored(row: Schema["tag"]): StoredTag {
     namespaceId: row.namespace_id,
     observationId: row.observation_id,
     channel: row.channel,
+    aspect: row.aspect,
     g0: row.g0,
     taggedAt: row.tagged_at,
     refreshCount: row.refresh_count,
     saturationState: row.saturation_state,
     suppressionFactor: row.suppression_factor,
+    retiredAt: row.retired_at,
   };
 }

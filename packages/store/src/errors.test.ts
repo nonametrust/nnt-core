@@ -5,6 +5,7 @@ import {
   ConstraintViolation,
   NamespaceAltered,
   StoreError,
+  TagAltered,
   TimestampAltered,
   mapPgError,
 } from "./errors.js";
@@ -28,6 +29,7 @@ describe("mapPgError", () => {
     ["NNT03", ChainBroken],
     ["NNT04", TimestampAltered],
     ["NNT05", NamespaceAltered],
+    ["NNT07", TagAltered],
   ])("maps %s to the named class", (code, Ctor) => {
     const mapped = mapPgError(pgError(code));
     expect(mapped).toBeInstanceOf(Ctor);

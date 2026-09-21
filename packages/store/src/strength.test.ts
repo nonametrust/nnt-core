@@ -5,8 +5,10 @@ import type { StoredTag } from "./repositories/tag.js";
 const DAY = 24 * 60 * 60 * 1000;
 const base: StoredTag = {
   tagId: "t", namespaceId: "n", observationId: "o", channel: "address_integrity",
+  aspect: "transition",
   g0: 1, taggedAt: new Date("2026-09-12T00:00:00.000Z"),
   refreshCount: 0, saturationState: "open", suppressionFactor: 1,
+  retiredAt: null,
 };
 
 describe("strengthAt", () => {
