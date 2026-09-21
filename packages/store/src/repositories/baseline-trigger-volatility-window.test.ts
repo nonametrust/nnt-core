@@ -61,7 +61,7 @@ function aBaseline(over: Partial<BaselineState> = {}): BaselineState {
   return {
     namespaceId: ns, channel: "volume", aspect: "amount",
     count: 7, mean: 512.5, m2: 1024.25,
-    medianEst: 500, madEst: 12.5,
+    medianEst: 512.5, madEst: 12.5,
     fastMean: 530.1, fastM2: 90.9, slowMean: 505.5, slowM2: 2048.5,
     ...over,
   };
@@ -93,12 +93,12 @@ describe("baseline", () => {
   it("keeps one baseline per namespace, channel and aspect, holding the latest state", async () => {
     await baselines.upsert(aBaseline({ aspect: "once", count: 1 }));
     clock.advance(1000);
-    await baselines.upsert(aBaseline({ aspect: "once", count: 2, medianEst: null, madEst: null }));
+    await baselines.upsert(aBaseline({ aspect: "once", count: 2, mean: 9, medianEst: 9, madEst: 3 }));
     const all = (await baselines.forNamespace(ns)).filter((b) => b.aspect === "once");
     expect(all).toHaveLength(1);
     expect(all[0]!.count).toBe(2);
-    expect(all[0]!.medianEst).toBeNull();
-    expect(all[0]!.madEst).toBeNull();
+    expect(all[0]!.medianEst).toBe(9);
+    expect(all[0]!.madEst).toBe(3);
     expect(all[0]!.updatedAt).toEqual(clock.now());
   });
 
@@ -116,6 +116,53 @@ describe("baseline", () => {
   it("is empty for a namespace with no baseline, not an error", async () => {
     const other = (await namespaces.ensure({ kind: "wallet", id: "NOBASELINE" })).namespaceId;
     expect(await baselines.forNamespace(other)).toEqual([]);
+  });
+
+  // The two shapes M2's arithmetic refuses and 0006 left open. Both are the
+  // same family: a row the arithmetic rejects must not be writable at all, or
+  // M3's read path throws on a row the store itself wrote -- a refusal on the
+  // pipeline rather than on an observation. 0006 said so in its own comment
+  // and left them to M2 (0006_baseline_trigger_volatility_window.sql:14-17);
+  // M2 has since decided, so they come back to the table.
+  //
+  // The equality is exact on purpose. Tagging compares with !== on the same
+  // two doubles, and a tolerance here would admit the row the M2 ledger
+  // measured moving criterion three by 106/21 against a bound of 6/21.
+  it("refuses a count without its robust pair, and a pair without its count, from a raw writer", async () => {
+    const shapes: Array<[string, string, string]> = [
+      ["a positive count with no median", "n, mean", "2, 1"],
+      ["a zero count carrying a median", "n, mean, median_est, mad_est", "0, 1, 1, 1"],
+      ["a median without its MAD", "n, mean, median_est", "2, 1, 1"],
+      ["a MAD without its median", "n, mean, mad_est", "2, 1, 1"],
+    ];
+    for (const [name, columns, values] of shapes) {
+      await expect(
+        sql`insert into baseline (namespace_id, channel, aspect, updated_at, ${sql.raw(columns)})
+            values (${ns}, 'volume', ${`pair:${name}`}, ${clock.now()}, ${sql.raw(values)})`
+          .execute(db),
+        name,
+      ).rejects.toMatchObject({ code: "23514", constraint: "baseline_pair_with_count" });
+    }
+  });
+
+  it("refuses a median that is not the mean, from a raw writer", async () => {
+    await expect(
+      sql`insert into baseline (namespace_id, channel, aspect, updated_at, n, mean, median_est, mad_est)
+          values (${ns}, 'volume', 'location', ${clock.now()}, 2, 100, 200, 1)`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "baseline_location_is_mean" });
+  });
+
+  // The empty baseline is a legal row and must stay writable: a counterparty
+  // whose first observation has not landed has a counter of zero and no
+  // robust pair, and the pair check is an equivalence rather than a ban on
+  // nulls. Without this, the check above could be satisfied by refusing every
+  // null and nobody would notice until the first observation of a new pair.
+  it("writes the empty baseline: zero count, no robust pair", async () => {
+    const empty = await baselines.upsert(
+      aBaseline({ aspect: "empty", count: 0, mean: 0, m2: 0, medianEst: null, madEst: null }),
+    );
+    expect(empty).toMatchObject({ count: 0, medianEst: null, madEst: null });
   });
 
   it("refuses a negative count, by class", async () => {
@@ -149,13 +196,17 @@ describe("baseline", () => {
     }
     // A signed column takes a negative, so the sign checks are on the right
     // columns and not on all of them.
-    await expect(baselines.upsert(aBaseline({ aspect: "signed", mean: -3, medianEst: -2, fastMean: -1, slowMean: -0.5 })))
+    await expect(baselines.upsert(aBaseline({ aspect: "signed", mean: -3, medianEst: -3, fastMean: -1, slowMean: -0.5 })))
       .resolves.toMatchObject({ mean: -3 });
   });
 
   it("refuses the same through the repository, and leaves the stored state as it was", async () => {
-    await baselines.upsert(aBaseline({ aspect: "poison", mean: 1 }));
-    for (const poison of [{ mean: Number.NaN }, { m2: -1 }]) {
+    await baselines.upsert(aBaseline({ aspect: "poison", mean: 1, medianEst: 1 }));
+    // Each poison is refused for its own reason rather than incidentally by
+    // the location check: the NaN row carries NaN in both estimates, so what
+    // stops it is the finiteness check 0006 added, not the equality this
+    // migration added.
+    for (const poison of [{ mean: Number.NaN, medianEst: Number.NaN }, { m2: -1 }]) {
       const written = baselines.upsert(aBaseline({ aspect: "poison", ...poison }));
       await expect(written).rejects.toBeInstanceOf(ConstraintViolation);
       await expect(written).rejects.toMatchObject({ sqlstate: "23514" });
