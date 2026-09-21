@@ -145,6 +145,20 @@ describe("baseline", () => {
     }
   });
 
+  // The equality is exact and this is the test that holds it exact. A
+  // tolerance check -- abs(median_est - mean) < 1e-6 -- refuses the 100/200
+  // row below just as well, so without a row one ulp away nothing in the
+  // suite can tell the two apart, and the migration's insistence that the
+  // equality must never become a tolerance would be a comment rather than a
+  // property.
+  it("refuses a median one ulp from the mean, which a tolerance would admit", async () => {
+    await expect(
+      sql`insert into baseline (namespace_id, channel, aspect, updated_at, n, mean, median_est, mad_est)
+          values (${ns}, 'volume', 'ulp', ${clock.now()}, 2, 100, 100.00000000000001, 1)`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "baseline_location_is_mean" });
+  });
+
   it("refuses a median that is not the mean, from a raw writer", async () => {
     await expect(
       sql`insert into baseline (namespace_id, channel, aspect, updated_at, n, mean, median_est, mad_est)
@@ -158,6 +172,18 @@ describe("baseline", () => {
   // robust pair, and the pair check is an equivalence rather than a ban on
   // nulls. Without this, the check above could be satisfied by refusing every
   // null and nobody would notice until the first observation of a new pair.
+  // An upsert writes what it is handed and does not coalesce: a baseline
+  // moving back to an empty pair must clear both estimates rather than keep
+  // the old ones under a new count. Held by an upsert over an existing row,
+  // because a fresh insert cannot see the difference.
+  it("clears the robust pair on upsert rather than keeping the old one", async () => {
+    await baselines.upsert(aBaseline({ aspect: "cleared", count: 3, mean: 4, medianEst: 4, madEst: 2 }));
+    const back = await baselines.upsert(
+      aBaseline({ aspect: "cleared", count: 0, mean: 0, m2: 0, medianEst: null, madEst: null }),
+    );
+    expect(back).toMatchObject({ count: 0, medianEst: null, madEst: null });
+  });
+
   it("writes the empty baseline: zero count, no robust pair", async () => {
     const empty = await baselines.upsert(
       aBaseline({ aspect: "empty", count: 0, mean: 0, m2: 0, medianEst: null, madEst: null }),
@@ -210,6 +236,11 @@ describe("baseline", () => {
       const written = baselines.upsert(aBaseline({ aspect: "poison", ...poison }));
       await expect(written).rejects.toBeInstanceOf(ConstraintViolation);
       await expect(written).rejects.toMatchObject({ sqlstate: "23514" });
+      // Named, so the comment above is a claim the test holds: each poison is
+      // refused by its own column check and not by the new equality.
+      await expect(written).rejects.toMatchObject({
+        constraint: "mean" in poison ? "baseline_mean_check" : "baseline_m2_check",
+      });
     }
     const read = (await baselines.forNamespace(ns)).find((b) => b.aspect === "poison");
     expect(read?.mean).toBe(1);

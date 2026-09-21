@@ -17,8 +17,12 @@
 --
 -- 0006 landed this table with its own comment saying that "whether m2 is zero
 -- when n is zero, and whether median and MAD arrive together, are properties
--- of M2's update and are left to it". M2 has since decided, so they come back
--- to the table. What the arithmetic refuses, the database must refuse too:
+-- of M2's update and are left to it". M2 decided the second of those, so it
+-- comes back to the table, together with the equality between the location
+-- estimate and the mean. The first is NOT decided here: the arithmetic does
+-- not refuse a zero count beside a positive m2 either, so there is nothing to
+-- hold, and inventing a rule the arithmetic does not have would be a decision
+-- this card has no authority to make. What the arithmetic refuses, the database must refuse too:
 -- otherwise the store can write a row that M3's read path throws on, which is
 -- a refusal on the pipeline rather than on an observation, and it surfaces far
 -- from the writer that caused it.
@@ -118,6 +122,32 @@ begin
     raise exception using
       errcode = 'NNT07',
       message = 'retirement is one-way: the instant does not move and a retired tag is not revived';
+  end if;
+  -- Retirement takes a tag out of the live set; a refresh puts strength back
+  -- into it. A refreshed retired tag is a row whose strength moves while
+  -- nothing can see it, and whose pair another tag has since reopened.
+  if old.retired_at is not null
+     and (new.g0 is distinct from old.g0
+          or new.tagged_at is distinct from old.tagged_at
+          or new.refresh_count is distinct from old.refresh_count
+          or new.saturation_state is distinct from old.saturation_state) then
+    raise exception using
+      errcode = 'NNT07',
+      message = 'a retired tag is not refreshed: strength does not move after retirement';
+  end if;
+  if new.retired_at is not null and new.retired_at < new.tagged_at then
+    raise exception using
+      errcode = 'NNT07',
+      message = 'retired_at is not before tagged_at: a tag cannot retire before it was opened';
+  end if;
+  -- The repository takes the greater of the two factors and its own test
+  -- calls lowering one "a way to revive evidence that nothing in the design
+  -- asks for". Held only there it was a promise; the house rule is that an
+  -- invariant lives in the database.
+  if new.suppression_factor < old.suppression_factor then
+    raise exception using
+      errcode = 'NNT07',
+      message = 'suppression only rises: lowering the factor revives evidence the design never revives';
   end if;
   return new;
 end

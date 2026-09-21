@@ -175,6 +175,18 @@ describe("what the table refuses to hold", () => {
   // foreign keys would let it name a counterparty the observation is not
   // about, and listLive would then surface it under the wrong namespace,
   // which is the one query the nightly job runs. The pair is one key.
+  // The aspect is the tag's key and an empty one is a tag on no aspect at
+  // all, which would collide with every other empty one under the unique
+  // index. The check has to be tested or it can be deleted without anything
+  // going red.
+  it("refuses an empty aspect from a raw writer, by name", async () => {
+    await expect(
+      sql`insert into tag (tag_id, namespace_id, observation_id, channel, aspect, g0, tagged_at)
+          values (${randomUUID()}, ${ns}, ${obs}, 'volume', '', 0.5, ${clock.now()})`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "tag_aspect_nonempty" });
+  });
+
   it("refuses a tag whose namespace is not the observation's, by foreign key", async () => {
     const stranger = (await namespaces.ensure({ kind: "wallet", id: "STRANGER" })).namespaceId;
     const opened = repo.open({ namespaceId: stranger, observationId: obs, channel: "volume", aspect: "p2", g0: 0.5 });
@@ -249,13 +261,14 @@ describe("opening and reading", () => {
     it("refuses a delete: retirement is a column, not a disappearance", async () => {
       const t = await aTag("g:delete");
       await expect(sql`delete from tag where tag_id = ${t.tagId}`.execute(db))
-        .rejects.toMatchObject({ code: "NNT07" });
+        .rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("never deleted") });
       expect((await repo.get(t.tagId)).tagId).toBe(t.tagId);
     });
 
     it("fixes the identity columns, so a tag never becomes a tag about something else", async () => {
       const t = await aTag("g:identity");
       for (const [column, value] of [
+        ["tag_id", sql`${randomUUID()}`],
         ["namespace_id", sql`${randomUUID()}`],
         ["observation_id", sql`${obs2}`],
         ["channel", sql`'volume'`],
@@ -264,7 +277,7 @@ describe("opening and reading", () => {
         await expect(
           sql`update tag set ${sql.ref(column)} = ${value} where tag_id = ${t.tagId}`.execute(db),
           column,
-        ).rejects.toMatchObject({ code: "NNT07" });
+        ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("identity is fixed") });
       }
     });
 
@@ -272,7 +285,7 @@ describe("opening and reading", () => {
       const t = await aTag("g:instant");
       await expect(
         sql`update tag set tagged_at = ${new Date(t.taggedAt.getTime() - 1)} where tag_id = ${t.tagId}`.execute(db),
-      ).rejects.toMatchObject({ code: "NNT07" });
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("only moves forward") });
       await sql`update tag set tagged_at = ${new Date(t.taggedAt.getTime() + DAY)},
                 refresh_count = ${t.refreshCount + 1} where tag_id = ${t.tagId}`.execute(db);
       expect((await repo.get(t.tagId)).refreshCount).toBe(1);
@@ -285,7 +298,7 @@ describe("opening and reading", () => {
       const t = await aTag("g:count");
       await expect(
         sql`update tag set refresh_count = ${t.refreshCount + 2} where tag_id = ${t.tagId}`.execute(db),
-      ).rejects.toMatchObject({ code: "NNT07" });
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("stands or rises by one") });
       await sql`update tag set suppression_factor = 2 where tag_id = ${t.tagId}`.execute(db);
       expect((await repo.get(t.tagId)).refreshCount).toBe(0);
     });
@@ -295,7 +308,41 @@ describe("opening and reading", () => {
       await sql`update tag set saturation_state = 'saturated' where tag_id = ${t.tagId}`.execute(db);
       await expect(
         sql`update tag set saturation_state = 'open' where tag_id = ${t.tagId}`.execute(db),
-      ).rejects.toMatchObject({ code: "NNT07" });
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("saturation is one-way") });
+    });
+
+    // Not in the plan's list, found by review: the repository's `suppress`
+    // takes the greater of the two factors, and its own test says lowering
+    // one "is a way to revive evidence that nothing in the design asks for".
+    // Held only there, it was a promise a raw writer could break -- and the
+    // house rule is that an invariant lives in the database.
+    it("refuses a suppression factor that falls, because that revives evidence", async () => {
+      const t = await aTag("g:suppression");
+      await repo.suppress(t.tagId, 4);
+      await expect(
+        sql`update tag set suppression_factor = 1 where tag_id = ${t.tagId}`.execute(db),
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("suppression only rises") });
+      expect((await repo.get(t.tagId)).suppressionFactor).toBe(4);
+    });
+
+    // Also from review. Retirement takes a tag out of the live set, and a
+    // refresh puts strength back into it; a refreshed retired tag is a row
+    // whose strength moves while nothing can see it, and the pair it once
+    // held has since been reopened by another tag.
+    it("refuses a refresh of a retired tag", async () => {
+      const t = await aTag("g:retired-refresh");
+      await sql`update tag set retired_at = ${clock.now()} where tag_id = ${t.tagId}`.execute(db);
+      await expect(
+        sql`update tag set g0 = 0.9, refresh_count = 1,
+            tagged_at = ${new Date(t.taggedAt.getTime() + DAY)} where tag_id = ${t.tagId}`.execute(db),
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("not refreshed") });
+    });
+
+    it("refuses a retirement instant before the tag's own", async () => {
+      const t = await aTag("g:retired-before");
+      await expect(
+        sql`update tag set retired_at = ${new Date(t.taggedAt.getTime() - 1)} where tag_id = ${t.tagId}`.execute(db),
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("not before tagged_at") });
     });
 
     it("holds retirement one-way: once set it neither moves nor clears", async () => {
@@ -305,7 +352,7 @@ describe("opening and reading", () => {
       for (const value of [sql`${new Date(at.getTime() + DAY)}`, sql`null`]) {
         await expect(
           sql`update tag set retired_at = ${value} where tag_id = ${t.tagId}`.execute(db),
-        ).rejects.toMatchObject({ code: "NNT07" });
+        ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("retirement is one-way") });
       }
     });
   });
