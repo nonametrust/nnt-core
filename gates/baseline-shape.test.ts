@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
+import { fieldsOf } from "./interface-fields.js";
 
 // A baseline's state is declared twice: once in packages/tagging, whose
 // arithmetic produces it, and once in packages/store, which stores it.
@@ -36,36 +37,15 @@ const DECLARATIONS = {
   store: "packages/store/src/repositories/baseline.ts",
 } as const;
 
-/**
- * The fields of the one `export interface BaselineState { … }` block in a
- * source, each as `name: type`, sorted. Comments inside the block are
- * dropped, block comments before the text is split into lines so that a
- * field commented out across several lines is not counted as declared; a
- * field is what remains of a line once its trailing semicolon is gone.
- * The store's `StoredBaseline extends BaselineState {` is not matched,
- * because the pattern wants `interface BaselineState {` and nothing between.
- * Exactly one block: none is a source the gate cannot read, and two would
- * merge into one type of which the first block is only part.
- */
-function fieldsOf(source: string, where: string): string[] {
-  const blocks = [...source.matchAll(/export interface BaselineState \{([\s\S]*?)\n\}/g)];
-  if (blocks.length === 0) throw new Error(`${where}: no \`export interface BaselineState {\` block found`);
-  if (blocks.length > 1) {
-    throw new Error(
-      `${where}: ${blocks.length} \`export interface BaselineState {\` blocks found; TypeScript merges them and this gate compares one`,
-    );
-  }
-  return blocks[0]![1]!
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .split("\n")
-    .map((line) => line.replace(/\/\/.*$/, "").trim())
-    .filter((line) => line.length > 0)
-    .map((line) => line.replace(/;$/, ""))
-    .sort();
+// The extractor moved to gates/interface-fields.ts when TagRefresh became
+// the second shape declared in two packages; its self-checks below are
+// unchanged and still the thing the gate rests on.
+function fieldsOfBaseline(source: string, where: string): string[] {
+  return fieldsOf(source, "BaselineState", where);
 }
 
 function declared(which: keyof typeof DECLARATIONS): string[] {
-  return fieldsOf(readFileSync(join(root, DECLARATIONS[which]), "utf8"), DECLARATIONS[which]);
+  return fieldsOfBaseline(readFileSync(join(root, DECLARATIONS[which]), "utf8"), DECLARATIONS[which]);
 }
 
 describe("the baseline shape", () => {
@@ -91,29 +71,29 @@ describe("the baseline shape", () => {
   it("is compared by an extractor that tells two shapes apart", () => {
     const a = "export interface BaselineState {\n  count: number;\n  mean: number;\n}\n";
     const b = "export interface BaselineState {\n  count: number;\n  // a comment\n  mean: number;\n  extra: number | null;\n}\n";
-    expect(fieldsOf(a, "a")).toEqual(["count: number", "mean: number"]);
-    expect(fieldsOf(b, "b")).toEqual(["count: number", "extra: number | null", "mean: number"]);
-    expect(fieldsOf(a, "a")).not.toEqual(fieldsOf(b, "b"));
+    expect(fieldsOfBaseline(a, "a")).toEqual(["count: number", "mean: number"]);
+    expect(fieldsOfBaseline(b, "b")).toEqual(["count: number", "extra: number | null", "mean: number"]);
+    expect(fieldsOfBaseline(a, "a")).not.toEqual(fieldsOfBaseline(b, "b"));
 
     // A field commented out is not declared, whichever comment form hides
     // it, and a line comment after a live field does not change the field.
     const hidden =
       "export interface BaselineState {\n  count: number; // live\n  /*\n  planted: number;\n  */\n  /* also: number; */ mean: number;\n}\n";
-    expect(fieldsOf(hidden, "hidden")).toEqual(["count: number", "mean: number"]);
+    expect(fieldsOfBaseline(hidden, "hidden")).toEqual(["count: number", "mean: number"]);
 
     // The extends-block is not the block: only the declaration proper counts.
     const extended =
       "export interface StoredBaseline extends BaselineState {\n  updatedAt: Date;\n}\nexport interface BaselineState {\n  count: number;\n}\n";
-    expect(fieldsOf(extended, "extended")).toEqual(["count: number"]);
+    expect(fieldsOfBaseline(extended, "extended")).toEqual(["count: number"]);
 
-    expect(() => fieldsOf("export interface Other {}", "c")).toThrow(
+    expect(() => fieldsOfBaseline("export interface Other {}", "c")).toThrow(
       "c: no `export interface BaselineState {` block found",
     );
 
     // A second block merges into the first under declaration merging, so a
     // source with two is refused rather than read as its first block.
     const merged = a + "export interface BaselineState {\n  planted: number;\n}\n";
-    expect(() => fieldsOf(merged, "d")).toThrow(
+    expect(() => fieldsOfBaseline(merged, "d")).toThrow(
       "d: 2 `export interface BaselineState {` blocks found; TypeScript merges them and this gate compares one",
     );
   });

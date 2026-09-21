@@ -294,19 +294,31 @@ describe("2. a tag's strength is derivable at an arbitrary instant", () => {
       // (tagging reading.ts, the address_integrity template).
       namespaceId: provider, observationId: idOf(stored.movedAway!),
       channel: "address_integrity", aspect: "transition", g0: 0.6,
+      // From the decision, which stamps the event's own instant. The clock
+      // here happens to agree; on a backfill it would not, and the store
+      // writes what it is handed either way.
+      taggedAt: day(12, "16:50"),
     });
     await audit("tag.opened", {
       tagId: limboTag.tagId, observationId: limboTag.observationId,
       channel: limboTag.channel, g0: limboTag.g0, taggedAt: limboTag.taggedAt.toISOString(),
     });
     // A repeated deviation on an already-tagged pair refreshes rather than
-    // stacks, and the larger g0 is kept.
-    await tags.refresh(limboTag.tagId, 0.4);
+    // stacks. What is stored is what M2's decision returned, and nothing
+    // here recomputes it: the maximum M2 takes is over the DECAYED strength
+    // at the instant of the repeat, which this package cannot compute because
+    // it holds no half-life. Under M1's arithmetic this row would have kept
+    // 0.6 by taking the greater of the two stored numbers, which is the
+    // substitution the storage card exists to remove.
+    const refreshedAt = day(12, "17:30");
+    await tags.refresh(limboTag.tagId, {
+      g0: 0.4, taggedAt: refreshedAt, refreshCount: 1, saturationState: "open",
+    });
     await audit("tag.refreshed", { tagId: limboTag.tagId, g0: 0.4 });
     const after = await tags.get(limboTag.tagId);
     expect(after.refreshCount).toBe(1);
-    expect(after.g0).toBe(0.6);
-    expect(after.taggedAt.toISOString()).toBe(day(12, "16:50").toISOString());
+    expect(after.g0).toBe(0.4);
+    expect(after.taggedAt.toISOString()).toBe(refreshedAt.toISOString());
     expect(await tags.listLive(provider)).toHaveLength(1);
   });
 
@@ -319,17 +331,20 @@ describe("2. a tag's strength is derivable at an arbitrary instant", () => {
     const before = await tagRowVersions();
     const tag = await tags.get(limboTag.tagId);
     const at_ = (instant: Date) => strengthAt(tag, instant, HALF_LIFE);
+    // g0 is 0.4 and not 0.6: the refresh above wrote what M2's decision
+    // returned rather than the greater of two stored numbers, and the decay
+    // curve reads from the refreshed instant.
     // Before the tag existed: g0, not more. A clock skew cannot invent
     // evidence.
-    expect(at_(day(0))).toBeCloseTo(0.6, 12);
+    expect(at_(day(0))).toBeCloseTo(0.4, 12);
     // At the instant of tagging: g0.
-    expect(at_(tag.taggedAt)).toBeCloseTo(0.6, 12);
+    expect(at_(tag.taggedAt)).toBeCloseTo(0.4, 12);
     // One half-life on: half.
-    expect(at_(new Date(tag.taggedAt.getTime() + HALF_LIFE))).toBeCloseTo(0.3, 12);
+    expect(at_(new Date(tag.taggedAt.getTime() + HALF_LIFE))).toBeCloseTo(0.2, 12);
     // Now, nine days on: still there, still readable, and less than half.
     const now = at_(clock.now());
     expect(now).toBeGreaterThan(0);
-    expect(now).toBeLessThan(0.3);
+    expect(now).toBeLessThan(0.2);
     // The brief is a decision, and the strength it read is reproducible from
     // this entry and the tag's row, because nothing was overwritten to
     // produce it.

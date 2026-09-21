@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Clock } from "../clock.js";
 import type { Db, Schema } from "../db.js";
-import { TagNotFound, mapPgError } from "../errors.js";
+import { TagNotFound, TagRefreshStale, mapPgError } from "../errors.js";
 
 /**
  * What a tag stores, and nothing derived from it. Strength is not here: it is
@@ -23,12 +23,38 @@ export interface StoredTag {
   retiredAt: Date | null;
 }
 
+/**
+ * What a refresh writes, spelled exactly as `TagRefresh` in
+ * packages/tagging. The store may not import tagging -- that dependency
+ * would put a database under every tagging test -- so the shape is declared
+ * twice and a root gate holds the two declarations equal field for field.
+ *
+ * Every value here is computed by M2 over the DECAYED strength at the
+ * caller's instant. The store cannot recompute any of it: it deliberately
+ * holds no half-life, so it writes what it is handed and merges nothing.
+ */
+export interface TagRefresh {
+  g0: number;
+  taggedAt: Date;
+  refreshCount: number;
+  saturationState: "open" | "saturated";
+}
+
 export interface OpenTag {
   namespaceId: string;
   observationId: string;
   channel: string;
   aspect: string;
   g0: number;
+  /**
+   * The instant the decision stamps, which is the event's own instant and not
+   * this process's clock. M2's `decide` clamps an event's instant to the
+   * caller's `at` and uses `at` itself for a state; either way the store
+   * writes what it is handed. Stamped from a clock instead, an observation
+   * ingested a minute after it happened decays from the wrong instant, and a
+   * backfill dates a whole history at the day it was loaded.
+   */
+  taggedAt: Date;
 }
 
 const COLUMNS = [
@@ -43,6 +69,15 @@ const COLUMNS = [
 // decay curve can read. Both numbers are refused here, before any statement,
 // and RangeError is the class because the argument is arithmetic nonsense in
 // the same way a zero half-life is.
+// An Invalid Date is a Date, and it reaches Postgres as a null bind rather
+// than as an error, so the column's NOT NULL would refuse it with a message
+// about a null. Refused here instead, where the argument can be named.
+function requireInstant(name: string, value: Date): void {
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+    throw new RangeError(`${name} must be a valid Date, got ${String(value)}`);
+  }
+}
+
 function requireFinite(name: string, value: number, floor: number): void {
   if (!Number.isFinite(value) || value < floor) {
     throw new RangeError(`${name} must be a finite number no less than ${floor}, got ${value}`);
@@ -73,6 +108,7 @@ export class TagRepository {
    */
   async open(input: OpenTag): Promise<StoredTag> {
     requireFinite("g0", input.g0, 0);
+    requireInstant("taggedAt", input.taggedAt);
     const tag: StoredTag = {
       tagId: randomUUID(),
       namespaceId: input.namespaceId,
@@ -80,7 +116,7 @@ export class TagRepository {
       channel: input.channel,
       aspect: input.aspect,
       g0: input.g0,
-      taggedAt: this.clock.now(),
+      taggedAt: input.taggedAt,
       refreshCount: 0,
       saturationState: "open",
       suppressionFactor: 1,
@@ -146,17 +182,46 @@ export class TagRepository {
    * result. A read in TypeScript followed by a write would let both read the
    * same count and the same g0, and one of the two would vanish.
    */
-  async refresh(tagId: string, g0: number): Promise<void> {
-    requireFinite("g0", g0, 0);
+  /**
+   * Writes what M2's decision returned, and computes nothing.
+   *
+   * Optimistic on the count: the caller was handed `refreshCount`, so it read
+   * the row at `refreshCount - 1`, and the update matches on that. A lost
+   * race is refused rather than merged, because merging would need the
+   * decayed strength at the caller's instant and this package holds no
+   * half-life to compute it with; the caller re-reads and recomputes. Merged
+   * arithmetically, as M1 did, the row would hold a strength no decision ever
+   * produced.
+   */
+  async refresh(tagId: string, next: TagRefresh): Promise<void> {
+    requireFinite("g0", next.g0, 0);
+    requireInstant("taggedAt", next.taggedAt);
+    if (!Number.isSafeInteger(next.refreshCount) || next.refreshCount < 1) {
+      throw new RangeError(
+        `refreshCount must be a safe integer of at least 1, got ${next.refreshCount}`,
+      );
+    }
     const result = await this.db
       .updateTable("tag")
-      .set((eb) => ({
-        g0: eb.fn<number>("greatest", ["g0", eb.val(g0)]),
-        refresh_count: eb("refresh_count", "+", 1),
-      }))
+      .set({
+        g0: next.g0,
+        tagged_at: next.taggedAt,
+        refresh_count: next.refreshCount,
+        saturation_state: next.saturationState,
+      })
       .where("tag_id", "=", tagId)
+      .where("refresh_count", "=", next.refreshCount - 1)
       .executeTakeFirst();
-    if (result.numUpdatedRows === 0n) throw new TagNotFound(`no tag ${tagId} to refresh`);
+    if (result.numUpdatedRows !== 0n) return;
+    // Zero rows is two different conditions with two different cures, and a
+    // caller told the wrong one retries forever or gives up wrongly.
+    const live = await this.db
+      .selectFrom("tag").select("tag_id").where("tag_id", "=", tagId).executeTakeFirst();
+    if (live === undefined) throw new TagNotFound(`no tag ${tagId} to refresh`);
+    throw new TagRefreshStale(
+      `tag ${tagId} was refreshed by someone else since this decision read it; ` +
+        `re-read the live tag and decide again`,
+    );
   }
 
   /**
@@ -166,6 +231,25 @@ export class TagRepository {
    * operation and arrives with it. The name says what the nightly job will
    * ask for, so its call site does not change when retirement exists.
    */
+  /**
+   * The live tag on a pair, or null. This is the read M2 needs: its
+   * `tagObservation` takes `LiveTagInput | null` for a (namespace, channel,
+   * aspect), and without this a caller would pull every live tag in the
+   * namespace and filter in memory. The uniqueness is the database's, so at
+   * most one row can match.
+   */
+  async findLive(namespaceId: string, channel: string, aspect: string): Promise<StoredTag | null> {
+    const row = await this.db
+      .selectFrom("tag")
+      .select(COLUMNS)
+      .where("namespace_id", "=", namespaceId)
+      .where("channel", "=", channel)
+      .where("aspect", "=", aspect)
+      .where("retired_at", "is", null)
+      .executeTakeFirst();
+    return row === undefined ? null : toStored(row);
+  }
+
   async listLive(namespaceId: string, since?: Date): Promise<StoredTag[]> {
     let q = this.db
       .selectFrom("tag")

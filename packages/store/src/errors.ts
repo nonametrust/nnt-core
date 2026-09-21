@@ -22,6 +22,11 @@ export class NamespaceAltered extends StoreError {}
 // one: the tag table is meant to be updated, so a refusal here says an update
 // broke a rule the arithmetic holds, not that the row was immutable.
 export class TagAltered extends StoreError {}
+// Raised in TypeScript by `refresh`, and deliberately not a ConstraintViolation:
+// nothing was refused by the database, the caller's read is simply older than
+// the row. The cure is to read the live tag again and decide again, which is
+// a different instruction from "this tag does not exist".
+export class TagRefreshStale extends StoreError {}
 // Raised in TypeScript, like NamespaceShredded, so it carries no SQLSTATE. It
 // exists because an erasure request naming a subject that has no row must not
 // resolve as success: nothing was examined, and "the data is gone" would be

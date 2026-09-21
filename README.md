@@ -141,6 +141,13 @@ true. The ones worth knowing before you add a file:
   store, so the shape is declared twice and this gate reads both
   declarations as text and compares names and written types. Refuses to
   report green unless it finds the Welford fields in each.
+- **The two `TagRefresh` declarations agree field for field**
+  (`gates/tag-refresh-shape.test.ts`), sharing its reader with the gate
+  above (`gates/interface-fields.ts`). The consequence of a drift is worse
+  here: the store writes these four values as handed and recomputes none of
+  them, so a field the arithmetic starts returning and the store does not
+  know about is simply not written, the refresh appears to succeed, and the
+  row is left half-updated with nothing raising anything.
 - **The schema version is checked exactly** on every observation
   (`packages/schema/src/payloads.test.ts`), and the golden fixtures must all
   validate (`packages/schema/src/fixtures.test.ts`).

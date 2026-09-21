@@ -6,11 +6,11 @@ import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
-import { ConstraintViolation, StoreError, TagNotFound } from "../errors.js";
+import { ConstraintViolation, StoreError, TagNotFound, TagRefreshStale } from "../errors.js";
 import { strengthAt } from "../strength.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
-import { TagRepository } from "./tag.js";
+import { TagRepository, type TagRefresh } from "./tag.js";
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -122,7 +122,7 @@ describe("what the table refuses to hold", () => {
   // real surface.
   it("offers no way to delete a tag by identifier, because suppression is not deletion", async () => {
     expect(Object.getOwnPropertyNames(TagRepository.prototype).sort()).toEqual([
-      "constructor", "get", "listLive", "open", "refresh", "suppress",
+      "constructor", "findLive", "get", "listLive", "open", "refresh", "suppress",
     ]);
     expect(Object.getOwnPropertyNames(TagRepository).sort()).toEqual(["length", "name", "prototype"]);
     expect(Object.keys(await import("./tag.js")).sort()).toEqual(["TagRepository"]);
@@ -164,7 +164,7 @@ describe("what the table refuses to hold", () => {
           .execute(db),
       ).rejects.toMatchObject({ code: "23514" });
     }
-    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p1", g0: 0.5 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p1", g0: 0.5, taggedAt: clock.now() });
     await expect(
       sql`update tag set g0 = 'NaN'::float8 where tag_id = ${t.tagId}`.execute(db),
     ).rejects.toMatchObject({ code: "23514" });
@@ -189,7 +189,7 @@ describe("what the table refuses to hold", () => {
 
   it("refuses a tag whose namespace is not the observation's, by foreign key", async () => {
     const stranger = (await namespaces.ensure({ kind: "wallet", id: "STRANGER" })).namespaceId;
-    const opened = repo.open({ namespaceId: stranger, observationId: obs, channel: "volume", aspect: "p2", g0: 0.5 });
+    const opened = repo.open({ namespaceId: stranger, observationId: obs, channel: "volume", aspect: "p2", g0: 0.5, taggedAt: clock.now() });
     await expect(opened).rejects.toBeInstanceOf(ConstraintViolation);
     await expect(opened).rejects.toMatchObject({ sqlstate: "23503", constraint: "tag_observation_in_namespace" });
     expect(await repo.listLive(stranger)).toEqual([]);
@@ -198,7 +198,7 @@ describe("what the table refuses to hold", () => {
 
 describe("opening and reading", () => {
   it("round-trips a tag through get, with the defaults a fresh tag carries", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p3", g0: 0.7 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p3", g0: 0.7, taggedAt: clock.now() });
     expect(t.tagId).toMatch(/^[0-9a-f-]{36}$/);
     const read = await repo.get(t.tagId);
     expect(read).toEqual({
@@ -210,9 +210,21 @@ describe("opening and reading", () => {
     });
   });
 
-  it("stamps taggedAt from the injected clock, not from the database's now()", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "latency", aspect: "p4", g0: 0.2 });
-    expect(t.taggedAt.toISOString()).toBe("2026-09-07T00:00:00.000Z");
+  // Inverted by the storage card, and this is the finding the card itself did
+  // not have. M2's decide returns taggedAt from the EVENT's own instant, not
+  // from any clock, and M1's own acceptance test insists the two differ: an
+  // observation ingested a minute after it happened must not be dated at
+  // ingest. Stamped from the clock, every event tag decays from the wrong
+  // instant, and a backfill dates a whole history at the day it was loaded.
+  it("stamps taggedAt from the decision, which for an event is earlier than the clock", async () => {
+    const happened = new Date("2026-09-05T10:00:00.000Z");
+    expect(happened.getTime()).toBeLessThan(clock.now().getTime());
+    const t = await repo.open({
+      namespaceId: ns, observationId: obs, channel: "latency", aspect: "p4",
+      g0: 0.2, taggedAt: happened,
+    });
+    expect(t.taggedAt).toEqual(happened);
+    expect((await repo.get(t.tagId)).taggedAt).toEqual(happened);
   });
 
   // M2 keys the live tag on (namespace, channel, aspect) and tagReading takes
@@ -222,8 +234,8 @@ describe("opening and reading", () => {
   // aspect the tag layer pools exactly what the aspect vocabulary exists to
   // keep apart: a deviation on one asset refreshes a tag another opened.
   it("holds one live tag per namespace, channel and aspect", async () => {
-    await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "usdc:in", g0: 0.4 });
-    const second = repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", aspect: "usdc:in", g0: 0.5 });
+    await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "usdc:in", g0: 0.4, taggedAt: clock.now() });
+    const second = repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", aspect: "usdc:in", g0: 0.5, taggedAt: clock.now() });
     await expect(second).rejects.toBeInstanceOf(ConstraintViolation);
     await expect(second).rejects.toMatchObject({ sqlstate: "23505", constraint: "tag_one_live_per_pair" });
   });
@@ -232,19 +244,19 @@ describe("opening and reading", () => {
   // whole point of the column: two assets moving on one channel are two
   // histories, not one.
   it("opens a second tag on the same channel under a different aspect", async () => {
-    await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "xlm:in", g0: 0.4 });
-    const other = await repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", aspect: "xlm:out", g0: 0.5 });
+    await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "xlm:in", g0: 0.4, taggedAt: clock.now() });
+    const other = await repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", aspect: "xlm:out", g0: 0.5, taggedAt: clock.now() });
     expect(other.aspect).toBe("xlm:out");
   });
 
   // Retirement frees the pair. The operation itself is M4's; the column and
   // the fact that a retired tag stops being live are this card's.
   it("stops counting a retired tag as the live one, and lets the pair open again", async () => {
-    const first = await repo.open({ namespaceId: ns, observationId: obs, channel: "content", aspect: "memo", g0: 0.3 });
+    const first = await repo.open({ namespaceId: ns, observationId: obs, channel: "content", aspect: "memo", g0: 0.3, taggedAt: clock.now() });
     await sql`update tag set retired_at = ${clock.now()} where tag_id = ${first.tagId}`.execute(db);
     const live = await repo.listLive(ns);
     expect(live.map((t) => t.tagId)).not.toContain(first.tagId);
-    const again = await repo.open({ namespaceId: ns, observationId: obs2, channel: "content", aspect: "memo", g0: 0.6 });
+    const again = await repo.open({ namespaceId: ns, observationId: obs2, channel: "content", aspect: "memo", g0: 0.6, taggedAt: clock.now() });
     expect(again.tagId).not.toBe(first.tagId);
   });
 
@@ -255,7 +267,7 @@ describe("opening and reading", () => {
   // moved backward is credited with a future it did not have.
   describe("the guard", () => {
     async function aTag(aspect: string) {
-      return repo.open({ namespaceId: ns, observationId: obs, channel: "latency", aspect, g0: 0.5 });
+      return repo.open({ namespaceId: ns, observationId: obs, channel: "latency", aspect, g0: 0.5, taggedAt: clock.now() });
     }
 
     it("refuses a delete: retirement is a column, not a disappearance", async () => {
@@ -363,7 +375,7 @@ describe("opening and reading", () => {
   });
 
   it("refuses a tag on an observation that does not exist, on the foreign key", async () => {
-    const opened = repo.open({ namespaceId: ns, observationId: randomUUID(), channel: "volume", aspect: "p5", g0: 0.5 });
+    const opened = repo.open({ namespaceId: ns, observationId: randomUUID(), channel: "volume", aspect: "p5", g0: 0.5, taggedAt: clock.now() });
     await expect(opened).rejects.toBeInstanceOf(ConstraintViolation);
     await expect(opened).rejects.toMatchObject({ sqlstate: "23503" });
   });
@@ -375,7 +387,7 @@ describe("opening and reading", () => {
     const before = await rowVersions();
     for (const g0 of [-0.1, Number.NaN, Number.POSITIVE_INFINITY]) {
       await expect(
-        repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p6", g0 }),
+        repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p6", g0, taggedAt: clock.now() }),
       ).rejects.toBeInstanceOf(RangeError);
     }
     expect(await rowVersions()).toEqual(before);
@@ -384,7 +396,7 @@ describe("opening and reading", () => {
 
 describe("suppression", () => {
   it("suppresses by raising the factor and leaves the row in place", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p7", g0: 1 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p7", g0: 1, taggedAt: clock.now() });
     await repo.suppress(t.tagId, 4);
     const after = await repo.get(t.tagId);
     expect(after.suppressionFactor).toBe(4);
@@ -395,14 +407,14 @@ describe("suppression", () => {
   // would slow a tag's decay back down, which is a way to revive evidence
   // that nothing in the design asks for; the larger factor stands.
   it("does not lower a factor already raised", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p8", g0: 1 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p8", g0: 1, taggedAt: clock.now() });
     await repo.suppress(t.tagId, 4);
     await repo.suppress(t.tagId, 2);
     expect((await repo.get(t.tagId)).suppressionFactor).toBe(4);
   });
 
   it("refuses a factor below one or not finite, because that would be deceleration", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p9", g0: 1 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p9", g0: 1, taggedAt: clock.now() });
     for (const factor of [0.5, 0, Number.NaN, Number.POSITIVE_INFINITY]) {
       await expect(repo.suppress(t.tagId, factor)).rejects.toBeInstanceOf(RangeError);
     }
@@ -414,45 +426,113 @@ describe("suppression", () => {
   });
 });
 
-describe("refresh", () => {
-  it("refreshes rather than stacking: the new g0 is the larger of the two", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", aspect: "p10", g0: 0.4 });
-    await repo.refresh(t.tagId, 0.9);
-    await repo.refresh(t.tagId, 0.2);
-    const after = await repo.get(t.tagId);
-    expect(after.g0).toBe(0.9);
-    expect(after.refreshCount).toBe(2);
+describe("findLive", () => {
+  // M2's tagObservation takes the live tag on a pair or null, and until now
+  // the only reader was listLive, so a caller would have had to pull every
+  // live tag in the namespace and filter in memory -- and could not have told
+  // two tags on one pair apart, because the pair was not a key.
+  it("finds the live tag on a pair, and nothing for a pair with none", async () => {
+    const t = await repo.open({
+      namespaceId: ns, observationId: obs, channel: "price", aspect: "usd",
+      g0: 0.5, taggedAt: clock.now(),
+    });
+    expect(await repo.findLive(ns, "price", "usd")).toMatchObject({ tagId: t.tagId });
+    expect(await repo.findLive(ns, "price", "eur")).toBeNull();
+    expect(await repo.findLive(ns, "volume", "usd")).toBeNull();
   });
 
-  // greatest(g0, NaN) is NaN in Postgres, so a NaN refresh that reached the
-  // statement would replace a real g0 with one that no decay curve can read.
-  it("refuses a g0 that is not a finite non-negative number, and leaves the tag as it was", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", aspect: "p11", g0: 0.4 });
-    for (const g0 of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      await expect(repo.refresh(t.tagId, g0)).rejects.toBeInstanceOf(RangeError);
-    }
+  it("stops finding a tag once it is retired, which is what frees the pair", async () => {
+    const t = await repo.open({
+      namespaceId: ns, observationId: obs, channel: "price", aspect: "gbp",
+      g0: 0.5, taggedAt: clock.now(),
+    });
+    await sql`update tag set retired_at = ${clock.now()} where tag_id = ${t.tagId}`.execute(db);
+    expect(await repo.findLive(ns, "price", "gbp")).toBeNull();
+  });
+});
+
+describe("refresh", () => {
+  function aLive(aspect: string, g0 = 0.4) {
+    return repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", aspect, g0, taggedAt: clock.now() });
+  }
+  function next(t: { g0: number; taggedAt: Date; refreshCount: number }, over: Partial<TagRefresh> = {}): TagRefresh {
+    return {
+      g0: t.g0, taggedAt: new Date(t.taggedAt.getTime() + DAY),
+      refreshCount: t.refreshCount + 1, saturationState: "open", ...over,
+    };
+  }
+
+  // The inversion the storage card exists for. M1 took the greater of the
+  // stored g0 and the new one and added one to the count, which was the
+  // store doing arithmetic. M2 does that arithmetic now -- over the DECAYED
+  // strength, which the store cannot compute because it deliberately holds
+  // no half-life -- and returns the four values. The store writes them as
+  // handed, including a g0 that is lower than the one already there.
+  it("writes the g0 the decision returns, even when it is lower than the stored one", async () => {
+    const t = await aLive("r:lower", 0.9);
+    await repo.refresh(t.tagId, next(t, { g0: 0.2 }));
     const after = await repo.get(t.tagId);
-    expect(after.g0).toBe(0.4);
-    expect(after.refreshCount).toBe(0);
+    expect(after.g0).toBe(0.2);
+    expect(after.refreshCount).toBe(1);
+  });
+
+  it("writes the instant, the count and the saturation state the decision returns", async () => {
+    const t = await aLive("r:fields");
+    const at = new Date(t.taggedAt.getTime() + 3 * DAY);
+    await repo.refresh(t.tagId, { g0: 0.8, taggedAt: at, refreshCount: 1, saturationState: "saturated" });
+    expect(await repo.get(t.tagId)).toMatchObject({
+      g0: 0.8, taggedAt: at, refreshCount: 1, saturationState: "saturated",
+    });
+  });
+
+  it("refuses a g0 that is not a finite non-negative number, and leaves the tag as it was", async () => {
+    const t = await aLive("r:g0");
+    for (const g0 of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await expect(repo.refresh(t.tagId, next(t, { g0 }))).rejects.toBeInstanceOf(RangeError);
+    }
+    expect(await repo.get(t.tagId)).toMatchObject({ g0: 0.4, refreshCount: 0 });
+  });
+
+  it("refuses an invalid instant and a count that is not a safe integer", async () => {
+    const t = await aLive("r:args");
+    await expect(repo.refresh(t.tagId, next(t, { taggedAt: new Date(Number.NaN) })))
+      .rejects.toBeInstanceOf(RangeError);
+    await expect(repo.refresh(t.tagId, next(t, { refreshCount: 1.5 })))
+      .rejects.toBeInstanceOf(RangeError);
+    expect(await repo.get(t.tagId)).toMatchObject({ refreshCount: 0 });
   });
 
   it("names a missing tag by class rather than updating nothing quietly", async () => {
-    await expect(repo.refresh(randomUUID(), 0.5)).rejects.toBeInstanceOf(TagNotFound);
+    const t = await aLive("r:missing");
+    await expect(repo.refresh(randomUUID(), next(t))).rejects.toBeInstanceOf(TagNotFound);
   });
 
-  // The reason refresh is one statement. Each of these runs on its own pooled
-  // connection, so up to the pool's width of them are inside Postgres at
-  // once. A read-modify-write would have two of them read the same
-  // refresh_count and one write would vanish; the single statement locks the
-  // row and re-evaluates on the current version, so every one of them lands.
-  it("loses nothing when many refreshes run at once", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", aspect: "p12", g0: 0.1 });
+  // The reason refresh stopped being one merging statement. The merged value
+  // depends on the decayed strength at the caller's instant, and the store
+  // holds no half-life to compute it with, so two refreshes cannot be
+  // combined here at all. The count the caller was handed is the version it
+  // read: one lands, the rest are told their read is stale and the caller
+  // re-reads and recomputes. Silently merging would write a strength that
+  // no decision produced.
+  it("lets exactly one of many concurrent refreshes land, and calls the rest stale", async () => {
+    const t = await aLive("r:race", 0.1);
     const rounds = 40;
-    const values = Array.from({ length: rounds }, (_, i) => ((i * 7919) % rounds) / rounds);
-    await Promise.all(values.map((g0) => repo.refresh(t.tagId, g0)));
-    const after = await repo.get(t.tagId);
-    expect(after.refreshCount).toBe(rounds);
-    expect(after.g0).toBe(Math.max(0.1, ...values));
+    const results = await Promise.allSettled(
+      Array.from({ length: rounds }, (_, i) => repo.refresh(t.tagId, next(t, { g0: i / rounds }))),
+    );
+    const landed = results.filter((r) => r.status === "fulfilled");
+    const stale = results.filter(
+      (r) => r.status === "rejected" && r.reason instanceof TagRefreshStale,
+    );
+    expect(landed).toHaveLength(1);
+    expect(stale).toHaveLength(rounds - 1);
+    expect((await repo.get(t.tagId)).refreshCount).toBe(1);
+  });
+
+  it("tells a stale refresh from a missing tag, because the cures differ", async () => {
+    const t = await aLive("r:stale");
+    await repo.refresh(t.tagId, next(t));
+    await expect(repo.refresh(t.tagId, next(t))).rejects.toBeInstanceOf(TagRefreshStale);
   });
 });
 
@@ -461,7 +541,7 @@ describe("strength", () => {
   // existed, read off one stored tag under a fixed clock, and the table's row
   // versions are the same afterwards: deriving strength wrote nothing.
   it("derives strength from a stored tag at an arbitrary instant with no write", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs3, channel: "volume", aspect: "p13", g0: 1 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs3, channel: "volume", aspect: "p13", g0: 1, taggedAt: clock.now() });
     const before = await rowVersions();
     const stored = await repo.get(t.tagId);
     const at = (iso: string) => strengthAt(stored, new Date(iso), 7 * DAY);
@@ -475,7 +555,7 @@ describe("strength", () => {
   });
 
   it("reads a suppressed tag as weaker at the same instant, from the same row", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs3, channel: "volume", aspect: "p14", g0: 1 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs3, channel: "volume", aspect: "p14", g0: 1, taggedAt: clock.now() });
     const instant = new Date("2026-09-14T00:00:00.000Z");
     const plain = strengthAt(await repo.get(t.tagId), instant, 7 * DAY);
     await repo.suppress(t.tagId, 3);
@@ -499,11 +579,11 @@ describe("listLive", () => {
   });
 
   it("returns the namespace's tags newest first and nobody else's", async () => {
-    const first = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "volume", aspect: "p15", g0: 0.3 });
+    const first = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "volume", aspect: "p15", g0: 0.3, taggedAt: listClock.now() });
     listClock.advance(DAY);
-    const second = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "latency", aspect: "p16", g0: 0.6 });
+    const second = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "latency", aspect: "p16", g0: 0.6, taggedAt: listClock.now() });
     listClock.advance(DAY);
-    const third = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "volume", aspect: "p17", g0: 0.9 });
+    const third = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "volume", aspect: "p17", g0: 0.9, taggedAt: listClock.now() });
     const live = await lister.listLive(otherNs);
     expect(live.map((t) => t.tagId)).toEqual([third.tagId, second.tagId, first.tagId]);
     expect(live.every((t) => t.namespaceId === otherNs)).toBe(true);
