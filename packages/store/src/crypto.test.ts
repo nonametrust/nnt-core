@@ -1,7 +1,15 @@
 import { randomBytes } from "node:crypto";
 import { describe, it, expect } from "vitest";
 import {
-  keyRingFromEnv, newDataKey, seal, open, payloadAad, type PayloadBinding, type Sealed,
+  keyRingFromEnv,
+  newDataKey,
+  open,
+  payloadAad,
+  seal,
+  type PayloadBinding,
+  type Sealed,
+  unwrapUnder,
+  wrapUnder,
 } from "./crypto.js";
 import { CiphertextMalformed, CiphertextRejected, StoreError } from "./errors.js";
 
@@ -31,6 +39,54 @@ function binding(over: Partial<PayloadBinding> = {}): PayloadBinding {
     ...over,
   };
 }
+
+describe("wrapping a key under a key", () => {
+  // Lifted out of the ring so a month key can be wrapped under a namespace
+  // key with the same layout the namespace key already uses under the master.
+  // One layout, so `namespace_key_present`'s 29-byte header stays one number
+  // rather than becoming two that must be kept equal by hand.
+  const outer = randomBytes(32);
+  const inner = randomBytes(32);
+
+  it("round-trips a key under another key", () => {
+    const wrapped = wrapUnder(outer, inner, "ns:2026-09-01");
+    expect(wrapped.length).toBe(29 + 32);
+    expect(unwrapUnder(outer, wrapped, "ns:2026-09-01").equals(inner)).toBe(true);
+  });
+
+  // The binding is the whole point. Without it, copying one period's wrapped
+  // key into another period's row before the first is shredded leaves a live
+  // copy that survives the shred -- and shredding is the only erasure this
+  // design has, so a shred a row copy can evade is not one.
+  it("refuses a wrapped key opened under a different binding, by class", () => {
+    const wrapped = wrapUnder(outer, inner, "ns:2026-09-01");
+    // CiphertextRejected and not CiphertextMalformed: the bytes are the right
+    // shape and the right version, they simply do not authenticate. The two
+    // classes say different things to an operator -- a corrupted row against
+    // a key or a binding that does not belong to it.
+    expect(() => unwrapUnder(outer, wrapped, "ns:2026-10-01")).toThrow(CiphertextRejected);
+    expect(() => unwrapUnder(randomBytes(32), wrapped, "ns:2026-09-01")).toThrow(CiphertextRejected);
+  });
+
+  it("refuses a wrapped key shorter than its header, and an unknown version", () => {
+    const wrapped = wrapUnder(outer, inner, "b");
+    expect(() => unwrapUnder(outer, wrapped.subarray(0, 28), "b")).toThrow(CiphertextMalformed);
+    const bumped = Buffer.from(wrapped);
+    bumped.writeUInt8(99, 0);
+    expect(() => unwrapUnder(outer, bumped, "b")).toThrow(/version 99/);
+  });
+
+  // The ring's own wrap must be these functions and not a second copy of the
+  // layout: a copy drifts, and the drift is silent until a key minted by one
+  // cannot be opened by the other.
+  it("is the same layout the ring wraps a namespace key with", () => {
+    const ring = keyRingFromEnv({ NNT_MASTER_KEY: outer.toString("base64") } as NodeJS.ProcessEnv);
+    const byRing = ring.wrap(inner, "namespace-id");
+    expect(unwrapUnder(outer, byRing, "namespace-id").equals(inner)).toBe(true);
+    const byHand = wrapUnder(outer, inner, "namespace-id");
+    expect(ring.unwrap(byHand, "namespace-id").equals(inner)).toBe(true);
+  });
+});
 
 describe("keyRingFromEnv", () => {
   it("refuses to start without a master key, with no default and no fallback", () => {

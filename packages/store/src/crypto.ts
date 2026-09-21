@@ -170,6 +170,50 @@ function authenticate(decipher: DecipherGCM, body: Buffer, what: string): Buffer
 }
 
 /**
+ * Wrap one key under another, with the versioned layout the ring has always
+ * used under the master: version byte, nonce, tag, encrypted key.
+ *
+ * Lifted out of the ring so that a month key can be wrapped under a
+ * namespace key with the SAME layout rather than a second copy of it. A copy
+ * drifts, and the drift is silent until a key minted by one cannot be opened
+ * by the other; it also keeps `namespace_key_present`'s 29-byte header one
+ * number instead of two that must be kept equal by hand.
+ *
+ * `binding` is the associated data, and it is what stops a wrapped key being
+ * useful anywhere but where it was minted. Without it, copying one period's
+ * wrapped key into another period's row before the first is shredded leaves a
+ * live copy that survives the shred; shredding is the only erasure this
+ * design has, and a shred a row copy can evade is not one.
+ */
+export function wrapUnder(key: Buffer, plaintextKey: Buffer, binding: string): Buffer {
+  const nonce = randomBytes(NONCE_BYTES);
+  const cipher = createCipheriv(ALGORITHM, key, nonce, { authTagLength: TAG_BYTES });
+  cipher.setAAD(Buffer.from(binding, "utf8"));
+  const body = Buffer.concat([cipher.update(plaintextKey), cipher.final()]);
+  return Buffer.concat([Buffer.from([WRAP_VERSION]), nonce, cipher.getAuthTag(), body]);
+}
+
+/** The inverse of `wrapUnder`, refusing anything it did not produce. */
+export function unwrapUnder(key: Buffer, wrapped: Buffer, binding: string): Buffer {
+  if (wrapped.length < WRAP_HEADER_BYTES) {
+    throw new CiphertextMalformed(
+      `wrapped key is ${wrapped.length} bytes, shorter than its ${WRAP_HEADER_BYTES}-byte header`,
+    );
+  }
+  const version = wrapped.readUInt8(0);
+  if (version !== WRAP_VERSION) {
+    throw new CiphertextMalformed(`unknown wrapped-key version ${version}`);
+  }
+  const nonce = wrapped.subarray(1, 1 + NONCE_BYTES);
+  const tag = wrapped.subarray(1 + NONCE_BYTES, WRAP_HEADER_BYTES);
+  const body = wrapped.subarray(WRAP_HEADER_BYTES);
+  const decipher = createDecipheriv(ALGORITHM, key, nonce, { authTagLength: TAG_BYTES });
+  decipher.setAAD(Buffer.from(binding, "utf8"));
+  decipher.setAuthTag(tag);
+  return authenticate(decipher, body, "wrapped key");
+}
+
+/**
  * There is no default master key and no development fallback. A fallback key
  * is a key that reaches production.
  *
@@ -211,29 +255,10 @@ export function keyRingFromEnv(env: NodeJS.ProcessEnv = process.env): KeyRing {
   }
   return {
     wrap(dataKey: Buffer, namespaceId: string): Buffer {
-      const nonce = randomBytes(NONCE_BYTES);
-      const cipher = createCipheriv(ALGORITHM, master, nonce, { authTagLength: TAG_BYTES });
-      cipher.setAAD(Buffer.from(namespaceId, "utf8"));
-      const body = Buffer.concat([cipher.update(dataKey), cipher.final()]);
-      return Buffer.concat([Buffer.from([WRAP_VERSION]), nonce, cipher.getAuthTag(), body]);
+      return wrapUnder(master, dataKey, namespaceId);
     },
     unwrap(wrapped: Buffer, namespaceId: string): Buffer {
-      if (wrapped.length < WRAP_HEADER_BYTES) {
-        throw new CiphertextMalformed(
-          `wrapped key is ${wrapped.length} bytes, shorter than its ${WRAP_HEADER_BYTES}-byte header`,
-        );
-      }
-      const version = wrapped.readUInt8(0);
-      if (version !== WRAP_VERSION) {
-        throw new CiphertextMalformed(`unknown wrapped-key version ${version}`);
-      }
-      const nonce = wrapped.subarray(1, 1 + NONCE_BYTES);
-      const tag = wrapped.subarray(1 + NONCE_BYTES, WRAP_HEADER_BYTES);
-      const body = wrapped.subarray(WRAP_HEADER_BYTES);
-      const decipher = createDecipheriv(ALGORITHM, master, nonce, { authTagLength: TAG_BYTES });
-      decipher.setAAD(Buffer.from(namespaceId, "utf8"));
-      decipher.setAuthTag(tag);
-      return authenticate(decipher, body, "wrapped key");
+      return unwrapUnder(master, wrapped, namespaceId);
     },
     deriveKey(label: string): Buffer {
       if (label.length === 0) {
