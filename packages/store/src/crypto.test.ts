@@ -73,6 +73,7 @@ describe("wrapping a key under a key", () => {
     expect(() => unwrapUnder(outer, wrapped.subarray(0, 28), "b")).toThrow(CiphertextMalformed);
     const bumped = Buffer.from(wrapped);
     bumped.writeUInt8(99, 0);
+    expect(() => unwrapUnder(outer, bumped, "b")).toThrow(CiphertextMalformed);
     expect(() => unwrapUnder(outer, bumped, "b")).toThrow(/version 99/);
   });
 

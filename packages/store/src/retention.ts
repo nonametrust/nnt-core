@@ -43,13 +43,25 @@ export interface RetentionPolicy {
   /**
    * Observations one producer may deliver inside that window.
    *
-   * Sized by a written rule rather than by a sense of what a rate limit
-   * usually is: the largest delivery measured to date must pass in one window
-   * with an order of magnitude to spare. The A1 indexer run delivered 646,890
-   * observations for 100 accounts over 31 days, its busiest account 187,313.
-   * "Ten thousand an hour" would have refused that backfill sixty times over
-   * and turned our own indexer into a denial of service. Re-derived, not
+   * Sized against the one delivery that exists rather than against a sense of
+   * what a rate limit usually is: the A1 indexer run delivered 646,890
+   * observations for 100 accounts over 31 days. "Ten thousand an hour" would
+   * have refused that backfill sixty times over and turned our own indexer
+   * into a denial of service.
+   *
+   * The margin is 1.55x, and saying so is the point. An earlier draft of this
+   * comment claimed an order of magnitude, which the number does not give and
+   * review caught; the sentence was wrong rather than the number. What 1.55x
+   * costs is written down instead: a delivery about 1.6 times the largest one
+   * measured is refused, and the remedy is to re-derive the cap from the new
+   * measurement, which is a policy version, not an edit. Re-derived, not
    * retuned, when the shadow evaluation measures a larger fleet.
+   *
+   * The busiest single account in that run held 187,313 of the 646,890. That
+   * figure does not bind here, because the cap is per producer and the
+   * producer is the indexer; it is the figure that would bind if the cap's
+   * scope were vetoed to per-(producer, namespace), which the plan leaves
+   * open, and it is recorded for that reason and no other.
    */
   readonly producerMaxObservations: number;
 }
@@ -63,6 +75,10 @@ export const RETENTION_V0: RetentionPolicy = Object.freeze({
 });
 
 const DAY_MS = 86_400_000;
+// Anchored, four digits and two digits exactly, and the day is literally 01.
+// Unanchored it would read a year out of "12026-09-01"; loose on width it
+// would accept "2026-9-01". The month range is checked below rather than in
+// the pattern, so the refusal can name what is wrong with it.
 const PERIOD = /^(\d{4})-(\d{2})-01$/;
 
 function requirePositiveInteger(name: string, value: number, floor: number): void {
@@ -121,6 +137,11 @@ export function periodCloses(period: string): Date {
  * When a period's key becomes shreddable. Takes no clock on purpose: a
  * backfill of last year expires a grace after last year's month closed, not a
  * grace after the day it was loaded.
+ *
+ * It does not assert the policy: a fractional `graceDays` produces a
+ * fractional instant here rather than a named refusal. The composition point
+ * calls `assertRetentionPolicy` once, and this function trusts it, the way
+ * every other arithmetic in this package trusts its validated inputs.
  */
 export function expiresAt(period: string, policy: RetentionPolicy): Date {
   return new Date(periodCloses(period).getTime() + policy.graceDays * DAY_MS);
