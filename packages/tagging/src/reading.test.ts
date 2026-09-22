@@ -150,7 +150,7 @@ describe("readObservation", () => {
 
   it("keys protocol by event and content by field, carrying no value", () => {
     const [protocol] = readObservation(fixture("protocol"));
-    expect(protocol).toEqual({ kind: "categorical", channel: "protocol", aspect: "event/trustline_created" });
+    expect(protocol).toEqual({ kind: "categorical", channel: "protocol", aspect: "event/trustline_open" });
     const [content] = readObservation(fixture("content"));
     expect(content).toEqual({ kind: "categorical", channel: "content", aspect: "field/memo" });
     const [address] = readObservation(fixture("address_integrity"));

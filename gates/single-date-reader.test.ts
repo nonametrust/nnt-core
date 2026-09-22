@@ -31,6 +31,11 @@ const packagesDir = fileURLToPath(new URL("../packages/", import.meta.url));
 const EXEMPT = new Set([
   "schema/src/observation.ts", // defines the fields
   "schema/src/timing.ts", // reads them, and is the only module that may
+  // The indexer's mappers construct observations and set the date fields
+  // from Horizon's created_at; they never read a date off an observation.
+  "indexer/src/mapper/content.ts",
+  "indexer/src/mapper/protocol.ts",
+  "indexer/src/mapper/volume.ts",
 ]);
 
 // Every extension the tsconfig admits, so none of them is a way past, and both
