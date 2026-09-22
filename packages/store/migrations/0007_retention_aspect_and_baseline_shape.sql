@@ -13,6 +13,28 @@
 -- Sections, in the order they were grown:
 --   1. baseline: the two shapes M2's arithmetic refuses
 --   2. tag: the aspect it was always keyed on, retirement, and the guard
+--   3. observation: the producer column, and the payload layout that moved
+
+-- Before anything else: this migration moves the byte layout of the payload
+-- envelope, and a stored payload is sealed under the layout that was in force
+-- when it was written. Adding `producer` and `ingested_at` to that envelope
+-- makes every existing ciphertext fail to open, and it would fail to open
+-- silently -- at the first read, far from here, as a CiphertextRejected that
+-- names a tamper rather than a migration.
+--
+-- Nothing has been deployed, so today this refusal never fires and the layout
+-- is free. It is written anyway, because "nothing is deployed" is a belief
+-- about the world and this is the one place that can make it a fact the
+-- database checks. Over stored rows the honest answer is a re-encryption,
+-- which is a separate migration with a key schedule of its own, not a column
+-- added quietly beside them.
+do $$
+begin
+  if exists (select 1 from observation) then
+    raise exception
+      'migration 0007 re-keys the payload envelope and cannot run over stored observations; re-encrypting them is a separate migration';
+  end if;
+end $$;
 
 -- === 1. baseline: the two shapes M2's arithmetic refuses =====================
 --
@@ -169,3 +191,29 @@ $$;
 create trigger tag_guard_trigger
   before update or delete on tag
   for each row execute function tag_guard();
+
+
+-- === 3. observation: the producer column, and the payload layout that moved ==
+--
+-- `producer` is the bare name of the component that delivered the
+-- observation, and it is derived by `append` from the source the observation
+-- carries -- never passed in beside it. That is the rule the table has held
+-- since 0002: every column beside the payload comes from one parsed object,
+-- so the columns and the evidence cannot disagree.
+--
+-- It becomes a column of its own for two reasons. The read path has to
+-- rebuild the payload envelope from the row alone, and the envelope now binds
+-- the producer, so the value must be on the row. And the per-producer cap
+-- counts rows by it, which a value buried inside the ciphertext could not do.
+--
+-- The regex is the schema's own (sourceSchema.producer in @nonametrust/schema:
+-- lowercase alphanumeric segments joined by single hyphens, no leading,
+-- trailing or doubled hyphen). It is restated here rather than referenced
+-- because a check constraint cannot import one, and it is restated in full
+-- rather than loosened: a check that admits more than the schema does is a
+-- check that lets a raw writer store what the repository never could. That
+-- duplication is the cost, and it is the two-shapes rule M1 set -- the
+-- TypeScript refuses first and names the class, the table refuses everyone.
+alter table observation
+  add column producer text not null
+  constraint observation_producer_shape check (producer ~ '^[a-z0-9]+(-[a-z0-9]+)*$');

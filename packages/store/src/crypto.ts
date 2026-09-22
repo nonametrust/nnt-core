@@ -29,17 +29,22 @@ const WRAP_HEADER_BYTES = 1 + NONCE_BYTES + TAG_BYTES;
 // part, for the reason the schema states: without a separator that cannot
 // occur inside a field, two adjacent parts can be re-partitioned into a
 // different tuple with the same concatenation, and the ciphertext would open
-// under a row it was not sealed for. Four of the six parts cannot carry a
-// NUL by construction, a uuid, a hex digest, one of two fixed words and an
-// ISO instant; channel and kind are free strings and can, and the refusal
-// is what makes the property hold for them, and for a caller this package
-// has not met yet.
+// under a row it was not sealed for. Five of the eight parts cannot carry a
+// NUL by construction, a uuid, a hex digest, one of two fixed words and two
+// ISO instants; channel, kind and producer are free strings and can, and the
+// refusal is what makes the property hold for them, and for a caller this
+// package has not met yet. The producer's own schema refuses far more than a
+// NUL, but this function is handed a string and cannot see which schema it
+// came from.
 //
 // The byte layout of the associated data is frozen once a payload is stored.
-// Changing it makes every existing ciphertext fail to open. It was changed
-// once, before anything was deployed, to take in the columns beside the
-// payload; that cost nothing then and would be a re-encryption of every row
-// now.
+// Changing it makes every existing ciphertext fail to open. It has been
+// changed twice, both times before anything was deployed: once to take in the
+// columns the store derives beside the payload, and once more to take in the
+// last two of them, `producer` and `ingested_at`. That cost nothing both
+// times and would be a re-encryption of every row now, which is why the
+// migration that adds those columns refuses to run over a non-empty table
+// rather than leaving the cost to be discovered at the first read.
 const SEPARATOR = "\u0000";
 
 // The rendering of a row that carries no instant. A state has none, and the
@@ -79,7 +84,7 @@ export function newDataKey(): Buffer {
  * store derived from it and keeps beside it. The namespace and the key put
  * the ciphertext on one row; without them an attacker with write access to
  * the table could swap two counterparties' evidence without breaking any
- * signature we hold. The other four are the same threat carried one step
+ * signature we hold. The other six are the same threat carried one step
  * further. Under that model the append-only trigger is already assumed
  * bypassed, since a swap needs an UPDATE too, and so a derived column can be
  * moved while the payload still opens: the promotion trigger measures a
@@ -88,11 +93,18 @@ export function newDataKey(): Buffer {
  * in the store able to tell. Bound here, a rewritten column fails to open,
  * which is the refusal a moved row already gets.
  *
- * `datedAt` is the Date the column holds, on both sides: the writer passes
- * the Date it is about to store and the reader passes the Date it read back,
- * and both render it the one way `toISOString` does. The wire string is not
- * used, because the schema admits more than one spelling of an instant and
- * the column keeps only what a Date keeps.
+ * `datedAt` and `ingestedAt` are the Dates the columns hold, on both sides:
+ * the writer passes the Date it is about to store and the reader passes the
+ * Date it read back, and both render it the one way `toISOString` does. The
+ * wire string is not used, because the schema admits more than one spelling
+ * of an instant and the column keeps only what a Date keeps.
+ *
+ * The two instants are not interchangeable and neither may be derived from
+ * the other: `datedAt` is when the evidence happened and is null for a state,
+ * `ingestedAt` is when this store wrote it and is never null. `ingestedAt` is
+ * also what the retention period is computed from, so a rewrite of it would
+ * move a row into another month's key without moving its ciphertext; bound
+ * here, that rewrite is a refusal rather than a silent re-filing.
  */
 export interface PayloadBinding {
   namespaceId: string;
@@ -100,18 +112,74 @@ export interface PayloadBinding {
   evidenceKind: string;
   channel: string;
   kind: string;
+  producer: string;
+  ingestedAt: Date;
   datedAt: Date | null;
 }
 
+/**
+ * The order of the parts is fixed and is a rule in its own right. Nothing
+ * else holds it: seal and open render the same binding the same way, so any
+ * consistent order round-trips, and a swap would be invisible everywhere but
+ * in the test that pins this list.
+ *
+ * `datedAt` stays last because it is the only part that may render empty, and
+ * an empty part is told from a missing one only by position: a separator with
+ * nothing after it is a null instant and nothing else.
+ */
 export function payloadAad(b: PayloadBinding): Buffer {
-  const parts = [
+  return joinParts([
     b.namespaceId,
     b.idempotencyKey,
     b.evidenceKind,
     b.channel,
     b.kind,
+    b.producer,
+    b.ingestedAt.toISOString(),
     b.datedAt === null ? UNDATED : b.datedAt.toISOString(),
-  ];
+  ]);
+}
+
+/**
+ * What a promoted copy of a payload is bound to. A permanent record is sealed
+ * under the same namespace data key as the observation it rescues, so the two
+ * envelopes share a key and must not share a domain: without separation a
+ * record's ciphertext and an observation's could be exchanged for each other
+ * under the write access this binding already assumes.
+ *
+ * The first part is the literal below. The reason usually given for it is
+ * that no uuid can equal it, and that is true but not what carries the
+ * property, since this package does not check that a namespace id is a uuid.
+ * What carries it is the part count: a permanent envelope joins six parts and
+ * a payload envelope eight, no part may contain the separator, so the two can
+ * never be equal for any inputs at all.
+ *
+ * `originalDatedAt` is not nullable. A state has no instant to preserve and
+ * `promote` refuses one before a record is ever sealed, which is also why the
+ * column is `not null` in 0004.
+ */
+export interface PermanentBinding {
+  recordId: string;
+  observationId: string;
+  namespaceId: string;
+  originalDatedAt: Date;
+  promotedAt: Date;
+}
+
+const PERMANENT_DOMAIN = "permanent";
+
+export function permanentAad(b: PermanentBinding): Buffer {
+  return joinParts([
+    PERMANENT_DOMAIN,
+    b.recordId,
+    b.observationId,
+    b.namespaceId,
+    b.originalDatedAt.toISOString(),
+    b.promotedAt.toISOString(),
+  ]);
+}
+
+function joinParts(parts: string[]): Buffer {
   for (const part of parts) {
     if (part.includes(SEPARATOR)) {
       throw new RangeError("associated data field contains NUL, the part separator");

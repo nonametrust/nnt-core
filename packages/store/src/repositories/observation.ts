@@ -92,6 +92,8 @@ export class ObservationRepository {
       evidenceKind: stored.evidenceKind,
       channel: stored.channel,
       kind: stored.kind,
+      producer: stored.source.producer,
+      ingestedAt,
       datedAt: datedColumn,
     }));
 
@@ -107,6 +109,7 @@ export class ObservationRepository {
           evidence_kind: stored.evidenceKind,
           dated_at: datedColumn,
           ingested_at: ingestedAt,
+          producer: stored.source.producer,
           payload_nonce: sealed.nonce,
           payload_tag: sealed.tag,
           payload_ciphertext: sealed.ciphertext,
@@ -154,6 +157,7 @@ export class ObservationRepository {
       .selectFrom("observation")
       .select([
         "namespace_id", "idempotency_key", "evidence_kind", "channel", "kind", "dated_at",
+        "ingested_at", "producer",
         "payload_nonce", "payload_tag", "payload_ciphertext",
       ])
       .where(column, "=", value)
@@ -171,6 +175,8 @@ export class ObservationRepository {
         evidenceKind: row.evidence_kind,
         channel: row.channel,
         kind: row.kind,
+        producer: row.producer,
+        ingestedAt: row.ingested_at,
         datedAt: row.dated_at,
       }),
     );

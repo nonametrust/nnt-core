@@ -126,10 +126,11 @@ describe("the invariant the table holds on its own", () => {
     return sql`
       insert into observation (
         observation_id, idempotency_key, namespace_id, channel, kind, evidence_kind,
-        dated_at, ingested_at, payload_nonce, payload_tag, payload_ciphertext
+        dated_at, ingested_at, producer, payload_nonce, payload_tag, payload_ciphertext
       )
       select ${randomUUID()}, ${randomUUID()}, namespace_id, 'protocol', 'raw', ${evidenceKind},
-        ${datedAt}, ${clock.now()}, decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
+        ${datedAt}, ${clock.now()}, 'raw-writer',
+        decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
       from namespace limit 1
     `.execute(db);
   }
@@ -302,6 +303,13 @@ describe("the columns beside the payload", () => {
       sql`channel = 'latency'`,
       sql`kind = 'tampered'`,
       sql`evidence_kind = 'state', dated_at = null`,
+      sql`producer = 'tampered'`,
+      // An hour moves the instant without moving its calendar month; a month
+      // moves the bucket the retention key is chosen by. Both are refused by
+      // the envelope, and the second is the one that would otherwise re-file
+      // a row under a key that was never used to seal it.
+      sql`ingested_at = ingested_at + interval '1 hour'`,
+      sql`ingested_at = ingested_at + interval '1 month'`,
     ];
     for (const move of moves) {
       await expect(
@@ -319,6 +327,63 @@ describe("the columns beside the payload", () => {
     const again = await observations.get(id);
     expect(again.channel).toBe("volume");
     expect(again.kind).toBe("payment");
+  });
+
+  // The producer is derived by `append` from the source the observation
+  // carries, not passed in beside it: every column beside the payload comes
+  // from the one parsed object, which is the rule observation.test's own
+  // derived-column test states. It is a column of its own because the read
+  // path has to rebuild the envelope from the row alone, and because the
+  // producer cap counts rows by it.
+  it("writes the producer the source named, as a column of its own", async () => {
+    const { observation } = await observations.append(
+      anEvent({ source: { ...src, ref: "op:producer:1" } }),
+    );
+    const row = await db.selectFrom("observation").select(["producer"])
+      .where("observation_id", "=", observation.observationId!).executeTakeFirst();
+    expect(row?.producer).toBe("stellar-indexer");
+  });
+
+  // The schema already refuses a producer that is not a bare lowercase name,
+  // so the repository cannot write one. This refuses it from a writer that
+  // did not come through the schema, which is the two-shapes rule M1 set: the
+  // TypeScript refuses first and names the class, and the table refuses
+  // everyone.
+  it("refuses a producer the schema would refuse, from a raw writer, by constraint name", async () => {
+    const { observation } = await observations.append(
+      anEvent({ source: { ...src, ref: "op:producer:2" } }),
+    );
+    const id = observation.observationId!;
+    for (const bad of ["Stellar-Indexer", "stellar_indexer", "-stellar", "stellar--indexer", ""]) {
+      await expect(
+        db.transaction().execute(async (trx) => {
+          await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+          await sql`update observation set producer = ${bad} where observation_id = ${id}`.execute(trx);
+        }),
+        bad,
+      ).rejects.toMatchObject({ code: "23514", constraint: "observation_producer_shape" });
+    }
+  });
+
+  // The shape check admits a null, because `producer ~ '...'` is null rather
+  // than false for one, and a check constraint passes on null. So the shape
+  // and the not-null are two separate rules and this holds the second.
+  //
+  // What a null costs is not a missing label: the read path rebuilds the
+  // envelope from the row, so a null producer reaches `joinParts` as a
+  // non-string and crashes with a TypeError from inside the crypto module,
+  // which is neither a refusal this store owns nor one an operator can read.
+  it("refuses a producer that is absent, which the shape check alone would admit", async () => {
+    const { observation } = await observations.append(
+      anEvent({ source: { ...src, ref: "op:producer:3" } }),
+    );
+    const id = observation.observationId!;
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+        await sql`update observation set producer = null where observation_id = ${id}`.execute(trx);
+      }),
+    ).rejects.toMatchObject({ code: "23502", column: "producer" });
   });
 });
 

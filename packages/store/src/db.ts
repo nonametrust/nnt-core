@@ -25,6 +25,7 @@ export interface Schema {
     evidence_kind: string;
     dated_at: Date | null;
     ingested_at: Date;
+    producer: string;
     payload_nonce: Buffer;
     payload_tag: Buffer;
     payload_ciphertext: Buffer;

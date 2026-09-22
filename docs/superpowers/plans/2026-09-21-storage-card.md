@@ -105,6 +105,35 @@ the decision** — the alternative was to delete a constructor parameter that
 had quietly become dead. Cost if wrong: an engine whose clock runs ahead of
 the store's has legitimate decisions refused; in v0 both are one process.
 
+**R13. The eight-part envelope lands with the `producer` column and the
+migration preamble, which the plan assigned to Task 6.** Task 4 is scoped "no
+database", but `PayloadBinding` gaining `producer` breaks `observation.ts`:
+`append` has `source.producer`, and `read` has no column to rebuild it from.
+The envelope cannot land half-wired, and binding a value the read side cannot
+verify would be a binding in name only -- it would round-trip, because seal
+and open would agree on the same invented value, and no test would see it. So
+`producer` (with its shape check and its not-null) and the R6 preamble came
+forward with the layout move that needs them; F5 already tied the preamble to
+that move. Task 6 keeps `period`, the period check, the `namespace_key`
+foreign key, the `(producer, ingested_at)` index and the observation
+catalogue pin, all of which genuinely wait on Task 5. Cost: Task 4 touches
+the migration after all, so its reviewer reads SQL the plan did not promise
+there; and Task 6 is smaller than its own acceptance list reads.
+
+**Correction to Task 4's acceptance text:** it says "a payload sealed under
+the seven-part layout fails to open under the eight-part one". The layout
+that shipped has six parts, not seven; the test built the six-part envelope
+by hand and proves it. Nothing else depended on the number.
+
+**Correction to `permanentAad`'s stated reason.** The plan says the domain
+literal works because "no uuid can equal `permanent`". That is true and it is
+not what carries the property: `payloadAad` does not check that its namespace
+id is a uuid, so a caller passing the literal itself is the case that reason
+does not cover. What carries it is the part count -- six against eight, with
+no part allowed to contain the separator -- so the two envelopes cannot be
+equal for any inputs at all. The test asserts the adversarial case and the
+structural reason, not the slogan.
+
 **Carried, not ruled:** a tag may still move from `open` to `saturated` with
 the count unchanged. Nothing in M2's arithmetic produces it and nothing
 refuses it; it belongs on M4's card beside retirement rather than being
