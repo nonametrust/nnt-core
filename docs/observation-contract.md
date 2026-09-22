@@ -402,14 +402,17 @@ türü tek bir `kind` yazımı alır, bir kez seçilir, her yerde o kullanılır
 Fixture'lardaki yazımlar referans. Geri dönüşün `kind`'ı ileri gidişle aynıdır
 (`payment_address_changed`), çünkü aynı olay türü: bir geçiş.
 
-Beklediğimiz `kind`'lar, kanal başına. İki sütun ayrı tutuldu: soldakiler bir
-fixture'da duruyor ve testten geçiyor, sağdakiler bu dokümandan başka hiçbir
-yerde yok, önerdik. **Şema ikisini de kontrol etmiyor**; sözlük, indexer
-gerçekte ne ürettiğini gördükten sonra dondurulacak.
+Beklediğimiz `kind`'lar, kanal başına. Sütunlar fixture'ın **nerede**
+durduğunu söylüyor, çünkü kanal fixture'ları tek bir karşı tarafın hikâyesi ve
+o dizin kanal başına tam bir dosyada kilitli (`fixtures.test.ts`). Kanal
+başına düşmeyen `kind`'lar `fixtures/kinds/` altında, kind adıyla; hepsi
+doğrulanıyor ve hepsi aynı namespace'e ait. **Şema hâlâ `kind`'ı kontrol
+etmiyor**; sözlük, indexer gerçekte ne ürettiğini gördükten sonra dondurulup
+enum'a çevrilecek ve dondurmanın dayanağı bu dosyalar.
 
-| Kanal | Fixture'da var | Önerilen, henüz hiçbir yerde yok |
+| Kanal | Kanal fixture'ında | `fixtures/kinds/` altında |
 |---|---|---|
-| `volume` | `payment` | `path_payment`, `create_account` |
+| `volume` | `payment` | `path_payment`, `create_account`, `sac_transfer` |
 | `protocol` | `trustline_open` (state) | `trustline_closed` (event), `claimable_balance_offered` (event), `account_flags_changed` (event) |
 | `content` | `memo` | – |
 | `cluster_proximity` | `dust_received` | – |

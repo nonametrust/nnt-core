@@ -142,6 +142,73 @@ describe("golden fixtures", () => {
     });
   });
 
+  // Contract section 12: a new `kind` is written into a fixture, because the
+  // list is frozen into a schema enum once the indexer's real output is
+  // known and the freeze needs ground truth rather than prose. The seven
+  // channel fixtures carry one kind each, so the kinds the indexer also
+  // produces had none. They live in their own directory: the channel
+  // fixtures are one counterparty's story and `has one fixture per channel`
+  // keeps that directory exact.
+  describe("kinds", () => {
+    const kindsDir = join(dir, "kinds");
+    // Every kind the indexer produces, minus the six already carried by a
+    // channel fixture. Written out rather than imported: the schema package
+    // does not depend on the indexer, and the day this list and
+    // `mapper/kinds.ts` disagree is the day one of them changed silently.
+    const EXTRA_KINDS = [
+      "path_payment", "create_account", "sac_transfer",
+      "trustline_closed", "claimable_balance_offered", "account_flags_changed",
+    ];
+
+    it("has one fixture per kind no channel fixture carries", () => {
+      const names = readdirSync(kindsDir).filter((f) => f.endsWith(".json")).map((f) => f.replace(/\.json$/, ""));
+      expect(names.sort()).toEqual([...EXTRA_KINDS].sort());
+    });
+
+    it("every one validates, and its kind is its file name", () => {
+      for (const k of EXTRA_KINDS) {
+        const raw = JSON.parse(readFileSync(join(kindsDir, `${k}.json`), "utf8")) as Record<string, unknown>;
+        expect(validateObservation(raw).ok, `${k} fixture failed`).toBe(true);
+        expect(raw.kind, `${k} fixture carries the wrong kind`).toBe(k);
+      }
+    });
+
+    it("every one belongs to the same counterparty as the channel fixtures", () => {
+      const ns = JSON.stringify(fixture("volume").namespace);
+      for (const k of EXTRA_KINDS) {
+        const raw = JSON.parse(readFileSync(join(kindsDir, `${k}.json`), "utf8")) as Record<string, unknown>;
+        expect(JSON.stringify(raw.namespace), `${k} fixture is about someone else`).toBe(ns);
+      }
+    });
+
+    // The whole point of the ruling on issue #3: the aspect a protocol
+    // baseline is keyed on must not be the source's word.
+    it("no protocol fixture carries a source effect name in payload.event", () => {
+      const sourceNames = new Set(["trustline_created", "trustline_removed", "claimable_balance_claimant_created", "account_flags_updated"]);
+      const all = [fixture("protocol"), ...EXTRA_KINDS.map((k) => JSON.parse(readFileSync(join(kindsDir, `${k}.json`), "utf8")) as Record<string, unknown>)];
+      for (const f of all) {
+        if (f.channel !== "protocol") continue;
+        const event = (f.payload as { event: string }).event;
+        expect(sourceNames.has(event), `${String(f.kind)} fixture carries the source's name`).toBe(false);
+        expect(event).toBe(f.kind);
+      }
+    });
+
+    it("the six derive six keys, all different from the channel fixtures'", () => {
+      const keys = new Set<string>();
+      for (const c of CHANNELS) {
+        const r = validateObservation(fixture(c));
+        if (r.ok) keys.add(r.value.idempotencyKey);
+      }
+      const before = keys.size;
+      for (const k of EXTRA_KINDS) {
+        const r = validateObservation(JSON.parse(readFileSync(join(kindsDir, `${k}.json`), "utf8")));
+        if (r.ok) keys.add(r.value.idempotencyKey);
+      }
+      expect(keys.size).toBe(before + EXTRA_KINDS.length);
+    });
+  });
+
   // The gate that no tracked file contains a Stellar-shaped address lives at
   // the repository root, gates/no-stellar-address.test.ts, and scans every
   // tracked file, these fixtures included. It used to live here and covered

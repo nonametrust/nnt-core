@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "0.1.0",
+  "namespace": {
+    "kind": "endpoint",
+    "id": "https://data.example/x402"
+  },
+  "channel": "volume",
+  "evidenceKind": "event",
+  "kind": "path_payment",
+  "observedAt": "2026-09-02T09:14:11.000Z",
+  "source": {
+    "producer": "stellar-indexer",
+    "producerVersion": "0.1.0",
+    "network": "stellar:pubnet",
+    "ref": "op:214720397314",
+    "fetchedAt": "2026-09-01T08:00:20.000Z"
+  },
+  "payload": {
+    "amount": "12.0000000",
+    "assetCode": "USDC",
+    "direction": "in"
+  },
+  "salienceHints": {
+    "amount": "12.0000000"
+  }
+}

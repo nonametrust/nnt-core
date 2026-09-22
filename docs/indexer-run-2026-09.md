@@ -83,7 +83,7 @@ comes from one build. The counters below are that run's
 |---|---|
 | Coverage | 100 accounts x 31 days; 646,890 observations, 100 namespaces |
 | Deduplication | same range run a second time with `--force --compare`: 0 keys only in the previous file, 0 only in the current, exit 0; the file itself holds 646,890 distinct keys |
-| Dropped records with reason | 3,676,280, every one with a reason (table below); no `duplicate_key_in_run`, no `claimable_creator_unresolved`, no `invalid_account_id` |
+| Dropped records with reason | 3,676,280, every one with a reason (table below); no `duplicate_key_in_run`, no `invalid_account_id` |
 | Coverage ratio | 420,356 volume observations from 420,474 payment-family records read: 0.9997; the 118 records that did not become observations are Soroban transfer entries between two contracts inside an invocation the followed wallet took part in (`not_followed`) |
 | Muxed share | 1 of 420,474 payment-family records carried a muxed side (`to_muxed_id`), and it was the counterparty's side: `muxed_followed` 0, `muxed_resolved` 0, so the criterion `muxed_resolved == muxed_followed` holds and no observation carries a `muxedId` |
 | Cost | 8,782 distinct Horizon pages for the 100 accounts, 87.8 per account, 0.0136 per observation; at Horizon's pace (1.25 s per request) about 3 h 03 min of request time; the live fetch was spread over four days by the stops in section 4a (the last live run: 1,452 requests, 2,610 s wall for 12 accounts) |
@@ -129,18 +129,30 @@ already held — counts as written, because it exists.
 
 - **payments** 420,474 = 420,356 written + 118 dropped. The reasons that can
   enter `dropped.payments`: `not_followed` (118 here), `invalid_account_id`,
-  `validation_failed`, `duplicate_key_in_run` (none here). `sac_non_transfer`
-  and `failed_transaction` are counted by the reader, before the record is
-  read into the payments stream, so they say what Horizon returned and the
-  indexer refused and sit outside this identity by construction.
+  `validation_failed`, `duplicate_key_in_run` (none here). `sac_non_transfer`,
+  `failed_transaction`, `unsupported_type`, `sac_no_entries` and
+  `amount_missing` are counted by the reader, before the record is read into
+  the payments stream, so they say what Horizon returned and the indexer
+  refused and sit outside this identity by construction. The list used to
+  stop after the first two, which left `unsupported_type` documented nowhere
+  although the code has always emitted it.
 - **memos** 251,417 = 220,668 written + 30,749 dropped. The reasons that can
   enter `dropped.memos`: `memo_non_text` (30,734), `memo_empty` (15),
   `invalid_account_id`, `validation_failed`, `duplicate_key_in_run` (none).
 - **effects** 5,902 = 5,866 written + 36 dropped. The reasons that can enter
-  `dropped.effects`: `trustline_updated_skipped` (36),
-  `claimable_creator_unresolved`, `invalid_account_id`, `validation_failed`,
-  `duplicate_key_in_run` (none). `effect_ignored` is counted by the reader
-  before the effects stream, like `sac_non_transfer` above.
+  `dropped.effects`: `trustline_updated_skipped` (36), `invalid_account_id`,
+  `validation_failed`, `duplicate_key_in_run` (none). `effect_ignored` is
+  counted by the reader before the effects stream, like `sac_non_transfer`
+  above.
+
+Two reasons in `DROP_REASONS` are **reserved, not measured**, and this report
+used to print one of them as a zero: `claimable_creator_unresolved` waits for
+a channel that needs a claimable balance's creator rather than its claimant,
+and `muxed_base_address` was superseded when muxed addresses began resolving
+to their base with the id carried in `namespace.muxedId`. No code path emits
+either, so "0" said the run met none where the truth is that none can occur.
+They are listed in `RESERVED_DROP_REASONS` now, next to the reason they are
+reserved.
 
 `retries` 1, `page_limit_reduced` 1, `retention_refusals` 0.
 
@@ -166,7 +178,7 @@ One line per open point of spec section 12, with what the run showed:
   measured. Not a real-traffic concern for these accounts in this month.
 - **`account_flags_updated`.** Not seen once; the `account_flags_changed`
   kind and its `event` value stay untested by live data.
-- **`duplicate_key_in_run`.** 0. **`claimable_creator_unresolved`.** 0.
+- **`duplicate_key_in_run`.** 0, and this one is measured: the code emits it.
 
 ## 4a. Traps met during the run, not in the brief
 
@@ -210,6 +222,15 @@ One line per open point of spec section 12, with what the run showed:
   2026-09-15 on issue #3: a ref names a value movement, not an operation).
   Entries of kind `mint`, `burn` and `clawback` are counted
   `sac_non_transfer` and not observed.
+- `sac_no_entries` and `amount_missing` did not exist when this run was
+  made and so appear nowhere in its counters. The first names an
+  `invoke_host_function` record whose `asset_balance_changes` is absent or
+  empty: it was counted as read and then produced neither observation nor
+  drop. The second names a payment-family record arriving without its
+  `amount`, which `?? "0"` turned into an observation of a zero-value
+  movement — written, and counted as coverage. **Whether this run contained
+  either shape is not knowable from its counters**, so the coverage ratio
+  below is an upper bound until a re-run reports the two reasons.
 - Both deduplication figures — this section's and section 3's — were
   measured with the second run served from the page cache (8,780 cache hits,
   2 live requests). They establish that the pipeline maps identical input to

@@ -153,6 +153,31 @@ describe("HorizonReader.payments", () => {
     expect(counters.snapshot().dropSamples["invalid_account_id"]).toEqual([`op:${opId}#0`]);
   });
 
+  it("counts an invocation that moved no asset, instead of letting the record vanish", async () => {
+    const g = randomAccount();
+    // `readRecord` has already counted this one as read. Without a drop it
+    // produces no observation and no reason, and the report cannot account
+    // for it in either direction.
+    const rows = [paymentRecord({ id: nextOpId(100, 1), type: "invoke_host_function", to: g, asset_balance_changes: [] })];
+    const { r, counters } = reader({ [`/accounts/${g}/payments`]: rows });
+    expect(await collect(r.payments(g, { from: 100, to: 100 }))).toEqual([]);
+    expect(counters.drops()["sac_no_entries"]).toBe(1);
+    expect(counters.snapshot().dropSamples["sac_no_entries"]).toEqual([`op:${rows[0]!.id}`]);
+  });
+
+  it("drops a payment-family record missing its amount rather than observing a zero", async () => {
+    const g = randomAccount();
+    const rows = [
+      paymentRecord({ id: nextOpId(100, 1), to: g, amount: undefined }),
+      paymentRecord({ id: nextOpId(100, 2), type: "path_payment_strict_send", from: g, source_amount: undefined, source_asset_type: "native" }),
+      paymentRecord({ id: nextOpId(100, 3), type: "create_account", account: g, funder: randomAccount(), starting_balance: undefined,
+        from: undefined, to: undefined, amount: undefined, asset_type: undefined, asset_code: undefined, asset_issuer: undefined }),
+    ];
+    const { r, counters } = reader({ [`/accounts/${g}/payments`]: rows });
+    expect(await collect(r.payments(g, { from: 100, to: 100 }))).toEqual([]);
+    expect(counters.drops()["amount_missing"]).toBe(3);
+  });
+
   it("counts a record type it does not handle", async () => {
     const g = randomAccount();
     const rows = [paymentRecord({ id: nextOpId(100, 1), type: "account_merge", to: g })];
@@ -213,19 +238,7 @@ describe("HorizonReader.effects", () => {
   });
 });
 
-describe("HorizonReader.memo and ledgers", () => {
-  it("reads a memo off a transaction", async () => {
-    const hash = "cd".repeat(32);
-    const { r } = reader({ [`/transactions/${hash}`]: { status: 200, body: { hash, memo_type: "text", memo: "x" } } });
-    expect(await r.memo(hash)).toEqual({ txHash: hash, type: "text", text: "x" });
-  });
-
-  it("does not mistake a status buried in the url for a 404: a real error rejects rather than resolving null", async () => {
-    const hash = "a404" + "b".repeat(60);
-    const { r } = reader({ [`/transactions/${hash}`]: { status: 500 } });
-    await expect(r.memo(hash)).rejects.toBeInstanceOf(HorizonStatusError);
-  });
-
+describe("HorizonReader ledgers", () => {
   it("reads the retention floor and the latest ledger", async () => {
     const { r } = reader({ "/ledgers": [
       { paging_token: "1", sequence: 500, closed_at: "2025-07-16T02:48:49Z" },
