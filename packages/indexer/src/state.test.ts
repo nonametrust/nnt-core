@@ -32,4 +32,10 @@ describe("state", () => {
     expect(isCompleted(a, { from: 10, to: 20 })).toBe(true);
     expect(isCompleted(a, { from: 10, to: 30 })).toBe(false);
   });
+
+  it("never records an empty range, which is how follow says there is nothing to do", () => {
+    const a = { completed: [] as { from: number; to: number }[] };
+    markCompleted(a, { from: 1001, to: 1000 });
+    expect(a.completed).toEqual([]);
+  });
 });

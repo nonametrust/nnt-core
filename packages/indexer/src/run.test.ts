@@ -55,6 +55,28 @@ async function run(path: string, s: ReturnType<typeof scenario>, state: IndexerS
   return { result, counters };
 }
 
+describe("an empty range", () => {
+  it("is skipped without reading, and is never written into the state", async () => {
+    const s = scenario();
+    const state: IndexerState = { network: "stellar:pubnet", accounts: {} };
+    const counters = new Counters();
+    const path = join(dir, "empty-range.ndjson");
+    const sink = openSink(path);
+    // The fake reader ignores the range and would happily yield every record,
+    // which is the point: the guard has to be in the loop, not in the source.
+    const result = await backfill({
+      reader: fakeReader(s.payments, s.effects), accounts: [s.g], range: { from: 13, to: 12 },
+      ctx: { network: "stellar:pubnet", producerVersion: "0.1.0" }, sink, state, saveState: async () => {},
+      counters, clock: fixedClock(new Date("2026-09-08T00:00:00.000Z")),
+    });
+    await sink.close();
+    expect(result.accountsSkipped).toBe(1);
+    expect(result.accountsDone).toBe(0);
+    expect(result.written).toBe(0);
+    expect(state.accounts[s.g]).toEqual({ completed: [] });
+  });
+});
+
 describe("backfill", () => {
   it("writes validated observations for one account: two volume in, one out, one memo, one trustline", async () => {
     const s = scenario();

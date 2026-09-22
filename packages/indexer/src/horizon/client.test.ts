@@ -49,6 +49,29 @@ describe("HorizonClient", () => {
     expect(h.counters.get("requests")).toBe(3);
   });
 
+  it("caches a repeated url but neither reads nor writes the cache under noCache", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "nnt-nocache-"));
+    try {
+      let n = 1000;
+      const h = harness(() => ({ status: 200, body: { n: n++ } }), { cacheDir });
+
+      expect(await h.client.getJson("/x")).toEqual({ n: 1000 });
+      expect(await h.client.getJson("/x")).toEqual({ n: 1000 });
+      expect(h.counters.get("cache_hits")).toBe(1);
+      expect(readdirSync(cacheDir)).toHaveLength(1);
+
+      // A noCache caller is answered by Horizon every time...
+      expect(await h.client.getJson("/y", { noCache: true })).toEqual({ n: 1001 });
+      expect(await h.client.getJson("/y", { noCache: true })).toEqual({ n: 1002 });
+      expect(h.counters.get("cache_hits")).toBe(1);
+      // ...and leaves nothing behind for an ordinary caller to be served later.
+      expect(readdirSync(cacheDir)).toHaveLength(1);
+      expect(await h.client.getJson("/y")).toEqual({ n: 1003 });
+    } finally {
+      rmSync(cacheDir, { recursive: true, force: true });
+    }
+  });
+
   it("turns HTTP 410 into RetentionBoundary and counts it", async () => {
     const h = harness(() => ({ status: 410, body: { title: "Gone" } }));
     await expect(h.client.getJson("/ledgers/1/payments")).rejects.toBeInstanceOf(RetentionBoundary);

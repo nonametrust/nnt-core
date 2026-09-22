@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, expect } from "vitest";
 import { HorizonClient, HorizonStatusError, RetentionBoundary } from "./client.js";
 import { HorizonReader, cursorForLedger, ledgerOfOperation } from "./reader.js";
@@ -31,6 +34,35 @@ describe("operation ids", () => {
   it("encode the ledger in the high 32 bits", () => {
     expect(ledgerOfOperation(nextOpId(58_021_921, 3))).toBe(58_021_921);
     expect(cursorForLedger(100)).toBe((100n << 32n).toString());
+  });
+});
+
+describe("the two frontiers", () => {
+  it("are read past the cache, so a second run sees the chain advance", async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), "nnt-frontier-"));
+    try {
+      let head = 1000;
+      let floor = 10;
+      const counters = new Counters();
+      const fetchImpl = (async (input: string | URL | Request) => {
+        const seq = String(input).includes("order=desc") ? head++ : floor++;
+        return new Response(JSON.stringify({ _embedded: { records: [{ sequence: seq }] } }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch;
+      const client = new HorizonClient({
+        baseUrl: "https://h.example", clock: fixedClock(new Date("2026-09-08T00:00:00.000Z")),
+        counters, fetch: fetchImpl, sleep: async () => {}, minIntervalMs: 0, cacheDir,
+      });
+      const r = new HorizonReader(client, counters);
+      expect(await r.latestLedger()).toBe(1000);
+      expect(await r.latestLedger()).toBe(1001);
+      expect(await r.retentionFloor()).toBe(10);
+      expect(await r.retentionFloor()).toBe(11);
+      expect(counters.get("cache_hits")).toBe(0);
+    } finally {
+      rmSync(cacheDir, { recursive: true, force: true });
+    }
   });
 });
 

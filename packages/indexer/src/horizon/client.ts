@@ -99,12 +99,14 @@ export class HorizonClient {
    * HTTP status; once retries are exhausted it fails with an error naming
    * the url, instead of aborting the run with the bare underlying message.
    */
-  async getJson<T = unknown>(pathWithQuery: string, opts?: { maxRetries?: number }): Promise<T> {
+  async getJson<T = unknown>(pathWithQuery: string, opts?: { maxRetries?: number; noCache?: boolean }): Promise<T> {
     const url = pathWithQuery.startsWith("http") ? pathWithQuery : `${this.baseUrl}${pathWithQuery}`;
-    const cached = this.readCache(url);
-    if (cached !== null) {
-      this.counters.inc("cache_hits");
-      return JSON.parse(cached) as T;
+    if (!opts?.noCache) {
+      const cached = this.readCache(url);
+      if (cached !== null) {
+        this.counters.inc("cache_hits");
+        return JSON.parse(cached) as T;
+      }
     }
     const maxRetries = opts?.maxRetries ?? this.maxRetries;
     let attempt = 0;
@@ -132,7 +134,7 @@ export class HorizonClient {
         } catch {
           throw new Error(`Horizon returned a non-JSON body for ${url}`);
         }
-        this.writeCache(url, text);
+        if (!opts?.noCache) this.writeCache(url, text);
         return parsed;
       }
       if (res.status === 410) {
@@ -229,6 +231,17 @@ export class HorizonClient {
     this.lastRequestAt = this.clock.now().getTime();
   }
 
+  /**
+   * The cache is keyed by URL and never expires, which is correct only for
+   * an answer that cannot change: a closed ledger, a page of a closed range.
+   * Two URLs do not have that property — `/ledgers?order=desc&limit=1` and
+   * `/ledgers?order=asc&limit=1` name the two moving frontiers of history,
+   * and their answers are different on every run. Cached, the head frontier
+   * pins `latestLedger()` to whatever the first run saw, and `follow` then
+   * computes an empty range for every account and exits 0 having read
+   * nothing. Those callers pass `noCache`, which skips the read *and* the
+   * write, so a frontier is never served from disk and never poisons it.
+   */
   private cachePath(url: string): string | null {
     if (!this.cacheDir) return null;
     return join(this.cacheDir, createHash("sha256").update(url).digest("hex") + ".json");

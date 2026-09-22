@@ -115,6 +115,14 @@ export async function backfill(o: BackfillOptions): Promise<BackfillResult> {
   for (const account of o.accounts) {
     const range = o.rangeFor ? o.rangeFor(account) : o.range;
     const accountState = (o.state.accounts[account] ??= { completed: [] });
+    // `follow` hands back an empty range for an account already at the
+    // frontier. There is nothing to read and nothing to record: reading it
+    // would page a descending range, and recording it would write that pair
+    // into the state. `--force` does not change the arithmetic.
+    if (range.to < range.from) {
+      result.accountsSkipped++;
+      continue;
+    }
     if (!o.force && isCompleted(accountState, range)) {
       result.accountsSkipped++;
       continue;

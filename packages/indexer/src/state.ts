@@ -49,6 +49,13 @@ export function isCompleted(state: AccountState, range: LedgerRange): boolean {
   return state.completed.some((c) => c.from <= range.from && c.to >= range.to);
 }
 
+/**
+ * An empty range (`to < from`, which is how `follow` says "this account is
+ * already at the frontier") is not a fact about history and is never
+ * recorded: stored, it would put a descending pair in `completed`, where
+ * every later reader has to special-case it.
+ */
 export function markCompleted(state: AccountState, range: LedgerRange): void {
+  if (range.to < range.from) return;
   if (!isCompleted(state, range)) state.completed.push({ from: range.from, to: range.to });
 }

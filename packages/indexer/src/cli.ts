@@ -14,7 +14,7 @@ import { renderReport } from "./report.js";
 import { backfill, IdentityError } from "./run.js";
 import { openSink, outputFileName } from "./sink.js";
 import type { AccountId, LedgerRange } from "./source/types.js";
-import { loadState, saveState } from "./state.js";
+import { type AccountState, loadState, saveState } from "./state.js";
 
 const NETWORKS: Record<Network, string> = {
   "stellar:pubnet": "https://horizon.stellar.org",
@@ -133,6 +133,25 @@ async function cmdSelect(args: string[], io: Io): Promise<number> {
   return 0;
 }
 
+/**
+ * What `follow` still owes one account. Accounts do not share a frontier: a
+ * lagging or newly added account must be read from its own last completed
+ * ledger, not from the pooled maximum, or the ledgers between its frontier
+ * and the pool's get skipped. An account already at the head gets an empty
+ * range (`to < from`), which `backfill` skips and the state never records.
+ *
+ * Exported because this arithmetic is where `follow` decides whether it does
+ * any work at all, and a wrong answer here is silent: the run still exits 0
+ * and still writes a report.
+ */
+export function followRange(account: AccountState | undefined, retentionFloor: number, latest: number): LedgerRange {
+  const completed = account?.completed ?? [];
+  const lastTo = completed.length > 0 ? Math.max(...completed.map((c) => c.to)) : retentionFloor - 1;
+  const from = Math.max(retentionFloor, lastTo + 1);
+  if (from > latest) return { from: latest + 1, to: latest };
+  return { from, to: latest };
+}
+
 async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<number> {
   const { values } = parseArgs({
     args,
@@ -185,16 +204,7 @@ async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<num
   let rangeFor: ((account: AccountId) => LedgerRange) | undefined;
   if (follow) {
     const latest = await reader.latestLedger();
-    // Accounts do not share a frontier: a lagging or newly added account
-    // must be read from its own last completed ledger, not from the pooled
-    // maximum, or ledgers between its frontier and the pool's get skipped.
-    rangeFor = (account: AccountId): LedgerRange => {
-      const completed = state.accounts[account]?.completed ?? [];
-      const lastTo = completed.length > 0 ? Math.max(...completed.map((c) => c.to)) : retentionFloor - 1;
-      const from = Math.max(retentionFloor, lastTo + 1);
-      if (from > latest) return { from: latest + 1, to: latest };
-      return { from, to: latest };
-    };
+    rangeFor = (account: AccountId): LedgerRange => followRange(state.accounts[account], retentionFloor, latest);
     range = { from: retentionFloor, to: latest };
     fromIso = systemClock.now().toISOString();
     toIso = fromIso;

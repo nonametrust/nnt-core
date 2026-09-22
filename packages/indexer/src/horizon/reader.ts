@@ -179,15 +179,17 @@ export class HorizonReader implements SourceReader {
     }
   }
 
+  /** The retention wall moves forward; a cached answer would be a wall that fell in the past. */
   async retentionFloor(): Promise<number> {
-    const page = await this.client.getJson<{ _embedded: { records: Array<{ sequence: number }> } }>("/ledgers?order=asc&limit=1");
+    const page = await this.client.getJson<{ _embedded: { records: Array<{ sequence: number }> } }>("/ledgers?order=asc&limit=1", { noCache: true });
     const first = page._embedded.records[0];
     if (!first) throw new Error("Horizon returned no ledgers");
     return first.sequence;
   }
 
+  /** The head of the chain; cached, `follow` would never see a ledger it has not already read. */
   async latestLedger(): Promise<number> {
-    const page = await this.client.getJson<{ _embedded: { records: Array<{ sequence: number }> } }>("/ledgers?order=desc&limit=1");
+    const page = await this.client.getJson<{ _embedded: { records: Array<{ sequence: number }> } }>("/ledgers?order=desc&limit=1", { noCache: true });
     const last = page._embedded.records[0];
     if (!last) throw new Error("Horizon returned no ledgers");
     return last.sequence;
@@ -195,8 +197,9 @@ export class HorizonReader implements SourceReader {
 
   /**
    * Instants to ledger sequences, by bisection over /ledgers/{seq}. About
-   * twenty-five requests per bound on a fourteen-month window; cached, so a
-   * repeated run pays nothing.
+   * twenty-five requests per bound on a fourteen-month window. A closed
+   * ledger never changes, so the bisection itself is cached and a repeated
+   * run pays only the two uncached frontier requests.
    */
   async resolveRange(fromIso: string, toIso: string): Promise<LedgerRange> {
     const floor = await this.retentionFloor();
