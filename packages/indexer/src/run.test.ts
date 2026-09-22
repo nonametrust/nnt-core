@@ -19,7 +19,6 @@ function fakeReader(payments: SourcePayment[], effects: SourceEffect[]): SourceR
   return {
     async *payments(account) { for (const p of payments) if (p.from === account || p.to === account) yield p; },
     async *effects(account) { for (const e of effects) if (e.account === account) yield e; },
-    async memo() { return null; },
     async retentionFloor() { return 1; },
   };
 }
@@ -275,9 +274,6 @@ describe("backfill", () => {
       },
       async *effects(account, range) {
         (calls[account] ??= []).push(range);
-      },
-      async memo() {
-        return null;
       },
       async retentionFloor() {
         return 1;

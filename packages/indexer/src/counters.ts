@@ -26,7 +26,20 @@ export const DROP_REASONS = [
   "not_followed",
   "duplicate_key_in_run",
   "failed_transaction",
+  "sac_no_entries",
+  "amount_missing",
 ] as const;
+
+/**
+ * Declared but emitted by no code path in v0, so a report must say "reserved"
+ * and never "measured zero": `claimable_creator_unresolved` waits for a
+ * channel that needs the creator rather than the claimant (plan, Task 13
+ * note), and `muxed_base_address` was superseded by resolving the muxed
+ * address to its base and carrying the id in `namespace.muxedId`. A reason
+ * that leaves this list has a code path and a test; one that joins it has
+ * neither.
+ */
+export const RESERVED_DROP_REASONS = ["claimable_creator_unresolved", "muxed_base_address"] as const;
 export type DropReason = (typeof DROP_REASONS)[number];
 
 export interface CountersSnapshot {

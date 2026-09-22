@@ -101,18 +101,28 @@ export class HorizonReader implements SourceReader {
         const from = side(rec.from, rec.from_muxed_id);
         const to = side(rec.to, rec.to_muxed_id);
         if (!from || !to) { this.counters.drop("invalid_account_id", `op:${rec.id}`); return; }
+        // Horizon sends `amount` on every payment-family record, and
+        // `source_amount` on every path payment. A record missing one is
+        // malformed, and `?? "0"` turned it into an observation saying the
+        // counterparty moved nothing — a measurement, indistinguishable
+        // downstream from a real zero. It is dropped with a reason instead.
+        const pathPayment = rec.type !== "payment";
+        if (rec.amount === undefined || (pathPayment && rec.source_amount === undefined)) {
+          this.counters.drop("amount_missing", `op:${rec.id}`);
+          return;
+        }
         const p: SourcePayment = withMemo({
           ...base,
           kind: rec.type === "payment" ? "payment" : "path_payment",
           from: from.base, to: to.base,
           ...(from.muxedId !== undefined ? { fromMuxedId: from.muxedId } : {}),
           ...(to.muxedId !== undefined ? { toMuxedId: to.muxedId } : {}),
-          amount: rec.amount ?? "0",
+          amount: rec.amount,
           asset: asset(rec.asset_type, rec.asset_code, rec.asset_issuer),
-          ...(rec.type === "payment" ? {} : {
-            sourceAmount: rec.source_amount ?? "0",
+          ...(pathPayment ? {
+            sourceAmount: rec.source_amount,
             sourceAsset: asset(rec.source_asset_type, rec.source_asset_code, rec.source_asset_issuer),
-          }),
+          } : {}),
         });
         yield p;
         return;
@@ -121,14 +131,19 @@ export class HorizonReader implements SourceReader {
         const from = side(rec.funder, undefined);
         const to = side(rec.account, undefined);
         if (!from || !to) { this.counters.drop("invalid_account_id", `op:${rec.id}`); return; }
+        if (rec.starting_balance === undefined) { this.counters.drop("amount_missing", `op:${rec.id}`); return; }
         yield withMemo({
           ...base, kind: "create_account", from: from.base, to: to.base,
-          amount: rec.starting_balance ?? "0", asset: { code: "XLM", issuer: null },
+          amount: rec.starting_balance, asset: { code: "XLM", issuer: null },
         });
         return;
       }
       case "invoke_host_function": {
         const changes = rec.asset_balance_changes ?? [];
+        // Counted as read by `readRecord`, so without this it produced
+        // neither an observation nor a drop and left the record invisible:
+        // the one shape the report's drop table cannot account for.
+        if (changes.length === 0) { this.counters.drop("sac_no_entries", `op:${rec.id}`); return; }
         for (const [i, c] of changes.entries()) {
           if (c.type !== "transfer") { this.counters.drop("sac_non_transfer", `op:${rec.id}#${i}`); continue; }
           const from = side(c.from, undefined) ?? contractSide(c.from);
@@ -166,16 +181,6 @@ export class HorizonReader implements SourceReader {
         if (rec.amount !== undefined) e.amount = rec.amount;
         yield e;
       }
-    }
-  }
-
-  async memo(txHash: string): Promise<SourceMemo | null> {
-    try {
-      const tx = await this.client.getJson<{ hash: string; memo_type: string; memo?: string }>(`/transactions/${txHash}`);
-      return memoOf(tx);
-    } catch (e) {
-      if (e instanceof HorizonStatusError && e.status === 404) return null;
-      throw e;
     }
   }
 

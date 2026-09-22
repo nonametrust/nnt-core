@@ -72,6 +72,16 @@ describe("HorizonClient", () => {
     }
   });
 
+  it("carries the status as a field, so a url full of digits cannot be read as one", async () => {
+    // The message embeds the url, and a url can hold a hex hash or an account
+    // id containing something status-code-shaped. A caller branching on the
+    // status must read `.status`, and this pins that it says what happened
+    // rather than what the url looks like.
+    const url = "/transactions/a404" + "b".repeat(60);
+    const h = harness(() => ({ status: 500, body: {} }), {});
+    await expect(h.client.getJson(url, { maxRetries: 0 })).rejects.toMatchObject({ status: 500 });
+  });
+
   it("turns HTTP 410 into RetentionBoundary and counts it", async () => {
     const h = harness(() => ({ status: 410, body: { title: "Gone" } }));
     await expect(h.client.getJson("/ledgers/1/payments")).rejects.toBeInstanceOf(RetentionBoundary);

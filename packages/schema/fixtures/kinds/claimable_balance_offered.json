@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "0.1.0",
+  "namespace": {
+    "kind": "endpoint",
+    "id": "https://data.example/x402"
+  },
+  "channel": "protocol",
+  "evidenceKind": "event",
+  "kind": "claimable_balance_offered",
+  "observedAt": "2026-09-06T13:55:09.000Z",
+  "source": {
+    "producer": "stellar-indexer",
+    "producerVersion": "0.1.0",
+    "network": "stellar:pubnet",
+    "ref": "op:214720397318",
+    "fetchedAt": "2026-09-01T08:00:20.000Z"
+  },
+  "payload": {
+    "event": "claimable_balance_offered",
+    "assetCode": "KALE",
+    "assetIssuer": "GUNKNOWNISSUER",
+    "issuerKnown": false
+  }
+}

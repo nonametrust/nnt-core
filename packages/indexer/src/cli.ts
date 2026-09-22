@@ -4,6 +4,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { selectAccounts } from "./accounts.js";
+import { isBaseAccount } from "./mapper/address.js";
 import { systemClock } from "./clock.js";
 import { Counters } from "./counters.js";
 import { compareKeys, readKeys } from "./dedupe.js";
@@ -134,6 +135,35 @@ async function cmdSelect(args: string[], io: Io): Promise<number> {
 }
 
 /**
+ * The followed accounts, checked at the point they are read.
+ *
+ * An id that is not a base account used to travel all the way into
+ * `mapVolume`, where it becomes one drop for a whole group of records; the
+ * group's other records are then read and never accounted for, so the run
+ * ends hours later on `IdentityError` naming a stream rather than the line of
+ * the file that is wrong. The cost of the check is one pass over a hundred
+ * lines.
+ */
+export function parseAccountList(text: string, path: string): AccountId[] {
+  const accounts: AccountId[] = [];
+  const seen = new Set<string>();
+  text.split("\n").forEach((raw, i) => {
+    const id = raw.trim();
+    if (id.length === 0) return;
+    if (!isBaseAccount(id)) throw new Error(`${path}:${i + 1} is not a base account id`);
+    // A repeated account is read twice and written once, because the second
+    // pass finds every key already in the run: the identity still holds and
+    // nothing is wrong in the file except the wasted requests. Saying so here
+    // is cheaper than finding it in the cost row.
+    if (seen.has(id)) throw new Error(`${path}:${i + 1} repeats an account already listed`);
+    seen.add(id);
+    accounts.push(id);
+  });
+  if (accounts.length === 0) throw new Error(`${path} lists no accounts`);
+  return accounts;
+}
+
+/**
  * What `follow` still owes one account. Accounts do not share a frontier: a
  * lagging or newly added account must be read from its own last completed
  * ledger, not from the pooled maximum, or the ledgers between its frontier
@@ -192,7 +222,7 @@ async function cmdBackfill(args: string[], io: Io, follow: boolean): Promise<num
     { horizonUrl: values["horizon-url"], cacheDir: values["cache-dir"], minIntervalMs: values["min-interval-ms"], maxRetries: values["max-retries"] },
     counters,
   );
-  const accounts = (await readFile(values.accounts, "utf8")).split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+  const accounts = parseAccountList(await readFile(values.accounts, "utf8"), values.accounts);
   const statePath = values.state ?? `state-${net.replace(":", "-")}.json`;
   const state = await loadState(statePath, net);
   const retentionFloor = await reader.retentionFloor();

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { exitCodeFor, followRange, main } from "./cli.js";
+import { exitCodeFor, followRange, main, parseAccountList } from "./cli.js";
+import { randomAccount } from "./testing/keys.js";
 import { IdentityError } from "./run.js";
 
 describe("cli", () => {
@@ -31,6 +32,31 @@ describe("cli", () => {
     );
     expect(code).toBe(2);
     expect(out.join("\n")).toMatch(/--max-retries must be a number/);
+  });
+});
+
+describe("parseAccountList", () => {
+  it("takes the ids, ignoring blank lines and surrounding space", () => {
+    const [a, b] = [randomAccount(), randomAccount()];
+    expect(parseAccountList(`${a}\n\n  ${b}  \n`, "accounts.txt")).toEqual([a, b]);
+  });
+
+  it("names the line of an id that is not a base account", () => {
+    const a = randomAccount();
+    // Left to travel, this reaches `mapVolume`, becomes one drop for a whole
+    // group, and surfaces hours later as an IdentityError about a stream.
+    expect(() => parseAccountList(`${a}\nGOLDADDRESS\n`, "accounts.txt"))
+      .toThrow("accounts.txt:2 is not a base account id");
+  });
+
+  it("names the line of a repeated account", () => {
+    const a = randomAccount();
+    expect(() => parseAccountList(`${a}\n${a}\n`, "accounts.txt"))
+      .toThrow("accounts.txt:2 repeats an account already listed");
+  });
+
+  it("refuses a file with no accounts in it", () => {
+    expect(() => parseAccountList("\n  \n", "accounts.txt")).toThrow("accounts.txt lists no accounts");
   });
 });
 

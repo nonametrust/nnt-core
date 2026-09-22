@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "0.1.0",
+  "namespace": {
+    "kind": "endpoint",
+    "id": "https://data.example/x402"
+  },
+  "channel": "volume",
+  "evidenceKind": "event",
+  "kind": "create_account",
+  "observedAt": "2026-09-03T06:41:02.000Z",
+  "source": {
+    "producer": "stellar-indexer",
+    "producerVersion": "0.1.0",
+    "network": "stellar:pubnet",
+    "ref": "op:214720397315",
+    "fetchedAt": "2026-09-01T08:00:20.000Z"
+  },
+  "payload": {
+    "amount": "2.5000000",
+    "assetCode": "XLM",
+    "direction": "in"
+  },
+  "salienceHints": {
+    "amount": "2.5000000"
+  }
+}
