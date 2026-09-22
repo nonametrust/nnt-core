@@ -33,7 +33,7 @@ const state = {
   validFrom: "2026-08-20T00:00:00.000Z",
   validUntil: null,
   source: src,
-  payload: { event: "trustline_created", assetCode: "USDC", issuerKnown: true },
+  payload: { event: "trustline_open", assetCode: "USDC", issuerKnown: true },
 };
 
 // Type-level gates, checked by `pnpm typecheck`. The documented VolumePayload
