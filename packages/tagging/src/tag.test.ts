@@ -102,7 +102,7 @@ const smallPayment = event("volume", "payment", { amount: "0.2600000", assetCode
 const tinyPayment = event("volume", "payment", { amount: "0.0100000", assetCode: "USDC", direction: "in" }, "2026-09-21T08:00:00.000Z");
 const addressChange = event("address_integrity", "payment_address_changed", { previous: "GOLDADDRESS", current: "GNEWADDRESS" }, "2026-09-12T08:14:00.000Z");
 const addressRevert = event("address_integrity", "payment_address_changed", { previous: "GNEWADDRESS", current: "GOLDADDRESS" }, "2026-09-12T16:47:00.000Z");
-const trustline = state("protocol", "trustline_open", { event: "trustline_created", assetCode: "USDC", issuerKnown: true }, "2026-08-20T11:02:31.000Z");
+const trustline = state("protocol", "trustline_open", { event: "trustline_open", assetCode: "USDC", issuerKnown: true }, "2026-08-20T11:02:31.000Z");
 
 describe("refreshTag", () => {
   const at = new Date("2026-09-21T08:00:00.000Z");
