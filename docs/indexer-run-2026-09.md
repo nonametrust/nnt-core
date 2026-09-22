@@ -1,10 +1,12 @@
 # Indexer run, September 2026
 
 The measurement behind the A1 delivery (board card "A1 Indexer", due
-16 September 2026). Aggregates only; no account identifier appears here, and
-the root gate checks that. Reproduce with the commands in
-`packages/indexer/README.md`; the selection rule and its parameters below
-regenerate the same account list.
+16 September 2026). Aggregates only. No account identifier appears here and
+the root gate checks that; no single account is profiled here either, which
+no gate checks, because the selection rule below is reproducible and a
+per-account figure tied to a position in that list re-identifies the
+account. Reproduce with the commands in `packages/indexer/README.md`; the
+selection rule and its parameters below regenerate the same account list.
 
 Source: SDF public Horizon (`horizon.stellar.org`), which served ledgers from
 58024801 on the run day (about fourteen months), rate-limited at one request
@@ -32,42 +34,47 @@ accounts Horizon does not know dropped; the rest ordered by the byte order of
 
 ## 2. One wallet, thirty days
 
-The first selected account, 2026-08-01T00:00:00Z to 2026-08-31T23:59:59Z
-(ledgers 63741059-64216184), run on 2026-09-08.
+The first end-to-end run was a single account over 2026-08-01T00:00:00Z to
+2026-08-31T23:59:59Z (ledgers 63741059-64216184), on 2026-09-08. **Its
+per-account figures are withdrawn from this report, and so is its position
+in the selection.**
 
-| Metric | Measured |
-|---|---|
-| Payment-family records read | 32 (`payment`); 7,582 `invoke_host_function` records read from `/payments` |
-| Volume observations written | 32 (coverage ratio 1.00) |
-| Content observations | 0: all 32 transactions carried `memo_type: none` (counted `memo_non_text`) |
-| Protocol observations | 0: 13,168 effects read, all `account_credited` / `account_debited` (counted `effect_ignored`) |
-| Soroban entries | 80,602 `asset_balance_changes` entries, all `mint` (counted `sac_non_transfer`); no `transfer` entry, so no `sac_transfer` observation |
-| Muxed | 0 of 32 |
-| Requests, wall clock | 141 requests, 218 s (4.41 requests per observation) |
+The reason is section 1 of this document. It states the window, the
+parameters and the ordering, and says the rule regenerates the same account
+list — which is what makes the measurement reproducible, and is staying.
+But a reader who reproduces that list and is then told which position in it
+this section described would hold a month-long profile of one identifiable
+wallet: how much value reached it, how many contract invocations touched
+it, what kind of contract those came from. That is subject-level data about
+a party who was never asked, this project does not publish it anywhere
+else, and this repository goes public at v0.
 
-Hand check, independent of the indexer's own reader: paging
-`/accounts/{id}/operations?order=asc` over the same ledger range counted
-32 `payment` operations, the same 32, and 7,583 `invoke_host_function`
-operations. The one-record difference is an invocation that moved no asset;
-`/payments` omits it and `/operations` does not. No difference is
-unexplained.
+What the run established is a property of the pipeline, not of the account,
+and that part stands:
 
-Re-run: the same range processed a second time with `--force --compare`
-against the first file reported 0 keys only in the previous run and 0 only in
-the current one, exit code 0. The second run came entirely from the cache
-(154 cache hits, 0 requests).
-
-What this wallet taught: it is a Soroban-heavy account (a farming contract
-minting to it thousands of times a month), so almost every record it
-produces is outside the three channels of this delivery. The report makes
-that visible as counted drops rather than as an empty file.
+- **The hand check does not go through the indexer's own reader.** Paging
+  `/accounts/{id}/operations?order=asc` over the same range returned the
+  same `payment` operations as `/payments`, and exactly one more
+  `invoke_host_function`: an invocation that moved no asset, which
+  `/payments` omits and `/operations` returns. No difference was left
+  unexplained.
+- **The re-run is identical.** The same range processed a second time with
+  `--force --compare` against the first file reported 0 keys only in the
+  previous run, 0 only in the current, exit code 0. The second run came
+  entirely from the page cache, so it proves the pipeline deterministic and
+  says nothing about whether the source is stable (section 5).
+- **A Soroban-heavy account produces almost nothing in these three
+  channels**, and the report makes that visible as counted drops rather
+  than as an empty file. Section 3 carries the same finding across 100
+  accounts (`sac_non_transfer`, 2,597,025 entries), which is where a
+  finding of this shape belongs.
 
 ## 3. One hundred accounts, thirty days
 
 The 100 selected accounts, 2026-08-01T00:00:00Z to 2026-08-31T23:59:59Z
 (ledgers 63741059-64216184). The pages were fetched between 2026-09-08 and
 2026-09-15 across the interrupted runs of section 4a; the delivered file is a
-single forced run on the final code (commit 52ff98a) on 2026-09-15, replayed
+single forced run on the delivered code (PR #6) on 2026-09-15, replayed
 from the page cache (8,780 cache hits, 2 live requests, 70 s), so every line
 comes from one build. The counters below are that run's
 (`out100/stellar-pubnet_2026-08-01_2026-08-31.counters.json`, gitignored).
@@ -203,6 +210,13 @@ One line per open point of spec section 12, with what the run showed:
   2026-09-15 on issue #3: a ref names a value movement, not an operation).
   Entries of kind `mint`, `burn` and `clawback` are counted
   `sac_non_transfer` and not observed.
+- Both deduplication figures — this section's and section 3's — were
+  measured with the second run served from the page cache (8,780 cache hits,
+  2 live requests). They establish that the pipeline maps identical input to
+  identical keys, which is what contract section 1's re-run test asks for.
+  They do **not** establish that Horizon returns the same records twice for
+  the same closed range: that question needs a second run with the cache
+  cold, and it has not been run.
 - Memos are recorded for `text` memos only.
 - Effects other than trustline, claimable-balance-claimant and account-flags
   are ignored by design and counted.
