@@ -206,6 +206,23 @@ export function permanentAad(b: PermanentBinding): Buffer {
  */
 const LONE_SURROGATE = /\p{Surrogate}/u;
 
+/**
+ * What a month key is wrapped under: its own (namespace, period) pair.
+ *
+ * This is what stops a shred being evaded by a row copy. Move a live wrapped
+ * month key into another namespace's row, or into another period's row of the
+ * same namespace, and it no longer authenticates -- so a copy taken before
+ * the shred is not a working key afterwards. Shredding is the only erasure
+ * this ledger has, and a shred a row copy can evade is not one.
+ *
+ * Built through the same checked join as the envelopes rather than
+ * concatenated by hand, so it inherits the separator and well-formedness
+ * refusals instead of restating them.
+ */
+export function periodKeyAad(namespaceId: string, period: string): string {
+  return joinParts([namespaceId, period]).toString("utf8");
+}
+
 function joinParts(parts: string[]): Buffer {
   for (const part of parts) {
     if (part.includes(SEPARATOR)) {

@@ -16,6 +16,23 @@ export interface Schema {
     key_shredded_at: Date | null;
     created_at: Date;
   };
+  // The month key, one row per (namespace, calendar month).
+  //
+  // `period` is typed as a string on the way in and out and is NEVER
+  // selectable as a driver Date: the driver parses a `date` at LOCAL
+  // midnight, so east of UTC a round-tripped 2026-09-01 comes back as
+  // 2026-08-31T21:00Z and looks up the wrong month's key with nothing to
+  // show for it. Every select renders it `period::text`. The `never` on the
+  // update side is the other half of the guard's rule: the column is fixed
+  // at mint and the type says so before the trigger has to.
+  namespace_key: {
+    namespace_id: string;
+    period: ColumnType<string, string, never>;
+    key_wrapped: Buffer | null;
+    expires_at: ColumnType<Date, Date, never>;
+    shredded_at: Date | null;
+    created_at: ColumnType<Date, Date, never>;
+  };
   observation: {
     observation_id: string;
     idempotency_key: string;

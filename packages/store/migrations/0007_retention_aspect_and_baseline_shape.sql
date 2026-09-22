@@ -14,6 +14,7 @@
 --   1. baseline: the two shapes M2's arithmetic refuses
 --   2. tag: the aspect it was always keyed on, retirement, and the guard
 --   3. observation: the producer column, and the payload layout that moved
+--   4. namespace_key: the month key, its guard, and what expiry may not do
 
 -- Before anything else: this migration moves the byte layout of the payload
 -- envelope, and a stored payload is sealed under the layout that was in force
@@ -229,3 +230,121 @@ alter table observation
   add column producer text not null
   constraint observation_producer_shape
   check (producer ~ '^[a-z0-9]+(-[a-z0-9]+)*$' and length(producer) <= 64);
+
+
+-- === 4. namespace_key: the month key, its guard, and what expiry may not do ==
+--
+-- Retention in this design is unreadability on a clock, not deletion. A
+-- payload is sealed under a key per (namespace, calendar month); that month
+-- key is wrapped under the namespace's own key, so there are two levels and
+-- the outer one is the namespace. Shredding a month key makes that month
+-- unreadable while every row, foreign key, audit entry and day seal stays
+-- exactly where it is and stays verifiable.
+--
+-- The primary key is the pair, which is also what the wrap is bound to. That
+-- binding is what stops a shred being evaded by a row copy: a wrapped key
+-- moved into another namespace's row, or into another period's row of the
+-- same namespace, no longer authenticates. Without it, copying a live key
+-- out before the shred leaves a working copy behind, and shredding is the
+-- only erasure this ledger has.
+--
+-- expires_at is written ONCE, at mint, from the period and the policy in
+-- force (R2). Two reasons it is a column rather than a computation. The
+-- database cannot hold a policy number it does not have, and putting
+-- graceDays into SQL would give that number a second home that drifts from
+-- retention.ts silently. And a guard that read now() would break the
+-- injected-clock rule that every simulated-day test in this package depends
+-- on; held against the row's own value, the early-shred refusal needs no
+-- wall clock at all.
+--
+-- What that costs, stated plainly because R2's own note was one line: a later
+-- policy that SHORTENS the grace does not shorten months already minted. The
+-- sanctioned path is a migration that disables this trigger, updates
+-- expires_at on the affected rows, and re-enables it -- the same shape the
+-- tests use, and the same shape M2 chose for lowering the saturation ceiling
+-- ("a policy change becomes a data migration, loudly rather than silently").
+-- Without that sentence written down, the guard below reads as "expiry can
+-- never change", which is not what is meant.
+--
+-- Note the asymmetry that makes fixing expiry at mint safe: a shred cannot be
+-- undone, so re-deriving expiry at each sweep could only ever matter in the
+-- shortening direction. Lengthening a grace cannot bring back a month that
+-- has already gone.
+create table namespace_key (
+  namespace_id uuid not null references namespace (namespace_id),
+  -- The first day of a UTC calendar month. Always read back as text: the
+  -- driver parses a `date` at LOCAL midnight, so east of UTC a round-tripped
+  -- 2026-09-01 returns as 2026-08-31T21:00Z and looks up the wrong month's
+  -- key, silently. The check makes the column's own shape a fact.
+  period date not null,
+  -- Null once the month is expired, exactly as namespace.data_key_wrapped is
+  -- null once the counterparty space is erased. One mechanism, two levels.
+  key_wrapped bytea,
+  expires_at timestamptz not null,
+  shredded_at timestamptz,
+  created_at timestamptz not null,
+  primary key (namespace_id, period),
+  constraint namespace_key_shred_consistent
+    check ((key_wrapped is null) = (shredded_at is not null)),
+  -- 29 is the wrapped-key header crypto.ts writes: one version byte, a
+  -- twelve-byte nonce, a sixteen-byte tag. Anything that short holds no key,
+  -- and without this an empty bytea would count as live above. The same
+  -- number, from the same layout, as namespace_key_present on namespace --
+  -- which is why wrapUnder was lifted out of the ring rather than copied.
+  constraint namespace_key_present
+    check (key_wrapped is null or octet_length(key_wrapped) > 29),
+  -- A month cannot expire before it has closed. `timezone('UTC', ...)` over a
+  -- plain timestamp is immutable and a bare comparison against timestamptz is
+  -- not, which a check constraint refuses; verified on the repository's 17.7
+  -- cluster rather than assumed.
+  constraint namespace_key_expires_after_period
+    check (expires_at >= timezone('UTC', (period + interval '1 month')::timestamp)),
+  constraint namespace_key_period_is_month
+    check (period = date_trunc('month', period::timestamp)::date),
+  -- R2's guard. Expiry is not early, measured against the row's own value.
+  constraint namespace_key_shred_not_early
+    check (shredded_at is null or shredded_at >= expires_at)
+);
+
+-- Mirrors namespace_guard in 0001 and raises its own SQLSTATE, NNT06, for the
+-- reason that one does not reuse NNT01: this table is MEANT to be updated
+-- (that is what expiry is), so a refusal here says an update broke a rule,
+-- not that the row was immutable.
+create function namespace_key_guard() returns trigger language plpgsql as $$
+begin
+  if tg_op = 'DELETE' then
+    raise exception using
+      errcode = 'NNT06',
+      message = 'a month key is never deleted; a month is expired by shredding its key';
+  end if;
+  if new.namespace_id is distinct from old.namespace_id
+     or new.period is distinct from old.period
+     or new.created_at is distinct from old.created_at then
+    raise exception using
+      errcode = 'NNT06',
+      message = 'month key identity is fixed: namespace_id, period and created_at do not change';
+  end if;
+  -- Its own rule and its own message, because its reason is its own: expiry
+  -- is fixed at mint from the policy in force, and moving it on a live row
+  -- would retroactively change how long evidence stays readable with nothing
+  -- recording that it happened. A policy change that must move it is a
+  -- migration that disables this trigger.
+  if new.expires_at is distinct from old.expires_at then
+    raise exception using
+      errcode = 'NNT06',
+      message = 'expires_at is fixed at mint; changing retention for a minted month is a migration';
+  end if;
+  if old.shredded_at is not null
+     and (new.shredded_at is distinct from old.shredded_at
+          or new.key_wrapped is not null) then
+    raise exception using
+      errcode = 'NNT06',
+      message = 'an expired month stays expired: the instant does not move and no key is put back';
+  end if;
+  return new;
+end
+$$;
+
+create trigger namespace_key_guarded
+  before update or delete on namespace_key
+  for each row execute function namespace_key_guard();

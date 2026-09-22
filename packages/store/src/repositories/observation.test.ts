@@ -6,6 +6,7 @@ import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv, newDataKey } from "../crypto.js";
 import { fixedClock } from "../clock.js";
+import { RETENTION_V0 } from "../retention.js";
 import {
   CiphertextRejected, ConstraintViolation, IdempotencyKeyMismatch, NamespaceShredded,
   ObservationNotFound, StoreError,
@@ -52,7 +53,7 @@ function aState(over: Record<string, unknown> = {}): WireObservation {
 
 beforeAll(async () => {
   ({ db, done } = await withSchema("obs_test"));
-  namespaces = new NamespaceRepository(db, ring, clock);
+  namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
   observations = new ObservationRepository(db, namespaces, clock);
 });
 afterAll(async () => { await done(); });
@@ -316,7 +317,7 @@ describe("the columns beside the payload", () => {
         db.transaction().execute(async (trx) => {
           await sql`alter table observation disable trigger observation_no_update`.execute(trx);
           await sql`update observation set ${move} where observation_id = ${id}`.execute(trx);
-          const inside = new ObservationRepository(trx, new NamespaceRepository(trx, ring, clock), clock);
+          const inside = new ObservationRepository(trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock);
           await inside.get(id);
         }),
       ).rejects.toBeInstanceOf(CiphertextRejected);
@@ -450,7 +451,7 @@ describe("the columns beside the payload", () => {
   it("binds the instant it stores, not a second reading of the clock", async () => {
     let t = new Date("2026-09-07T00:00:00.000Z").getTime();
     const ticking = { now: () => { const d = new Date(t); t += 1_000; return d; } };
-    const ns = new NamespaceRepository(db, ring, ticking);
+    const ns = new NamespaceRepository(db, ring, ticking, RETENTION_V0);
     const repo = new ObservationRepository(db, ns, ticking);
     const { observation } = await repo.append(
       anEvent({ source: { ...src, ref: "op:ticking:1" } }),

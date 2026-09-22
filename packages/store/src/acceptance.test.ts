@@ -36,6 +36,7 @@ import type { Db } from "./db.js";
 import { withSchema } from "./testing/harness.js";
 import { keyRingFromEnv } from "./crypto.js";
 import { fixedClock } from "./clock.js";
+import { RETENTION_V0 } from "./retention.js";
 import {
   AppendOnlyViolation, DayNotClosed, TimestampAltered, mapPgError,
 } from "./errors.js";
@@ -228,7 +229,7 @@ async function tagRowVersions(): Promise<string[]> {
 
 beforeAll(async () => {
   ({ db, done } = await withSchema("acceptance"));
-  namespaces = new NamespaceRepository(db, ring, clock);
+  namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
   observations = new ObservationRepository(db, namespaces, clock);
   tags = new TagRepository(db, clock);
   triggers = new TriggerEventRepository(db, clock);

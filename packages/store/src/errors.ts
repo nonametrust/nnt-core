@@ -18,6 +18,17 @@ export class NamespaceShredded extends StoreError {}
 // meant to be updated, and an operator must be able to tell the two apart
 // by class.
 export class NamespaceAltered extends StoreError {}
+// Raised by the namespace_key guard, under NNT06. Like the namespace guard's
+// class and unlike the append-only one: this table is meant to be updated,
+// because expiry IS an update, so a refusal here says an update broke a rule
+// rather than that the row was immutable.
+export class PeriodKeyAltered extends StoreError {}
+// Raised in TypeScript, not by the database. A month whose key has been
+// shredded is a payload nobody can read, and that is a different condition
+// from a shredded namespace: the counterparty space is intact and every other
+// month of it is still readable. An operator told "shredded" about an expired
+// month would look for an erasure request that never happened.
+export class PayloadExpired extends StoreError {}
 // Raised by the tag guard, under its own SQLSTATE rather than the append-only
 // one: the tag table is meant to be updated, so a refusal here says an update
 // broke a rule the arithmetic holds, not that the row was immutable.
@@ -117,6 +128,7 @@ const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreErro
   NNT03: ChainBroken,
   NNT04: TimestampAltered,
   NNT05: NamespaceAltered,
+  NNT06: PeriodKeyAltered,
   NNT07: TagAltered,
 };
 

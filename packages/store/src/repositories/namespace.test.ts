@@ -7,8 +7,10 @@ import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv, newDataKey } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import {
-  CiphertextRejected, NamespaceAltered, NamespaceNotFound, NamespaceShredded, StoreError, mapPgError,
+  CiphertextRejected, NamespaceAltered, NamespaceNotFound, NamespaceShredded, PayloadExpired,
+  PeriodKeyAltered, StoreError, mapPgError,
 } from "../errors.js";
+import { RETENTION_V0, expiresAt } from "../retention.js";
 import { NamespaceRepository } from "./namespace.js";
 
 let db: Db;
@@ -21,7 +23,7 @@ const clock = fixedClock(new Date("2026-09-07T00:00:00.000Z"));
 
 beforeAll(async () => {
   ({ db, done } = await withSchema("ns_test"));
-  repo = new NamespaceRepository(db, ring, clock);
+  repo = new NamespaceRepository(db, ring, clock, RETENTION_V0);
 });
 afterAll(async () => { await done(); });
 
@@ -287,5 +289,351 @@ describe("what the table refuses on its own", () => {
     await db.updateTable("namespace").set({ data_key_wrapped: ring.wrap(key, n.namespaceId) })
       .where("namespace_id", "=", n.namespaceId).execute();
     expect((await repo.dataKey(n.namespaceId)).equals(key)).toBe(true);
+  });
+});
+
+// The month key: a key per (namespace, calendar month), wrapped under the
+// namespace's own key. Shredding the month key makes that month unreadable
+// while the namespace and every row stay where they are, which is what
+// retention is in this design -- unreadability on a clock, not deletion.
+async function keyVersions(): Promise<string[]> {
+  const r = await sql<{ v: string }>`
+    select namespace_id::text || ':' || period::text || ':' || xmin::text as v
+    from namespace_key order by namespace_id, period`.execute(db);
+  return r.rows.map((x) => x.v);
+}
+
+describe("the month key", () => {
+  async function aNamespace(id: string): Promise<string> {
+    return (await repo.ensure({ kind: "wallet", id })).namespaceId;
+  }
+
+  it("mints one key per period and gives the same key back", async () => {
+    const ns = await aNamespace("PERIODKEY1");
+    await repo.periodKey(ns, "2026-09-01");
+    const first = await repo.openPeriodKey(ns, "2026-09-01");
+    expect(first).toHaveLength(32);
+    expect((await repo.openPeriodKey(ns, "2026-09-01")).equals(first)).toBe(true);
+    // A second mint is a no-op, not a re-key: re-minting would strand every
+    // payload already sealed under the first key.
+    await repo.periodKey(ns, "2026-09-01");
+    expect((await repo.openPeriodKey(ns, "2026-09-01")).equals(first)).toBe(true);
+  });
+
+  it("mints a different key for a different period and a different namespace", async () => {
+    const a = await aNamespace("PERIODKEY2");
+    const b = await aNamespace("PERIODKEY3");
+    for (const [ns, period] of [[a, "2026-09-01"], [a, "2026-10-01"], [b, "2026-09-01"]] as const) {
+      await repo.periodKey(ns, period);
+    }
+    const sept = await repo.openPeriodKey(a, "2026-09-01");
+    expect((await repo.openPeriodKey(a, "2026-10-01")).equals(sept)).toBe(false);
+    expect((await repo.openPeriodKey(b, "2026-09-01")).equals(sept)).toBe(false);
+  });
+
+  // The whole point of the wrap's associated data. Copy a live month key into
+  // another row before the first is shredded and, without the binding, a live
+  // copy survives the shred -- and shredding is the only erasure this design
+  // has, so a shred a row copy can evade is not one.
+  it("refuses a wrapped month key copied into another row, in either direction", async () => {
+    const a = await aNamespace("PERIODCOPY1");
+    const b = await aNamespace("PERIODCOPY2");
+    await repo.periodKey(a, "2026-09-01");
+    await repo.periodKey(a, "2026-10-01");
+    await repo.periodKey(b, "2026-09-01");
+    // Another namespace, same period.
+    await sql`update namespace_key set key_wrapped =
+      (select key_wrapped from namespace_key where namespace_id = ${a} and period = date '2026-09-01')
+      where namespace_id = ${b} and period = date '2026-09-01'`.execute(db);
+    await expect(repo.openPeriodKey(b, "2026-09-01")).rejects.toBeInstanceOf(CiphertextRejected);
+    // Same namespace, another period.
+    await sql`update namespace_key set key_wrapped =
+      (select key_wrapped from namespace_key where namespace_id = ${a} and period = date '2026-09-01')
+      where namespace_id = ${a} and period = date '2026-10-01'`.execute(db);
+    await expect(repo.openPeriodKey(a, "2026-10-01")).rejects.toBeInstanceOf(CiphertextRejected);
+  });
+
+  it("refuses to mint under a shredded namespace, and writes no row", async () => {
+    const ns = await aNamespace("PERIODSHRED1");
+    await repo.shred(ns);
+    await expect(repo.periodKey(ns, "2026-09-01")).rejects.toBeInstanceOf(NamespaceShredded);
+    const rows = await db.selectFrom("namespace_key").select(["period"])
+      .where("namespace_id", "=", ns).execute();
+    expect(rows).toEqual([]);
+  });
+
+  // The namespace key is the outer one. Once it is gone there is no inner key
+  // to mint under and nothing to unwrap with, so the namespace's refusal wins
+  // over the period's: an operator must not be told a month expired when the
+  // whole counterparty space was erased.
+  it("lets the namespace's shred win over the period's, and leaves the rows alone", async () => {
+    const ns = await aNamespace("PERIODSHRED2");
+    await repo.periodKey(ns, "2026-09-01");
+    await repo.periodKey(ns, "2026-10-01");
+    const before = await keyVersions();
+    await repo.shred(ns);
+    for (const period of ["2026-09-01", "2026-10-01"]) {
+      await expect(repo.openPeriodKey(ns, period)).rejects.toBeInstanceOf(NamespaceShredded);
+    }
+    expect(await keyVersions()).toEqual(before);
+  });
+
+  // A late observation for a month that has already expired must not revive
+  // it. `append` calls periodKey before it seals, so without do-nothing on
+  // conflict an arrival after expiry would mint a fresh key over the dead
+  // one -- and then some payloads of that month would open and the rest
+  // would not, under a row that says the month was shredded. Retention would
+  // be a suggestion.
+  it("does not revive an expired month when a later observation asks for it", async () => {
+    const ns = await aNamespace("PERIODREVIVE");
+    await repo.periodKey(ns, "2026-09-01");
+    const at = new Date("2027-01-05T00:00:00.000Z");
+    await sql`update namespace_key set key_wrapped = null, shredded_at = ${at}
+      where namespace_id = ${ns} and period = date '2026-09-01'`.execute(db);
+    const before = await keyVersions();
+
+    await repo.periodKey(ns, "2026-09-01");
+
+    // Not one byte written: xmin would move on any UPDATE, including one
+    // that set a column to the value it already held.
+    expect(await keyVersions()).toEqual(before);
+    await expect(repo.openPeriodKey(ns, "2026-09-01")).rejects.toBeInstanceOf(PayloadExpired);
+    const row = await db.selectFrom("namespace_key").select(["key_wrapped", "shredded_at"])
+      .where("namespace_id", "=", ns).executeTakeFirst();
+    expect(row?.key_wrapped).toBeNull();
+    expect(row?.shredded_at?.toISOString()).toBe(at.toISOString());
+  });
+
+  // A second mint over a LIVE month must not rewrite the key either: every
+  // payload already sealed under the first one would be stranded, readable
+  // by nothing, with the row still claiming the month is live.
+  it("writes nothing at all when a live month is minted again", async () => {
+    const ns = await aNamespace("PERIODREMINT");
+    await repo.periodKey(ns, "2026-09-01");
+    const before = await keyVersions();
+    await repo.periodKey(ns, "2026-09-01");
+    expect(await keyVersions()).toEqual(before);
+  });
+
+  // The two erasures can both be true of one month, and then the outer one is
+  // the answer. Told "expired", an operator would go looking for a retention
+  // sweep instead of the erasure request that actually happened.
+  it("says shredded, not expired, for a month that is both", async () => {
+    const ns = await aNamespace("PERIODBOTH");
+    await repo.periodKey(ns, "2026-09-01");
+    await sql`update namespace_key set key_wrapped = null, shredded_at = ${new Date("2027-01-05T00:00:00Z")}
+      where namespace_id = ${ns} and period = date '2026-09-01'`.execute(db);
+    await repo.shred(ns);
+    await expect(repo.openPeriodKey(ns, "2026-09-01")).rejects.toBeInstanceOf(NamespaceShredded);
+  });
+
+  it("names an expired month, with the period and the instant it was shredded", async () => {
+    const ns = await aNamespace("PERIODEXPIRED");
+    await repo.periodKey(ns, "2026-09-01");
+    const at = new Date("2027-01-05T00:00:00.000Z");
+    await sql`update namespace_key set key_wrapped = null, shredded_at = ${at}
+      where namespace_id = ${ns} and period = date '2026-09-01'`.execute(db);
+    const opened = repo.openPeriodKey(ns, "2026-09-01");
+    await expect(opened).rejects.toBeInstanceOf(PayloadExpired);
+    await expect(opened).rejects.toThrow(/2026-09-01/);
+    await expect(opened).rejects.toThrow(/2027-01-05/);
+  });
+
+  // Expiry is fixed at mint from the period and the policy in force (R2), and
+  // takes no clock: a backfill of last year expires a grace after last year's
+  // month closed, not a grace after the day it was loaded. The clock here is
+  // 2026 and the period is 2025.
+  it("fixes expiry from the period and the policy, not from the clock", async () => {
+    const ns = await aNamespace("PERIODEXPIRY");
+    await repo.periodKey(ns, "2025-03-01");
+    const row = await db.selectFrom("namespace_key").select(["expires_at"])
+      .where("namespace_id", "=", ns).executeTakeFirst();
+    expect(row?.expires_at.toISOString())
+      .toBe(expiresAt("2025-03-01", RETENTION_V0).toISOString());
+    // Ninety days after 2025-04-01, and the clock reads 2026-09-07.
+    expect(row?.expires_at.toISOString()).toBe("2025-06-30T00:00:00.000Z");
+  });
+});
+
+// R8: the driver parses a `date` at LOCAL midnight, and this machine sits at
+// UTC+3 while CI sits at UTC. Read back as a Date, 2026-09-01 becomes
+// 2026-08-31T21:00Z east of Greenwich and the wrong month's key is looked up,
+// silently. Every select of `period` renders it as text for that reason.
+describe("the period column under a skewed zone", () => {
+  it("round-trips the same month in every zone the process might run in", async () => {
+    const was = process.env.TZ;
+    try {
+      for (const zone of ["UTC", "Etc/GMT-3", "Etc/GMT-14", "Etc/GMT+12"]) {
+        process.env.TZ = zone;
+        const ns = (await repo.ensure({ kind: "wallet", id: `TZ${zone}` })).namespaceId;
+        await repo.periodKey(ns, "2026-09-01");
+        const key = await repo.openPeriodKey(ns, "2026-09-01");
+        expect(key, zone).toHaveLength(32);
+        const rows = await repo.periodsOf(ns);
+        expect(rows, zone).toEqual(["2026-09-01"]);
+      }
+    } finally {
+      if (was === undefined) delete process.env.TZ;
+      else process.env.TZ = was;
+    }
+  });
+});
+
+describe("what the namespace_key table refuses to hold", () => {
+  async function mint(id: string, period = "2026-09-01"): Promise<string> {
+    const ns = (await repo.ensure({ kind: "wallet", id })).namespaceId;
+    await repo.periodKey(ns, period);
+    return ns;
+  }
+
+  it("refuses a period that is not the first of a month, by name", async () => {
+    const ns = (await repo.ensure({ kind: "wallet", id: "RAWPERIOD1" })).namespaceId;
+    await expect(
+      sql`insert into namespace_key (namespace_id, period, key_wrapped, expires_at, shredded_at, created_at)
+          values (${ns}, date '2026-09-15', ${Buffer.alloc(61)}, ${new Date("2027-01-01")}, null, ${clock.now()})`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_period_is_month" });
+  });
+
+  it("refuses an expiry before the period closes, by name", async () => {
+    const ns = (await repo.ensure({ kind: "wallet", id: "RAWPERIOD2" })).namespaceId;
+    await expect(
+      sql`insert into namespace_key (namespace_id, period, key_wrapped, expires_at, shredded_at, created_at)
+          values (${ns}, date '2026-09-01', ${Buffer.alloc(61)}, ${new Date("2026-09-30T00:00:00Z")}, null, ${clock.now()})`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_expires_after_period" });
+  });
+
+  // R2's guard, and the reason expiry is a column at all: an early shred is
+  // refused against the row's own value, with no wall clock in the database.
+  it("refuses a shred before the month expires, by name", async () => {
+    const ns = await mint("RAWPERIOD3");
+    await expect(
+      sql`update namespace_key set key_wrapped = null, shredded_at = ${new Date("2026-10-02T00:00:00Z")}
+          where namespace_id = ${ns} and period = date '2026-09-01'`.execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_shred_not_early" });
+  });
+
+  it("refuses a key gone without a shred instant, and an instant without the key going", async () => {
+    const ns = await mint("RAWPERIOD4");
+    await expect(
+      sql`update namespace_key set key_wrapped = null
+          where namespace_id = ${ns} and period = date '2026-09-01'`.execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_shred_consistent" });
+    await expect(
+      sql`update namespace_key set shredded_at = ${new Date("2027-01-05T00:00:00Z")}
+          where namespace_id = ${ns} and period = date '2026-09-01'`.execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_shred_consistent" });
+  });
+
+  // 29 is the wrapped-key header: one version byte, a twelve-byte nonce, a
+  // sixteen-byte tag. Anything that short holds no key, and without this an
+  // empty bytea would count as live under the consistency check above.
+  it("refuses a wrapped key too short to hold one, by name", async () => {
+    const ns = (await repo.ensure({ kind: "wallet", id: "RAWPERIOD5" })).namespaceId;
+    await expect(
+      sql`insert into namespace_key (namespace_id, period, key_wrapped, expires_at, shredded_at, created_at)
+          values (${ns}, date '2026-09-01', ${Buffer.alloc(29)}, ${new Date("2027-01-01")}, null, ${clock.now()})`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_present" });
+  });
+});
+
+describe("the namespace_key guard", () => {
+  const CODE = "NNT06";
+
+  async function mint(id: string): Promise<string> {
+    const ns = (await repo.ensure({ kind: "wallet", id })).namespaceId;
+    await repo.periodKey(ns, "2026-09-01");
+    return ns;
+  }
+
+  // Both halves, the way the namespace guard's own tests do it: the raw
+  // driver error carries the SQLSTATE this package allocated, and mapPgError
+  // turns it into the class callers assert on. Asserting only one of the two
+  // would let an unmapped code pass as a refusal nobody can catch by class.
+  async function refused(attempt: Promise<unknown>, pattern: RegExp): Promise<void> {
+    await expect(attempt).rejects.toMatchObject({ code: CODE });
+    const mapped = mapPgError(await attempt.catch((e: unknown) => e));
+    expect(mapped).toBeInstanceOf(PeriodKeyAltered);
+    expect(mapped).toBeInstanceOf(StoreError);
+    expect((mapped as Error).message).toMatch(pattern);
+  }
+
+  it("refuses a DELETE: a month is expired by shredding its key, never by dropping the row", async () => {
+    const ns = await mint("GUARDDEL");
+    await refused(
+      sql`delete from namespace_key where namespace_id = ${ns}`.execute(db),
+      /never deleted/,
+    );
+    expect(await repo.periodsOf(ns)).toEqual(["2026-09-01"]);
+  });
+
+  it("refuses a move of any fixed column, naming which rule failed", async () => {
+    const ns = await mint("GUARDFIXED");
+    const other = (await repo.ensure({ kind: "wallet", id: "GUARDFIXED2" })).namespaceId;
+    const moves = [
+      [sql`namespace_id = ${other}`, /identity is fixed/],
+      [sql`period = date '2026-10-01'`, /identity is fixed/],
+      [sql`created_at = ${new Date("2020-01-01T00:00:00Z")}`, /identity is fixed/],
+      // Its own message, because its reason is its own: R2 fixes expiry at
+      // mint, and a policy change that must move it is a migration.
+      [sql`expires_at = ${new Date("2030-01-01T00:00:00Z")}`, /expires_at is fixed at mint/],
+    ] as const;
+    for (const [move, pattern] of moves) {
+      await refused(
+        sql`update namespace_key set ${move} where namespace_id = ${ns}`.execute(db),
+        pattern,
+      );
+    }
+  });
+
+  it("refuses to un-shred a month, or to move the instant it was shredded", async () => {
+    const ns = await mint("GUARDUNSHRED");
+    const at = new Date("2027-01-05T00:00:00.000Z");
+    await sql`update namespace_key set key_wrapped = null, shredded_at = ${at}
+      where namespace_id = ${ns}`.execute(db);
+    await refused(
+      sql`update namespace_key set key_wrapped = ${Buffer.alloc(61)}, shredded_at = null
+          where namespace_id = ${ns}`.execute(db),
+      /stays expired/,
+    );
+    await refused(
+      sql`update namespace_key set shredded_at = ${new Date("2027-02-05T00:00:00Z")}
+          where namespace_id = ${ns}`.execute(db),
+      /stays expired/,
+    );
+    // And the row is still expired, with the first instant intact: that
+    // instant is the compliance record.
+    const row = await db.selectFrom("namespace_key").select(["key_wrapped", "shredded_at"])
+      .where("namespace_id", "=", ns).executeTakeFirst();
+    expect(row?.key_wrapped).toBeNull();
+    expect(row?.shredded_at?.toISOString()).toBe(at.toISOString());
+  });
+
+  // The sanctioned path the migration comment names, proved rather than
+  // asserted: a policy that shortens the grace moves expires_at on minted
+  // rows through a migration that disables this trigger. Without this test
+  // "that is a migration, loudly" is a sentence with no demonstration, and a
+  // reader would reasonably conclude expiry can never change at all.
+  it("admits the migration path it names, with the trigger disabled", async () => {
+    const ns = await mint("GUARDMIGRATE");
+    const shorter = new Date("2026-10-08T00:00:00.000Z");
+    await db.transaction().execute(async (trx) => {
+      await sql`alter table namespace_key disable trigger namespace_key_guarded`.execute(trx);
+      await sql`update namespace_key set expires_at = ${shorter} where namespace_id = ${ns}`
+        .execute(trx);
+      await sql`alter table namespace_key enable trigger namespace_key_guarded`.execute(trx);
+    });
+    const row = await db.selectFrom("namespace_key").select(["expires_at"])
+      .where("namespace_id", "=", ns).executeTakeFirst();
+    expect(row?.expires_at.toISOString()).toBe(shorter.toISOString());
+    // The guard is back on afterwards, so the path is a migration and not a
+    // way to leave the table unguarded.
+    await refused(
+      sql`update namespace_key set expires_at = ${new Date("2031-01-01T00:00:00Z")}
+          where namespace_id = ${ns}`.execute(db),
+      /expires_at is fixed at mint/,
+    );
   });
 });

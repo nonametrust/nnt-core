@@ -6,6 +6,7 @@ import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
+import { RETENTION_V0 } from "../retention.js";
 import { ConstraintViolation, HotWindowNotFound, StoreError, TriggerEventNotFound } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
@@ -69,7 +70,7 @@ function aBaseline(over: Partial<BaselineState> = {}): BaselineState {
 
 beforeAll(async () => {
   ({ db, done } = await withSchema("later_tables_test"));
-  namespaces = new NamespaceRepository(db, ring, clock);
+  namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
   observations = new ObservationRepository(db, namespaces, clock);
   records = new PermanentRecordRepository(db, clock);
   baselines = new BaselineRepository(db, clock);

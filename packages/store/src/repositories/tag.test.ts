@@ -6,6 +6,7 @@ import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
+import { RETENTION_V0 } from "../retention.js";
 import { ConstraintViolation, StoreError, TagAltered, TagNotFound, TagRefreshStale } from "../errors.js";
 import { strengthAt } from "../strength.js";
 import { NamespaceRepository } from "./namespace.js";
@@ -56,7 +57,7 @@ async function appendUnder(nsId: string, ref: string): Promise<string> {
 
 beforeAll(async () => {
   ({ db, done } = await withSchema("tag_test"));
-  namespaces = new NamespaceRepository(db, ring, clock);
+  namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
   observations = new ObservationRepository(db, namespaces, clock);
   repo = new TagRepository(db, clock);
   obs = await appendUnder("GOLDADDRESS", "op:tag:1");

@@ -3,8 +3,9 @@ import { sql } from "kysely";
 import type { NamespaceRef } from "@nonametrust/schema";
 import type { Clock } from "../clock.js";
 import type { Db } from "../db.js";
-import { newDataKey, type KeyRing } from "../crypto.js";
-import { NamespaceNotFound, NamespaceShredded } from "../errors.js";
+import { newDataKey, periodKeyAad, unwrapUnder, wrapUnder, type KeyRing } from "../crypto.js";
+import { NamespaceNotFound, NamespaceShredded, PayloadExpired } from "../errors.js";
+import { expiresAt, type RetentionPolicy } from "../retention.js";
 
 export interface StoredNamespace {
   namespaceId: string;
@@ -18,6 +19,11 @@ export class NamespaceRepository {
     private readonly db: Db,
     private readonly ring: KeyRing,
     private readonly clock: Clock,
+    // Needed at mint and nowhere else: expires_at is fixed on the row from
+    // the period and the policy in force (R2). Required rather than
+    // defaulted, for the reason the key ring has no default master key -- a
+    // fallback policy is a policy that reaches production.
+    private readonly policy: RetentionPolicy,
   ) {}
 
   /**
@@ -122,5 +128,84 @@ export class NamespaceRepository {
     if (result.numUpdatedRows === 0n) {
       throw new NamespaceNotFound(`no namespace ${namespaceId} to shred`);
     }
+  }
+
+  /**
+   * Mints the month key for this (namespace, period) if it does not exist.
+   *
+   * Insert-on-conflict-do-nothing, the same shape and for the same reason as
+   * `ensure`: an upsert that wrote `key_wrapped` on conflict would re-key a
+   * month, stranding every payload already sealed under the first key, and
+   * would mint a fresh key for a month that had been expired, quietly undoing
+   * the erasure. `do nothing` leaves an expired row exactly as it is.
+   *
+   * `dataKey` is read first, so a shredded namespace refuses before any row is
+   * written: there is no inner key to mint under a null outer one. That is
+   * also the restatement M1's re-key argument needed once period keys existed
+   * (F9): a namespace shred is total because the outer key is gone, not
+   * because readable and unreadable rows may not sit behind one marker --
+   * under period keys, that is the designed normal state.
+   */
+  async periodKey(namespaceId: string, period: string): Promise<void> {
+    const dataKey = await this.dataKey(namespaceId);
+    await this.db
+      .insertInto("namespace_key")
+      .values({
+        namespace_id: namespaceId,
+        period,
+        key_wrapped: wrapUnder(dataKey, newDataKey(), periodKeyAad(namespaceId, period)),
+        expires_at: expiresAt(period, this.policy),
+        shredded_at: null,
+        created_at: this.clock.now(),
+      })
+      .onConflict((oc) => oc.columns(["namespace_id", "period"]).doNothing())
+      .execute();
+  }
+
+  /**
+   * The month key, or a named refusal saying which of the two erasures
+   * happened.
+   *
+   * `dataKey` first, so a shredded namespace raises NamespaceShredded and
+   * never PayloadExpired. The order is the whole point: an operator told a
+   * month expired, when the counterparty space was erased on request, would
+   * go looking for a retention sweep instead of the erasure that actually
+   * happened. The namespace is the outer key and its refusal wins.
+   *
+   * A period with no row is a caller defect rather than a store condition --
+   * the only reader is a path whose row already exists - so it is a plain
+   * Error, as `ensure` does for a namespace that vanished after its insert.
+   */
+  async openPeriodKey(namespaceId: string, period: string): Promise<Buffer> {
+    const dataKey = await this.dataKey(namespaceId);
+    const row = await this.db
+      .selectFrom("namespace_key")
+      .select(["key_wrapped", "shredded_at"])
+      .where("namespace_id", "=", namespaceId)
+      .where(sql<boolean>`period = ${period}::date`)
+      .executeTakeFirst();
+    if (!row) throw new Error(`no month key ${period} for namespace ${namespaceId}`);
+    if (row.key_wrapped === null) {
+      throw new PayloadExpired(
+        `the month ${period} of namespace ${namespaceId} expired at ` +
+          `${row.shredded_at?.toISOString()}; its payloads are unreadable`,
+      );
+    }
+    return unwrapUnder(dataKey, row.key_wrapped, periodKeyAad(namespaceId, period));
+  }
+
+  /**
+   * Every period this namespace holds a key row for, as text.
+   *
+   * Rendered `period::text` in SQL, like every other read of the column: the
+   * driver parses a `date` at LOCAL midnight, so a Date here would be the
+   * previous day east of UTC and this list would name months that are off by
+   * one on exactly the machines this project runs on.
+   */
+  async periodsOf(namespaceId: string): Promise<string[]> {
+    const rows = await sql<{ period: string }>`
+      select period::text as period from namespace_key
+      where namespace_id = ${namespaceId} order by period`.execute(this.db);
+    return rows.rows.map((r) => r.period);
   }
 }

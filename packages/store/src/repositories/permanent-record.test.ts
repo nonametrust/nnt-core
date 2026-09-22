@@ -6,6 +6,7 @@ import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
+import { RETENTION_V0 } from "../retention.js";
 import {
   AppendOnlyViolation, ConstraintViolation, NamespaceShredded, ObservationNotFound,
   PermanentRecordNotFound, StateNotPromotable, StoreError, mapPgError,
@@ -64,7 +65,7 @@ function aState(over: Record<string, unknown> = {}): WireObservation {
 
 beforeAll(async () => {
   ({ db, done } = await withSchema("permrec_test"));
-  namespaces = new NamespaceRepository(db, ring, clock);
+  namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
   observations = new ObservationRepository(db, namespaces, clock);
   records = new PermanentRecordRepository(db, clock);
   ns = (await namespaces.ensure({ kind: "wallet", id: "GOLDADDRESS" })).namespaceId;
