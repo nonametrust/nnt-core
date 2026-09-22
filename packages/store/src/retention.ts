@@ -49,13 +49,29 @@ export interface RetentionPolicy {
    * have refused that backfill sixty times over and turned our own indexer
    * into a denial of service.
    *
-   * The margin is 1.55x, and saying so is the point. An earlier draft of this
-   * comment claimed an order of magnitude, which the number does not give and
-   * review caught; the sentence was wrong rather than the number. What 1.55x
-   * costs is written down instead: a delivery about 1.6 times the largest one
-   * measured is refused, and the remedy is to re-derive the cap from the new
-   * measurement, which is a policy version, not an edit. Re-derived, not
-   * retuned, when the shadow evaluation measures a larger fleet.
+   * The rule is a full order of magnitude over that measurement, so the cap is
+   * the smallest power of ten at or above 6,468,900: ten million. The test
+   * COMPUTES that from the rule rather than comparing the constant to a band,
+   * because a band is a threshold chosen after the constant.
+   *
+   * This reverses an earlier decision and the reversal is the point. The
+   * number was first 1,000,000 beside a comment claiming an order of
+   * magnitude, which 1.55x is not. The previous review kept the number and
+   * rewrote the sentence to admit 1.55x -- a defensible choice, but it left
+   * the plan's stated rule saying one thing and the code another, and it
+   * moved the test to `margin > 1.5 && margin < 2`, a band 1,200,000 also
+   * satisfies. Between a rule that was reasoned about and a number that
+   * drifted, the number gives way.
+   *
+   * The direction matters too. R3 says this cap is not a defence against an
+   * attacker -- the producer name is free text and an attacker rotates names
+   * until signatures are enforced -- so its real job is catching our own
+   * indexer in a loop. Too low refuses a legitimate delivery, which is the
+   * denial of service on ourselves this whole paragraph exists to avoid, and
+   * 1.55x would have refused a fleet only 60% larger than the one measured.
+   * Too high only delays noticing a runaway, and ten million a day per
+   * producer is still a bound. Re-derived, not retuned, when the shadow
+   * evaluation measures a larger fleet.
    *
    * The busiest single account in that run held 187,313 of the 646,890. That
    * figure does not bind here, because the cap is per producer and the
@@ -71,7 +87,7 @@ export const RETENTION_V0: RetentionPolicy = Object.freeze({
   graceDays: 90,
   period: "calendar-month-utc",
   producerWindowMs: 86_400_000,
-  producerMaxObservations: 1_000_000,
+  producerMaxObservations: 10_000_000,
 });
 
 const DAY_MS = 86_400_000;

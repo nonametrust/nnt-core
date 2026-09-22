@@ -187,6 +187,21 @@ describe("what the table refuses to hold", () => {
     ).rejects.toMatchObject({ code: "23514", constraint: "tag_aspect_nonempty" });
   });
 
+  // The nonempty check and the not-null are two rules, and only the first was
+  // held. `length(aspect) > 0` evaluates to NULL, not false, for a null
+  // aspect, so a check constraint passes it -- and the partial unique index
+  // treats NULLs as distinct, so a null aspect would also admit any number of
+  // live tags on one (namespace, channel). This is the same null-versus-check
+  // gap the producer column had one migration section down; review deleted
+  // `alter column aspect set not null` and the whole suite stayed green.
+  it("refuses a tag with no aspect at all, which the nonempty check alone admits", async () => {
+    await expect(
+      sql`insert into tag (tag_id, namespace_id, observation_id, channel, aspect, g0, tagged_at)
+          values (${randomUUID()}, ${ns}, ${obs}, 'volume', null, 0.5, ${clock.now()})`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23502", column: "aspect" });
+  });
+
   it("refuses a tag whose namespace is not the observation's, by foreign key", async () => {
     const stranger = (await namespaces.ensure({ kind: "wallet", id: "STRANGER" })).namespaceId;
     const opened = repo.open({ namespaceId: stranger, observationId: obs, channel: "volume", aspect: "p2", g0: 0.5, taggedAt: clock.now() });

@@ -317,8 +317,9 @@ describe("payloadAad", () => {
   // open render the same binding the same way, so any consistent order passes
   // a round trip. Swap two parts and only this test goes red.
   //
-  // The instant stays last because the null rendering above depends on it: an
-  // empty part anywhere else could not be told from a separator.
+  // Last is a convention, not a necessity: with a fixed part count and a
+  // separator no part may contain, an empty part is unambiguous anywhere.
+  // This pin is what holds the order; nothing deeper does.
   it("renders the eight parts in one fixed order, the two instants last", () => {
     expect(payloadAad(binding()).toString("utf8").split("\u0000")).toEqual([
       NS,
@@ -366,6 +367,57 @@ describe("payloadAad", () => {
     ]) {
       expect(() => payloadAad(binding(move)), JSON.stringify(move)).toThrow(RangeError);
     }
+  });
+
+  // A lone surrogate is not a character: UTF-8 cannot encode one, so Node
+  // encodes it as U+FFFD, and so does Postgres when it stores the column.
+  // The payload keeps the original escape inside its JSON while the column
+  // holds the replacement, both render to the SAME associated data, and the
+  // payload opens -- with a `kind` that disagrees with its own column. That
+  // falsifies the sentence the read path states outright, that a column which
+  // disagrees with the payload does not open at all.
+  //
+  // Verified before it was fixed: Buffer.from("\uD800") and
+  // Buffer.from("\uFFFD") are both ef bf bd, and the driver round-trips a
+  // lone surrogate back as U+FFFD.
+  //
+  // The separator check is not enough, because the two strings differ without
+  // either containing a NUL. What the parts must guarantee is that distinct
+  // tuples render to distinct bytes, and only well-formed strings do.
+  it("refuses a part that is not well-formed, because two of them can render the same bytes", () => {
+    const lone = "a\uD800b";
+    const replaced = "a\uFFFDb";
+    expect(lone).not.toBe(replaced);
+    expect(Buffer.from(lone, "utf8").equals(Buffer.from(replaced, "utf8"))).toBe(true);
+    for (const move of [{ channel: lone }, { kind: lone }, { producer: lone }, { namespaceId: lone }]) {
+      expect(() => payloadAad(binding(move)), JSON.stringify(move)).toThrow(RangeError);
+    }
+    expect(() => permanentAad(record({ recordId: lone }))).toThrow(RangeError);
+    // The well-formed twin is still accepted: what is refused is the
+    // ill-formed string, not the character it would have collapsed to.
+    expect(() => payloadAad(binding({ kind: replaced }))).not.toThrow();
+    // And a VALID surrogate pair is accepted, which is the other direction of
+    // the same rule and the one a careless check gets wrong: an astral
+    // character is stored as two surrogate code units, so a pattern without
+    // the unicode flag sees them individually and refuses legitimate text.
+    // Under `u` a valid pair is one non-surrogate code point and does not
+    // match at all. Nothing caught this until the flag was mutated away.
+    for (const good of ["a\u{1F600}b", "\u{1F600}", "ödeme-çğş", "日本語"]) {
+      expect(() => payloadAad(binding({ kind: good })), good).not.toThrow();
+      expect(payloadAad(binding({ kind: good })).toString("utf8").split("\u0000")[4]).toBe(good);
+    }
+  });
+
+  // An Invalid Date reaches toISOString and throws the runtime's own
+  // RangeError, which names no field. periodOf already refuses one by name;
+  // this is the same instant arriving one function later.
+  it("refuses an invalid instant by name, rather than by the runtime's own error", () => {
+    expect(() => payloadAad(binding({ ingestedAt: new Date(Number.NaN) })))
+      .toThrow(/ingestedAt/);
+    expect(() => payloadAad(binding({ datedAt: new Date(Number.NaN) })))
+      .toThrow(/datedAt/);
+    expect(() => permanentAad(record({ promotedAt: new Date(Number.NaN) })))
+      .toThrow(/promotedAt/);
   });
 
   // A state has no instant and its column is null. The rendering is fixed,

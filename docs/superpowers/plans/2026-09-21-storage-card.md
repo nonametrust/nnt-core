@@ -120,6 +120,27 @@ catalogue pin, all of which genuinely wait on Task 5. Cost: Task 4 touches
 the migration after all, so its reviewer reads SQL the plan did not promise
 there; and Task 6 is smaller than its own acceptance list reads.
 
+**What Task 6 must not silently re-green.** `observation.test.ts` now asserts
+that a raw `ingested_at = ingested_at + interval '1 month'` is refused as
+`CiphertextRejected`. Once Task 6 adds `observation_period_from_ingested_at`,
+that same UPDATE fails at the check with 23514 BEFORE the envelope is ever
+consulted, so the assertion inverts on purpose: it becomes 23514 by
+constraint name, and the test must say which layer refused. An implementer
+who edits it back to green without reading this has removed a gate. The
+one-hour move stays `CiphertextRejected`, because it does not change the
+month, and the pair is what shows the two layers apart.
+
+**Already done, not Task 6's any more:** the `producer` column with its shape
+check (regex *and* the schema's 64-character bound) and its not-null, the R6
+preamble with its own test, and the two additions to the move list. Gate G8's
+"producer shaped" shipped in Task 4; the gate table's row is stale. 0007's
+sections now read 1 baseline, 2 tag, 3 observation.producer, so Task 5's
+`namespace_key` is section 4, Task 6's period work section 5, and Task 9's
+permanent columns section 6 -- one higher than this plan says throughout.
+`observation` is therefore altered in section 3 and again in Task 6's
+section, which is correct (the period's foreign key needs `namespace_key`
+first) but is not the shape the plan describes.
+
 **Correction to Task 4's acceptance text:** it says "a payload sealed under
 the seven-part layout fails to open under the eight-part one". The layout
 that shipped has six parts, not seven; the test built the six-part envelope
@@ -327,7 +348,21 @@ The card does not enumerate them. These are the four the code needs and cannot d
 | `graceDays` | "sixty days" or "a quarter", from taste | `90`, the whitepaper's own sentence (en.md line 141: "ninety days after a calendar month closes"). A design number, not a measurement: declared, sourced, uncalibrated. |
 | `period` | a rolling 30 days, a week, a day | `"calendar-month-utc"`, the whitepaper's "(counterparty space, calendar month)". The UTC half is ours and says so; the field is a literal type so a change is a policy version, not an edit. |
 | `producerWindowMs` | "per hour" | `86 400 000`, one sliding UTC day on `ingested_at`, chosen so the unit matches the one measured delivery (below). |
-| `producerMaxObservations` | "10 000" | `1 000 000`, by a written rule: the largest delivery measured to date must be ingestible in one window with a margin of an order of magnitude. The A1 run report (`origin/feature/indexer:docs/indexer-run-2026-09.md` §3) delivered 646 890 observations for 100 accounts over 31 days in one file, the busiest account 187 313. Re-derived, not retuned, when the shadow evaluation measures a larger fleet. |
+| `producerMaxObservations` | "10 000" | `10 000 000`, by a written rule: the largest delivery measured to date must be ingestible in one window with a margin of an order of magnitude. The A1 run report (`origin/feature/indexer:docs/indexer-run-2026-09.md` §3) delivered 646 890 observations for 100 accounts over 31 days in one file, the busiest account 187 313. Ten times that is 6 468 900, and the smallest power of ten at or above it is ten million. The test computes that from the rule rather than comparing the constant to a band. Re-derived, not retuned, when the shadow evaluation measures a larger fleet. |
+
+**The cap was 1 000 000 for three commits and that was a fitted number.** The
+rule above was written first; the constant gave a margin of 1.55x, not ten,
+and the discrepancy survived two review rounds -- the second of which kept the
+number and rewrote the sentence to admit 1.55x, then moved the test to
+`margin > 1.5 && margin < 2`, a band 1 200 000 also satisfies. Between a rule
+that was reasoned about and a number that drifted, the number gives way. The
+direction also matters: R3 says this cap is not a defence against an attacker,
+since the producer name is free text until signatures are enforced, so its
+real job is catching our own indexer in a loop. Too low refuses a legitimate
+delivery, which is the denial of service on ourselves this section exists to
+prevent, and 1.55x would have refused a fleet only 60% larger than the one
+measured; too high only delays noticing a runaway, and ten million a day per
+producer is still a bound.
 
 Stated plainly: "10 000 per hour" would refuse the A1 backfill sixty times over and turn the indexer's own delivery into a denial of service, which is why the cap's numbers come from the one delivery that exists rather than from a sense of what a rate limit usually is. The bound it gives is real where the retention card wanted one: readable bytes are bounded by the window and the grace, and rows per producer per day are bounded by the cap; the row skeleton still grows without bound, by design.
 

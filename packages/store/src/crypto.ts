@@ -49,9 +49,14 @@ const SEPARATOR = "\u0000";
 
 // The rendering of a row that carries no instant. A state has none, and the
 // column is null for it. The empty part is chosen because no instant renders
-// to it, and the fixed part count keeps an empty part distinct from a missing
-// one: the instant is the last part, so a separator with nothing after it is
-// a null and nothing else.
+// to it, so a null is distinct from every instant, and the part count is
+// fixed, so an empty part is distinct from a missing one wherever it sits.
+//
+// Position does nothing here, and an earlier comment claimed it did: joining
+// on a separator no part may contain makes "a", "" and "b" recoverable from
+// their join in any order. Last is a convention, held by the order pin in
+// the test and by nothing deeper -- which is worth saying plainly, because
+// the same slogan-shaped reasoning was retired from permanentAad.
 const UNDATED = "";
 
 export interface Sealed {
@@ -123,9 +128,10 @@ export interface PayloadBinding {
  * consistent order round-trips, and a swap would be invisible everywhere but
  * in the test that pins this list.
  *
- * `datedAt` stays last because it is the only part that may render empty, and
- * an empty part is told from a missing one only by position: a separator with
- * nothing after it is a null instant and nothing else.
+ * `datedAt` is last by convention rather than by necessity. With a fixed part
+ * count and a separator no part may contain, an empty part is unambiguous in
+ * any position; the order is held by the pin in the test, which is the honest
+ * statement of it.
  */
 export function payloadAad(b: PayloadBinding): Buffer {
   return joinParts([
@@ -135,8 +141,8 @@ export function payloadAad(b: PayloadBinding): Buffer {
     b.channel,
     b.kind,
     b.producer,
-    b.ingestedAt.toISOString(),
-    b.datedAt === null ? UNDATED : b.datedAt.toISOString(),
+    instantPart("ingestedAt", b.ingestedAt),
+    b.datedAt === null ? UNDATED : instantPart("datedAt", b.datedAt),
   ]);
 }
 
@@ -174,18 +180,59 @@ export function permanentAad(b: PermanentBinding): Buffer {
     b.recordId,
     b.observationId,
     b.namespaceId,
-    b.originalDatedAt.toISOString(),
-    b.promotedAt.toISOString(),
+    instantPart("originalDatedAt", b.originalDatedAt),
+    instantPart("promotedAt", b.promotedAt),
   ]);
 }
+
+/**
+ * A lone surrogate is not a character and UTF-8 cannot encode one, so
+ * `Buffer.from` writes the replacement character instead -- and Postgres
+ * stores the column the same way. Two distinct strings therefore render to
+ * the same bytes: "a\uD800b" and "a\uFFFDb" are both `61 ef bf bd 62`.
+ *
+ * That breaks the property this whole function exists for. The separator
+ * check makes distinct TUPLES render distinctly; this makes distinct PARTS
+ * render distinctly, and without both, a payload can open under a row whose
+ * column disagrees with it -- an observation whose `kind` column is the
+ * replacement character while its sealed payload keeps the surrogate, with
+ * the read path's own sentence ("a column that disagrees with it does not
+ * open at all") false for that row.
+ *
+ * `\p{Surrogate}` under the `u` flag matches only LONE surrogates: a valid
+ * pair is one non-surrogate code point to a unicode-aware regex. It agrees
+ * with String.prototype.isWellFormed on every input, and is used instead
+ * because that method is ES2024 and this package targets ES2023.
+ */
+const LONE_SURROGATE = /\p{Surrogate}/u;
 
 function joinParts(parts: string[]): Buffer {
   for (const part of parts) {
     if (part.includes(SEPARATOR)) {
       throw new RangeError("associated data field contains NUL, the part separator");
     }
+    if (LONE_SURROGATE.test(part)) {
+      throw new RangeError(
+        "associated data field contains a lone surrogate, which encodes to the " +
+          "replacement character and would render the same bytes as another field",
+      );
+    }
   }
   return Buffer.from(parts.join(SEPARATOR), "utf8");
+}
+
+/**
+ * An instant rendered for the envelope, refused by the name of the field it
+ * came from. `toISOString` on an Invalid Date throws the runtime's own
+ * RangeError, whose message names no field and no caller can act on;
+ * `periodOf` already refuses one by name and this is the same instant
+ * arriving one function later.
+ */
+function instantPart(name: string, value: Date): string {
+  if (Number.isNaN(value.getTime())) {
+    throw new RangeError(`${name} must be a valid Date, got Invalid Date`);
+  }
+  return value.toISOString();
 }
 
 export function seal(dataKey: Buffer, plaintext: string, aad: Buffer): Sealed {

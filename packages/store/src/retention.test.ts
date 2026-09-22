@@ -64,16 +64,56 @@ describe("the period", () => {
     expect(periodCloses("2026-12-01").toISOString()).toBe("2027-01-01T00:00:00.000Z");
   });
 
+  // periodOf has had this sweep since it was written; periodCloses did not,
+  // and that asymmetry was a blind spot rather than a judgement. A local-time
+  // `new Date(year, month, 1)` here SURVIVES at UTC, which is the zone CI
+  // runs in, and dies only when the process sits off Greenwich -- so the bug
+  // would have been caught by this author's laptop being UTC+3 and by
+  // nothing else. Neither the arithmetic nor its gate may depend on that.
+  it("closes and expires in UTC in every zone the process might run in", () => {
+    const was = process.env.TZ;
+    try {
+      for (const zone of ["UTC", "Etc/GMT-14", "Etc/GMT+12", "America/New_York", "Asia/Kathmandu"]) {
+        process.env.TZ = zone;
+        expect(periodCloses("2026-09-01").toISOString(), zone).toBe("2026-10-01T00:00:00.000Z");
+        expect(periodCloses("2026-12-01").toISOString(), zone).toBe("2027-01-01T00:00:00.000Z");
+        expect(periodCloses("2028-02-01").toISOString(), zone).toBe("2028-03-01T00:00:00.000Z");
+        expect(
+          expiresAt("2026-09-01", aPolicy({ graceDays: 90 })).toISOString(), zone,
+        ).toBe("2026-12-30T00:00:00.000Z");
+      }
+    } finally {
+      if (was === undefined) delete process.env.TZ;
+      else process.env.TZ = was;
+    }
+  });
+
   it("handles a leap February and a short month", () => {
     expect(periodOf(new Date("2028-02-29T12:00:00.000Z"))).toBe("2028-02-01");
     expect(periodCloses("2028-02-01").toISOString()).toBe("2028-03-01T00:00:00.000Z");
     expect(periodCloses("2026-02-01").toISOString()).toBe("2026-03-01T00:00:00.000Z");
   });
 
-  it("refuses an instant that is not one, and a period that is not a first-of-month", () => {
-    expect(() => periodOf(new Date(Number.NaN))).toThrow(RangeError);
+  // The message and not only the class. RangeError is what this module throws
+  // for every bad input, so a test that asserts the class alone cannot tell
+  // the Invalid-Date refusal from the period-shape one -- and review's
+  // mutants confirmed both refusals could be swapped for each other with the
+  // suite green. This is the plan's own habit, applied where it was missed.
+  it("refuses an instant that is not one, and a period that is not a first-of-month, by message", () => {
+    expect(() => periodOf(new Date(Number.NaN))).toThrow(/ingestedAt must be a valid Date/);
     for (const bad of ["2026-09", "2026-09-02", "not-a-date", ""]) {
-      expect(() => periodCloses(bad), bad).toThrow(RangeError);
+      expect(() => periodCloses(bad), bad).toThrow(/period must be YYYY-MM-01/);
+    }
+  });
+
+  // `instanceof Date` is a separate rule from the NaN check, and only it
+  // turns a non-Date into a refusal this module owns: without it a string
+  // reaches `.getTime()` and throws a bare TypeError from the runtime, which
+  // names nothing a caller can act on. Nothing passed a non-Date until now.
+  it("refuses something that is not a Date at all, as its own named refusal", () => {
+    for (const bad of ["2026-09-01T00:00:00.000Z", 1_759_000_000_000, null, undefined, {}]) {
+      expect(() => periodOf(bad as unknown as Date), String(bad))
+        .toThrow(/ingestedAt must be a valid Date/);
     }
   });
 
@@ -128,7 +168,7 @@ describe("the v0 policy", () => {
       graceDays: 90,
       period: "calendar-month-utc",
       producerWindowMs: 86_400_000,
-      producerMaxObservations: 1_000_000,
+      producerMaxObservations: 10_000_000,
     });
   });
 
@@ -137,17 +177,26 @@ describe("the v0 policy", () => {
   });
 
   // The cap must admit the one delivery that exists, or it is a rule against
-  // ourselves. The margin is stated as what it is -- 1.55x -- rather than as
-  // a multiplier the constant happens to clear: an earlier version asserted
-  // `> 646_890 * 1.5` beside a comment claiming an order of magnitude, which
-  // is 6.5 million. The comment was wrong, and a test whose threshold is
-  // chosen after the constant proves nothing.
+  // ourselves. It is DERIVED here rather than compared against a band: the
+  // rule is stated once, applied to the measurement, and whatever it yields
+  // is what the constant must be.
+  //
+  // This is the third shape this test has had, and the first two are why it
+  // looks like this. It began as `> 646_890 * 1.5` beside a comment claiming
+  // an order of magnitude -- a threshold picked after the constant. Review
+  // caught the claim, and the fix rewrote the comment to admit 1.55x and the
+  // test to `margin > 1.5 && margin < 2`, which is the same mistake with
+  // better prose: 1,200,000 sits inside that band and the band holds nothing.
+  // A rule the test computes cannot be fitted to a constant after the fact.
   const A1_DELIVERY = 646_890;
-  it("admits the largest delivery measured to date, at the margin the comment claims", () => {
-    expect(RETENTION_V0.producerMaxObservations).toBeGreaterThan(A1_DELIVERY);
-    const margin = RETENTION_V0.producerMaxObservations / A1_DELIVERY;
-    expect(margin).toBeGreaterThan(1.5);
-    expect(margin).toBeLessThan(2);
+  const ORDER_OF_MAGNITUDE = 10;
+  it("is the rule applied to the measurement, not a number the rule was fitted to", () => {
+    // The smallest power of ten that leaves a full order of magnitude over
+    // the largest delivery measured to date.
+    const required = A1_DELIVERY * ORDER_OF_MAGNITUDE;
+    const derived = 10 ** Math.ceil(Math.log10(required));
+    expect(RETENTION_V0.producerMaxObservations).toBe(derived);
+    expect(RETENTION_V0.producerMaxObservations).toBeGreaterThanOrEqual(required);
   });
 });
 
@@ -168,6 +217,15 @@ describe("assertRetentionPolicy", () => {
       [{ producerWindowMs: -1 }, /producerWindowMs/],
       [{ producerMaxObservations: 0 }, /producerMaxObservations/],
       [{ producerMaxObservations: 1.5 }, /producerMaxObservations/],
+      // 2^53 is an integer and is NOT a safe one: beyond it, +1 is a no-op,
+      // so a cap counted up to would never be reached. `Number.isInteger`
+      // admits it and `Number.isSafeInteger` does not, and nothing passed a
+      // value this large until review mutated the check and nothing failed.
+      [{ producerMaxObservations: 2 ** 53 }, /producerMaxObservations/],
+      [{ producerWindowMs: 2 ** 53 }, /producerWindowMs/],
+      [{ graceDays: 2 ** 53 }, /graceDays/],
+      [{ graceDays: Number.POSITIVE_INFINITY }, /graceDays/],
+      [{ producerMaxObservations: Number.NaN }, /producerMaxObservations/],
       // The field is a literal type, so only a cast can produce this -- and a
       // cast is exactly how a future policy version would arrive with a
       // period this arithmetic does not implement.

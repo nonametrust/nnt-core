@@ -206,14 +206,26 @@ create trigger tag_guard_trigger
 -- the producer, so the value must be on the row. And the per-producer cap
 -- counts rows by it, which a value buried inside the ciphertext could not do.
 --
--- The regex is the schema's own (sourceSchema.producer in @nonametrust/schema:
--- lowercase alphanumeric segments joined by single hyphens, no leading,
--- trailing or doubled hyphen). It is restated here rather than referenced
--- because a check constraint cannot import one, and it is restated in full
--- rather than loosened: a check that admits more than the schema does is a
--- check that lets a raw writer store what the repository never could. That
--- duplication is the cost, and it is the two-shapes rule M1 set -- the
--- TypeScript refuses first and names the class, the table refuses everyone.
+-- The shape is the schema's own (sourceSchema.producer in @nonametrust/schema:
+-- `.min(1).max(64)` and lowercase alphanumeric segments joined by single
+-- hyphens, no leading, trailing or doubled hyphen). It is restated here
+-- rather than referenced because a check constraint cannot import one, and it
+-- is restated in FULL rather than loosened: a check that admits more than the
+-- schema does is a check that lets a raw writer store what the repository
+-- never could. That duplication is the cost, and it is the two-shapes rule M1
+-- set -- the TypeScript refuses first and names the class, the table refuses
+-- everyone.
+--
+-- The length bound is half of that and was missed on the first pass: the
+-- regex matches a name of any length, so the check admitted a 65-character
+-- producer while the schema refused it, and the paragraph above said
+-- otherwise. `min(1)` needs no clause of its own -- the regex requires at
+-- least one segment of at least one character -- but `max(64)` does.
+--
+-- The not-null is a third rule and not implied by either: `producer ~ '...'`
+-- evaluates to NULL, not false, for a null producer, and a check constraint
+-- passes on NULL.
 alter table observation
   add column producer text not null
-  constraint observation_producer_shape check (producer ~ '^[a-z0-9]+(-[a-z0-9]+)*$');
+  constraint observation_producer_shape
+  check (producer ~ '^[a-z0-9]+(-[a-z0-9]+)*$' and length(producer) <= 64);

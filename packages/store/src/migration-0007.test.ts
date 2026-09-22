@@ -106,24 +106,43 @@ describe("0007 over stored observations", () => {
   // actually is.
   //
   // Without this half, a preamble that refused unconditionally would still
-  // pass the test above.
-  it("runs over an empty observation table, which is every deployment there is", async () => {
+  // pass the test above. And the namespace row is what keys the refusal to
+  // the right table: with only an observation present in the test above, a
+  // preamble reading `select 1 from namespace` refuses identically, and
+  // review found that mutant alive. A namespace with no observation is
+  // reachable in ordinary use -- `ensure` runs before an insert that then
+  // fails -- so a deployment in that state must still migrate.
+  it("runs over an empty observation table, even with other rows present", async () => {
     const fresh = `${schemaName}_fresh`;
+    const freshDir = mkdtempSync(join(tmpdir(), "nnt-0007-fresh-"));
     const admin = openDb(url);
     await sql.raw(`drop schema if exists ${fresh} cascade`).execute(admin);
     await sql.raw(`create schema ${fresh}`).execute(admin);
     await admin.destroy();
     const freshDb = openDb(urlForSchema(url, fresh));
     try {
-      await migrate(freshDb, MIGRATIONS);
+      const names = readdirSync(MIGRATIONS).filter((n) => n.endsWith(".sql")).sort();
+      const seventh = "0007_retention_aspect_and_baseline_shape.sql";
+      for (const n of names.filter((n) => n < seventh)) {
+        copyFileSync(join(MIGRATIONS, n), join(freshDir, n));
+      }
+      await migrate(freshDb, freshDir);
+      await sql`
+        insert into namespace (namespace_id, kind, ns_id, data_key_wrapped, key_shredded_at, created_at)
+        values (${randomUUID()}, 'wallet', 'NOOBSERVATIONS', ${Buffer.alloc(61)}, null, now())
+      `.execute(freshDb);
+
+      copyFileSync(join(MIGRATIONS, seventh), join(freshDir, seventh));
+      await migrate(freshDb, freshDir);
       const row = await freshDb.selectFrom("schema_migration").select(["filename"])
-        .where("filename", "=", "0007_retention_aspect_and_baseline_shape.sql").executeTakeFirst();
+        .where("filename", "=", seventh).executeTakeFirst();
       expect(row).toBeDefined();
     } finally {
       await freshDb.destroy();
       const cleanup = openDb(url);
       await sql.raw(`drop schema if exists ${fresh} cascade`).execute(cleanup);
       await cleanup.destroy();
+      rmSync(freshDir, { recursive: true, force: true });
     }
   });
 });

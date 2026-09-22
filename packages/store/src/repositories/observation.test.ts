@@ -385,6 +385,84 @@ describe("the columns beside the payload", () => {
       }),
     ).rejects.toMatchObject({ code: "23502", column: "producer" });
   });
+
+  // The schema bounds the producer at 64 characters and the check restated
+  // only the regex, which matches a name of any length. A check that admits
+  // more than the schema does is a check that lets a raw writer store what
+  // the repository never could -- which is the sentence the migration's own
+  // comment makes, so the comment was false until this landed.
+  it("refuses a producer longer than the schema's bound, and admits one at it", async () => {
+    const { observation } = await observations.append(
+      anEvent({ source: { ...src, ref: "op:producer:4" } }),
+    );
+    const id = observation.observationId!;
+    const at64 = "a".repeat(64);
+    const at65 = "a".repeat(65);
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+        await sql`update observation set producer = ${at65} where observation_id = ${id}`.execute(trx);
+      }),
+    ).rejects.toMatchObject({ code: "23514", constraint: "observation_producer_shape" });
+    // The bound is 64 and not 63: a check one short would refuse a legitimate
+    // name, which is the other direction of the same error and would be
+    // invisible without this half. The transaction rolls itself back through
+    // a sentinel, so the row is left as it was written.
+    const rolledBack = new Error("rollback");
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+        await sql`update observation set producer = ${at64} where observation_id = ${id}`.execute(trx);
+        throw rolledBack;
+      }),
+    ).rejects.toBe(rolledBack);
+    expect((await observations.get(id)).source.producer).toBe("stellar-indexer");
+  });
+
+  // Two producers, because one cannot tell a derived value from a constant.
+  // With a single producer in the fixture, hard-coding both the envelope and
+  // the column to that name passes the entire suite -- review found exactly
+  // that mutant alive. The column is what Task 8's cap will count by, and a
+  // constant would collapse a per-producer cap into a global one.
+  it("derives the producer per observation, not once for the repository", async () => {
+    const a = await observations.append(anEvent({
+      source: { ...src, producer: "stellar-indexer", ref: "op:twoproducers:a" },
+    }));
+    const b = await observations.append(anEvent({
+      source: { ...src, producer: "x402-gateway", ref: "op:twoproducers:b" },
+    }));
+    const rows = await db.selectFrom("observation").select(["observation_id", "producer"])
+      .where("observation_id", "in", [a.observation.observationId!, b.observation.observationId!])
+      .execute();
+    const byId = new Map(rows.map((r) => [r.observation_id, r.producer]));
+    expect(byId.get(a.observation.observationId!)).toBe("stellar-indexer");
+    expect(byId.get(b.observation.observationId!)).toBe("x402-gateway");
+    // And both still open, so the column and the envelope agree for each.
+    expect((await observations.get(a.observation.observationId!)).source.producer).toBe("stellar-indexer");
+    expect((await observations.get(b.observation.observationId!)).source.producer).toBe("x402-gateway");
+  });
+
+  // The envelope binds the Date the column will hold, and every test in this
+  // package uses a frozen clock, so a second read of the clock for the column
+  // returns the same instant and the rule is held by the fixture rather than
+  // by the code. Under a real clock that mutant makes every payload fail to
+  // open at its first read. This clock moves on every call.
+  it("binds the instant it stores, not a second reading of the clock", async () => {
+    let t = new Date("2026-09-07T00:00:00.000Z").getTime();
+    const ticking = { now: () => { const d = new Date(t); t += 1_000; return d; } };
+    const ns = new NamespaceRepository(db, ring, ticking);
+    const repo = new ObservationRepository(db, ns, ticking);
+    const { observation } = await repo.append(
+      anEvent({ source: { ...src, ref: "op:ticking:1" } }),
+    );
+    const id = observation.observationId!;
+    // The read must succeed: it rebuilds the envelope from the stored column,
+    // so column and envelope agreeing is exactly what this proves.
+    await expect(repo.get(id)).resolves.toBeDefined();
+    const row = await db.selectFrom("observation").select(["ingested_at"])
+      .where("observation_id", "=", id).executeTakeFirst();
+    expect(row?.ingested_at.toISOString()).toBe(observation.ingestedAt);
+  });
 });
 
 describe("shredding", () => {
