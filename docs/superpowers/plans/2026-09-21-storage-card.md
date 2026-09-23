@@ -298,6 +298,42 @@ Cost if wrong: filtering would leave a growing set of month keys live under a
 dead one; the union would keep erasure-preceded-by-expiry out of the retention
 count; and an unsorted array makes M4's audit row unreproducible between runs.
 
+**R19. A re-delivery whose payload cannot be opened is answered, not thrown,
+and the answer carries two booleans rather than a reason.** §2d left this owed
+for Task 8. Measured first: `append`'s pre-read is `byIdempotencyKey`, which
+opens the payload, so for a namespace erased on request it raises
+`NamespaceShredded` out of the retry path itself
+(`observation.ts:68`). The indexer's normal retry then errors forever for that
+counterparty -- a denial of service on our own pipeline, which is the failure
+R3 already says this card must not create.
+
+It is answered rather than thrown because the row already exists. Refusing
+protects nothing: the skeleton is what a shred deliberately leaves standing,
+and §2c records that `namespace.ns_id` stays plaintext through an erasure, so
+confirming the row adds no fact the caller could not already read.
+
+**The shape follows R18 rather than repeating its mistake.** The obvious
+design is a `reason: "period-expired" | "namespace-erased"`, and it is wrong
+for exactly the reason the sweep's `reason` was wrong one task earlier: the
+two are not alternatives. A namespace erased on request can also hold a month
+past its grace, and then a union has to pick one and silently drops the other
+from whatever counts it feeds. So the third `AppendResult` shape carries
+`periodExpired` and `namespaceErased` as independent booleans, both of them
+state at the moment of the read.
+
+**The adjacent case is recorded and NOT changed.** A genuinely new observation
+for an erased namespace still throws `NamespaceShredded`, from `periodKey`'s
+refusal to mint under a dead outer key (`namespace.test.ts`, "refuses to mint
+under a shredded namespace"). That is M1's rule and it stays: a re-delivery is
+a retry of something already stored, while a new observation would be resuming
+collection on a counterparty who asked to be erased, and those deserve
+different answers. The distinction is the idempotency key, which is what the
+pre-read is for.
+
+Cost if wrong: answered when it should refuse, and an erased counterparty's
+pipeline quietly keeps flowing; thrown when it should answer, and one erasure
+request wedges the indexer's retry loop permanently.
+
 ## 2c. Limits of crypto-shredding, recorded rather than fixed
 
 Two things a security review measured that no schema change can close. They
