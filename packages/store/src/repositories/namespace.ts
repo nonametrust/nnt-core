@@ -30,6 +30,22 @@ import { assertRetentionPolicy, expiresAt, type RetentionPolicy } from "../reten
 export const PERIOD_TEXT = (column: RawBuilder<unknown>) =>
   sql<string>`to_char(${column}, 'YYYY-MM-DD')`;
 
+/**
+ * Why a month stopped being readable. Two erasures reach the same column by
+ * two different routes and a caller that cannot tell them apart will report
+ * one as the other: `retention-expiry` is the policy's clock reaching a
+ * month, `erased-namespace` is a month swept because the counterparty space
+ * it belongs to was erased on request (R18). The compliance record for the
+ * second is `namespace.key_shredded_at`, not this sweep.
+ */
+export type ExpiryReason = "retention-expiry" | "erased-namespace";
+
+export interface ExpiredPeriod {
+  namespaceId: string;
+  period: string;
+  reason: ExpiryReason;
+}
+
 export interface StoredNamespace {
   namespaceId: string;
   kind: string;
@@ -299,6 +315,76 @@ export class NamespaceRepository {
       );
     }
     return unwrapUnder(dataKey, row.key_wrapped, periodKeyAad(row.namespace_id, row.period));
+  }
+
+  /**
+   * The nightly sweep: every month past its grace becomes unreadable, and
+   * nothing else about it changes.
+   *
+   * One statement, for the reason `shred` is one statement -- the set it acts
+   * on and the set it reports are then the same set by construction, and a
+   * job that told M4 it expired a month it had not is worse than one that
+   * expired nothing. `returning` is what is reported, so the report comes
+   * from the rows the database actually wrote.
+   *
+   * It takes no namespace argument. That is what makes it the nightly job,
+   * and also what makes it awkward to test: a suite sharing a schema with it
+   * has every month it minted swept too, so the sweep's own tests own a
+   * schema.
+   *
+   * `now` from the injected clock, never `now()`, so a simulated day is a
+   * simulated day all the way down.
+   *
+   * The store writes no audit row here. It never has -- the caller does, and
+   * `acceptance.test.ts:174-182` is where that division is pinned. What this
+   * returns is what that caller needs in order to write one.
+   *
+   * The two `where` clauses are each a rule. `expires_at <= now` is the
+   * retention promise itself; `key_wrapped is not null` is what keeps the
+   * sweep idempotent, because an already-expired row re-selected here would
+   * have its `shredded_at` moved and the guard refuses exactly that -- so
+   * dropping it turns the second night into a PeriodKeyAltered rather than
+   * into a no-op.
+   *
+   * R18: the join, and why the sweep reaches an erased namespace. Such a
+   * namespace keeps its month keys, each still carrying a live wrapped key.
+   * Those keys are unopenable today only because the OUTER key is gone, and
+   * the plan's §2c measures that the realistic attacker on a shred is a
+   * backup restoring that outer key into its own row. Left alone, one restore
+   * returns every month the namespace ever had; swept, it returns only the
+   * months still inside their grace. What the sweep must NOT do is tell M4
+   * these were retention: the compliance record for an erasure request is
+   * `namespace.key_shredded_at`, and a retention count that silently includes
+   * subject requests measures neither of the two questions it would be read
+   * for. So the reason is read from the namespace's own column in the same
+   * statement. The foreign key guarantees exactly one matching row, so the
+   * join changes which rows are swept not at all.
+   *
+   * The instant is `now` for both kinds, and not the erasure request's
+   * instant for the second, truer though that one would be:
+   * `namespace_key_shred_not_early` refuses a `shredded_at` before
+   * `expires_at`, and an erasure request is usually earlier. The reason field
+   * carries what the instant cannot.
+   */
+  async expirePeriods(): Promise<{ shredded: ExpiredPeriod[] }> {
+    const now = this.clock.now();
+    const swept = await sql<{ namespace_id: string; period: string; erased: boolean }>`
+      update namespace_key k
+         set key_wrapped = null, shredded_at = ${now}
+        from namespace n
+       where n.namespace_id = k.namespace_id
+         and k.key_wrapped is not null
+         and k.expires_at <= ${now}
+      returning k.namespace_id::text as namespace_id,
+                ${PERIOD_TEXT(sql`k.period`)} as period,
+                (n.data_key_wrapped is null) as erased`.execute(this.db);
+    return {
+      shredded: swept.rows.map((row) => ({
+        namespaceId: row.namespace_id,
+        period: row.period,
+        reason: row.erased ? "erased-namespace" : "retention-expiry",
+      })),
+    };
   }
 
   /**

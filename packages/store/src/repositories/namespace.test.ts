@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { namespaceRefSchema } from "@nonametrust/schema";
+import { namespaceRefSchema, type WireObservation } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db, Schema } from "../db.js";
 import { withIsoDates } from "../db.js";
@@ -12,8 +12,10 @@ import {
   CiphertextRejected, NamespaceAltered, NamespaceNotFound, NamespaceShredded, PayloadExpired,
   PeriodKeyAltered, StoreError, mapPgError,
 } from "../errors.js";
-import { RETENTION_V0, expiresAt } from "../retention.js";
+import { RETENTION_V0, expiresAt, type RetentionPolicy } from "../retention.js";
 import { NamespaceRepository } from "./namespace.js";
+import { ObservationRepository } from "./observation.js";
+import { AuditChain } from "../audit/chain.js";
 
 let db: Db;
 let done: () => Promise<void>;
@@ -882,5 +884,247 @@ describe("the namespace_key guard", () => {
           where namespace_id = ${ns}`.execute(db),
       /expires_at is fixed at mint/,
     );
+  });
+});
+
+// Task 7. The sweep that makes retention a clock rather than a sentence.
+//
+// This block owns its own SCHEMA, which is not fastidiousness. `expirePeriods`
+// takes no namespace argument -- it is the nightly job and it sweeps the whole
+// table -- so run against `ns_test` it would also shred the rows every other
+// describe in this file minted, and "the sweep returned exactly this period"
+// would be measuring whichever tests happened to run first. The 2025 period
+// minted by "fixes expiry from the period and the policy" expires 2025-06-30
+// and is already past every clock below.
+//
+// Every repository here is built from ONE policy object with graceDays 7.
+// R16 refuses a stored expiry its own policy did not compute, so a fixture
+// appended through a ninety-day repository and swept by a seven-day one is a
+// PeriodKeyAltered on the next append to that namespace rather than a sweep
+// that finds nothing -- which is the failure this comment exists to stop
+// someone rediscovering.
+describe("expirePeriods: expiry is unreadability and nothing else", () => {
+  const grace7: RetentionPolicy = { ...RETENTION_V0, graceDays: 7 };
+  const SEPT = "2026-09-01";
+  const OCT = "2026-10-01";
+  // 2026-10-01 plus seven days. Written out rather than computed so that a
+  // change to expiresAt cannot move the boundary this test is about.
+  const due = new Date("2026-10-08T00:00:00.000Z");
+
+  let sdb: Db;
+  let sdone: () => Promise<void>;
+
+  /** Repositories that share `grace7` and read one fixed instant. */
+  function at(iso: string) {
+    const c = fixedClock(new Date(iso));
+    const namespaces = new NamespaceRepository(sdb, ring, c, grace7);
+    return { namespaces, observations: new ObservationRepository(sdb, namespaces, c) };
+  }
+
+  function anEvent(id: string, ref: string): WireObservation {
+    return {
+      schemaVersion: "0.1.0",
+      namespace: { kind: "wallet", id },
+      channel: "volume", evidenceKind: "event", kind: "payment",
+      observedAt: "2026-09-12T09:00:00.000Z",
+      source: {
+        producer: "stellar-indexer", producerVersion: "0.1.0",
+        network: "testnet", ref, fetchedAt: "2026-09-05T10:00:00.000Z",
+      },
+      payload: { amount: "500.0000000" },
+      salienceHints: { amount: "500.0000000" },
+    } as WireObservation;
+  }
+
+  beforeAll(async () => {
+    ({ db: sdb, done: sdone } = await withSchema("ns_sweep"));
+  });
+  afterAll(async () => { await sdone(); });
+
+  it("pins the boundary this block is built on", () => {
+    expect(expiresAt(SEPT, grace7).toISOString()).toBe(due.toISOString());
+  });
+
+  it("shreds nothing one millisecond before the expiry, and the month at it", async () => {
+    const september = at("2026-09-07T00:00:00.000Z");
+    const { observation } = await september.observations.append(anEvent("SWEEPSEPT", "op:sweep:1"));
+    const id = observation.observationId!;
+    // Readable before anything sweeps, so the refusal below is the sweep's
+    // doing and not the fixture's.
+    expect((await september.observations.get(id)).channel).toBe("volume");
+
+    // One millisecond early. `expires_at <= now` is the clause under test:
+    // deleted, this returns the period and the assertion fails.
+    const early = await at("2026-10-07T23:59:59.999Z").namespaces.expirePeriods();
+    expect(early.shredded).toEqual([]);
+    expect((await september.observations.get(id)).channel).toBe("volume");
+
+    // And at the instant itself. `>=` in namespace_key_shred_not_early is
+    // what admits shredded_at exactly equal to expires_at.
+    const swept = await at(due.toISOString()).namespaces.expirePeriods();
+    expect(swept.shredded).toEqual([
+      { namespaceId: expect.any(String), period: SEPT, reason: "retention-expiry" },
+    ]);
+    await expect(september.observations.get(id)).rejects.toBeInstanceOf(PayloadExpired);
+  });
+
+  it("leaves the row, its key row and its foreign key exactly where they were", async () => {
+    // The whole claim of this design: the payload stops opening and NOTHING
+    // else changes. A sweep that deleted rows would pass every readability
+    // assertion above and fail here.
+    const rows = await sql<{ observations: string; keys: string; orphans: string }>`
+      select (select count(*) from observation)::text as observations,
+             (select count(*) from namespace_key)::text as keys,
+             (select count(*) from observation o
+                where not exists (select 1 from namespace_key k
+                  where k.namespace_id = o.namespace_id and k.period = o.period))::text as orphans
+    `.execute(sdb);
+    expect(rows.rows[0]!.orphans).toBe("0");
+    expect(Number(rows.rows[0]!.observations)).toBeGreaterThan(0);
+    expect(Number(rows.rows[0]!.keys)).toBeGreaterThan(0);
+    // The shred instant is the sweep's, and the expiry it was measured
+    // against is untouched.
+    const key = await sdb.selectFrom("namespace_key").select(["expires_at", "shredded_at"])
+      .where(sql<boolean>`period = ${SEPT}::date`).executeTakeFirstOrThrow();
+    expect(key.expires_at.toISOString()).toBe(due.toISOString());
+    expect(key.shredded_at?.toISOString()).toBe(due.toISOString());
+  });
+
+  it("sweeps a second namespace's September and leaves October readable", async () => {
+    const october = at("2026-10-05T00:00:00.000Z");
+    // Appended in October, so its period is October and its grace has not
+    // run: the sweep below must not reach it.
+    const live = await october.observations.append(anEvent("SWEEPOCT", "op:sweep:oct"));
+    // A second namespace's September, minted late enough that the previous
+    // sweep did not see it.
+    const late = at("2026-09-20T00:00:00.000Z");
+    const stale = await late.observations.append(anEvent("SWEEPOTHER", "op:sweep:other"));
+
+    const swept = await at(due.toISOString()).namespaces.expirePeriods();
+    expect(swept.shredded.map((s) => s.period)).toEqual([SEPT]);
+    await expect(late.observations.get(stale.observation.observationId!))
+      .rejects.toBeInstanceOf(PayloadExpired);
+    expect((await october.observations.get(live.observation.observationId!)).channel)
+      .toBe("volume");
+    expect(await october.namespaces.periodsOf(
+      (await october.namespaces.find("wallet", "SWEEPOCT"))!.namespaceId,
+    )).toEqual([OCT]);
+  });
+
+  it("sweeps an expired month once and never moves the instant again", async () => {
+    // `key_wrapped is not null` is the clause under test. Deleted, this
+    // second sweep re-selects the already-shredded row, tries to write a new
+    // shredded_at over it, and the guard refuses with NNT06 -- so the
+    // mutation surfaces here as a thrown PeriodKeyAltered rather than as a
+    // wrong list.
+    const late = "2026-12-01T00:00:00.000Z";
+    const again = await at(late).namespaces.expirePeriods();
+    expect(again.shredded.map((s) => s.period)).toEqual([OCT]);
+    const sept = await sdb.selectFrom("namespace_key").select(["shredded_at"])
+      .where(sql<boolean>`period = ${SEPT}::date`).executeTakeFirstOrThrow();
+    expect(sept.shredded_at?.toISOString()).toBe(due.toISOString());
+
+    // The instant is the SWEEP's, not the row's own expiry, and this is the
+    // only place that can tell: October expired on 2026-11-08 and is swept
+    // three weeks later. In the test above the two instants are the same
+    // value, so `set shredded_at = k.expires_at` passed the entire suite --
+    // measured, as a surviving mutant, not supposed. A compliance record that
+    // took the expiry would say a month swept six months late became
+    // unreadable the day it became eligible, which is a false date on the one
+    // record this table exists to produce.
+    const oct = await sdb.selectFrom("namespace_key").select(["expires_at", "shredded_at"])
+      .where(sql<boolean>`period = ${OCT}::date`).executeTakeFirstOrThrow();
+    expect(oct.expires_at.toISOString()).toBe("2026-11-08T00:00:00.000Z");
+    expect(oct.shredded_at?.toISOString()).toBe(late);
+  });
+
+  // The sweep's period rendering, held the way every other read of this
+  // column is. `period::text` renders through the server's DateStyle -- the
+  // same date is 2026-09-01 under ISO and 01.09.2026 under German -- and the
+  // connection pins ISO, so the two forms agree and `::text` here survived
+  // every assertion above as an equivalent mutant. It is not equivalent under
+  // a session that sets its own style, and M4's audit rows are keyed on this
+  // string.
+  //
+  // The month is minted OUTSIDE this transaction on purpose: under German the
+  // driver cannot parse the timestamptz the mint reads back, so minting here
+  // would fail on a mechanism other than the one under test.
+  it("renders the swept period independently of the server's DateStyle", async () => {
+    const mar = at("2028-03-05T00:00:00.000Z");
+    await mar.observations.append(anEvent("SWEEPSTYLE", "op:sweep:style"));
+    const ROLLBACK = Symbol("rollback");
+    let swept: { period: string }[] = [];
+    await sdb.transaction().execute(async (trx) => {
+      await sql.raw("set local datestyle = 'German'").execute(trx);
+      const inside = new NamespaceRepository(trx, ring, fixedClock(new Date("2028-07-01T00:00:00.000Z")), grace7);
+      swept = (await inside.expirePeriods()).shredded;
+      throw ROLLBACK;
+    }).catch((e: unknown) => { if (e !== ROLLBACK) throw e; });
+    expect(swept.map((s) => s.period)).toEqual(["2028-03-01"]);
+  });
+
+  // R18. A namespace erased on request keeps its month keys, and the sweep
+  // reaches them: left alone they are unopenable only because the outer key
+  // is gone, and §2c measures that the realistic attacker on a shred is a
+  // backup restoring exactly that outer key. What the sweep may NOT do is
+  // report them to M4 as retention.
+  it("sweeps the months of an erased namespace, and says that is what they are", async () => {
+    const jan = at("2027-01-05T00:00:00.000Z");
+    await jan.observations.append(anEvent("SWEEPERASED", "op:sweep:erased"));
+    const ns = (await jan.namespaces.find("wallet", "SWEEPERASED"))!.namespaceId;
+    await jan.namespaces.shred(ns);
+
+    const swept = await at("2027-05-01T00:00:00.000Z").namespaces.expirePeriods();
+    expect(swept.shredded).toEqual([
+      { namespaceId: ns, period: "2027-01-01", reason: "erased-namespace" },
+    ]);
+    // The reason is read from the namespace, not guessed from the period: a
+    // live namespace swept in the same statement is still retention.
+    expect(swept.shredded.every((s) => s.reason === "erased-namespace")).toBe(true);
+  });
+
+  it("lets the namespace's erasure win over the month's on a namespace that is both", async () => {
+    const ns = (await at("2027-01-05T00:00:00.000Z").namespaces.find("wallet", "SWEEPERASED"))!
+      .namespaceId;
+    const both = at("2027-05-01T00:00:00.000Z");
+    // Both erasures have happened to this pair. An operator told the month
+    // expired would go looking for a retention sweep instead of the erasure
+    // request that actually happened, so the outer refusal wins.
+    await expect(both.namespaces.openPeriodKey(ns, "2027-01-01"))
+      .rejects.toBeInstanceOf(NamespaceShredded);
+  });
+
+  it("still erases a namespace on request after its months have been swept", async () => {
+    // The risk this holds: a shred that now has to cross rows the sweep
+    // already wrote. `shred` touches `namespace` alone and the month rows are
+    // already consistent, so it stays the single statement it was -- but the
+    // guard on namespace_key is the kind of thing that turns a one-statement
+    // erasure into a refusal, and a refused erasure request is the worst
+    // failure this table has.
+    const ns = (await at("2026-09-07T00:00:00.000Z").namespaces.find("wallet", "SWEEPSEPT"))!
+      .namespaceId;
+    await at("2027-06-01T00:00:00.000Z").namespaces.shred(ns);
+    const row = await sdb.selectFrom("namespace").select(["data_key_wrapped", "key_shredded_at"])
+      .where("namespace_id", "=", ns).executeTakeFirstOrThrow();
+    expect(row.data_key_wrapped).toBeNull();
+    expect(row.key_shredded_at?.toISOString()).toBe("2027-06-01T00:00:00.000Z");
+  });
+
+  it("leaves the audit chain verifying over entries written before the sweep", async () => {
+    const chain = new AuditChain(sdb, fixedClock(new Date("2027-08-08T00:00:00.000Z")), ring);
+    await chain.append({ policyVersion: "retention-v0", kind: "observation.appended", body: { n: 1 } });
+    await chain.append({ policyVersion: "retention-v0", kind: "observation.appended", body: { n: 2 } });
+    // A month of its own, because every month minted above has already been
+    // swept by now: without this the sweep below returns nothing and the
+    // assertion that it reached something would be the only thing failing.
+    await at("2027-08-08T00:00:00.000Z").observations.append(anEvent("SWEEPCHAIN", "op:sweep:chain"));
+    const swept = await at("2028-01-01T00:00:00.000Z").namespaces.expirePeriods();
+    // Non-vacuous in both directions: the chain has entries, and the sweep
+    // reached something. A verify() over an empty chain is ok and proves
+    // nothing.
+    expect(swept.shredded.length).toBeGreaterThan(0);
+    const entries = await sdb.selectFrom("audit_entry").select(["seq"]).execute();
+    expect(entries.length).toBeGreaterThan(0);
+    expect(await chain.verify()).toEqual({ ok: true });
   });
 });

@@ -220,6 +220,42 @@ sends and returns **null** for every timestamp column, so a read crashes on
 `.getTime()` with an error this package does not own. `to_char` fixes what we
 render; the connection pin fixes what the driver parses.
 
+**R18. The sweep reaches the months of a namespace erased on request, and
+names them as that rather than as retention.** §2d left this owed. A namespace
+shredded on request keeps its `namespace_key` rows, each still carrying a live
+wrapped month key; when their grace elapses the sweep's `where key_wrapped is
+not null` finds them. Filtering them out was the tempting answer and it is the
+wrong one, for a reason §2c already measured rather than one of taste: those
+month keys are unopenable today only because the outer key is gone, and §2c
+records that the realistic attacker on a shred is **a database backup**
+restoring that outer key into its own row. Left alone, one restore makes every
+month of that namespace readable again, including months whose grace ran out
+years earlier. Swept, a restore recovers only the months still inside their
+grace. So the sweep shreds them, and erasure-on-request gets strictly stronger
+with time rather than weaker.
+
+What it may NOT do is tell M4 they were retention expiries. The compliance
+record for an erasure request is `namespace.key_shredded_at`; a nightly audit
+that counted these as retention would report a retention event whose real
+cause was a subject's request, and the two answer different questions. So
+`expirePeriods` returns a discriminated row -- `reason: "retention-expiry" |
+"erased-namespace"` -- read from the namespace's own column in the same
+statement, by joining `namespace` in the `UPDATE ... FROM`. The foreign key
+guarantees exactly one matching row, so the join changes which rows are swept
+not at all.
+
+The instant stays `now` for both, and not the erasure request's instant even
+though that is the truer one for the second kind:
+`namespace_key_shred_not_early` refuses a `shredded_at` before `expires_at`,
+and an erasure request is usually earlier. The reason field carries the
+distinction the instant cannot.
+
+Cost if wrong: filtering instead would leave a growing set of month keys whose
+only protection is a key a backup restore returns, which is the one attacker
+§2c says this design must assume; and collapsing the two reasons would put
+erasure requests into a retention count someone will read as a measure of how
+the retention policy is behaving.
+
 ## 2c. Limits of crypto-shredding, recorded rather than fixed
 
 Two things a security review measured that no schema change can close. They
@@ -364,12 +400,19 @@ connection's ISO pin the two agree, so a `::text` implementation stays green
 and the divergence survives review -- this branch already recorded that pair
 as an equivalent mutant. `PERIOD_TEXT` in `namespace.ts` is the shared form.
 
-**Task 7 owes a ruling on already-shredded namespaces.** The sweep as written
-also nulls month keys belonging to namespaces that were erased on request --
-their `namespace_key` rows still carry a key -- and returns those periods to
-M4's audit as retention expiries. Reads are unaffected, since `openPeriodKey`
-answers `NamespaceShredded` first; what needs deciding is whether the sweep
-filters them out or reports them and says what they are.
+**Task 7 owed a ruling on already-shredded namespaces. R18 makes it:** the
+sweep reaches them and returns them under `reason: "erased-namespace"` rather
+than filtering them or calling them retention.
+
+**Task 7's first planted violation is already shipped, and the plan names the
+wrong refusal for it.** Task 7's text says a raw early shred is
+`PeriodKeyAltered`. It is not: the guard function has no early-shred branch,
+the rule is the CHECK `namespace_key_shred_not_early`, and it already refuses
+as 23514 by that name at `namespace.test.ts:761`. Re-asserting it under Task 7
+would add a test that measures Task 5's work; what Task 7 must plant instead
+is its own two clauses -- delete `expires_at <= now` and the
+minus-one-millisecond assertion fails; delete `key_wrapped is not null` and
+the second sweep of an expired month moves an instant the guard fixes.
 
 **Task 8: the policy must be the same object.** `ObservationRepository` gains
 a `RetentionPolicy` beside `NamespaceRepository`'s. Two repositories handed
