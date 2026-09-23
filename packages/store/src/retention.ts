@@ -13,10 +13,17 @@
  * Shipped so far: the month key, its table and its guard (Task 5), and the
  * wiring -- `append` seals under the month key and `read` opens under it
  * (Task 6), so expiring a month now does make its payloads unreadable through
- * every path the store offers. What is NOT shipped: the sweep that expires a
- * month on a clock (Task 7), so today expiry only happens when something
- * writes the shred by hand; and the permanent copy that lets a promoted trace
- * outlive its month (Task 9), so `permanent_record` still holds no payload.
+ * every path the store offers; and the sweep itself,
+ * `NamespaceRepository.expirePeriods` (Task 7), so retention is now a clock
+ * rather than something that happens when an operator writes a shred by hand.
+ * What is NOT shipped: the permanent copy that lets a promoted trace outlive
+ * its month (Task 9), so `permanent_record` still holds no payload.
+ *
+ * The sweep is the whole table's and the CALLER runs it: the store writes no
+ * audit row for it and returns what it shredded so that the caller can. It
+ * also reaches the months of a namespace erased on request, and says so
+ * (R18) -- the reason it returns tells the policy's clock apart from a
+ * subject's request, because those two are answerable to different records.
  *
  * "Unreadable" means through this store's API. It is not erasure from the
  * disk: see the plan's §2c, which records what a holder of the master key and

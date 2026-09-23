@@ -390,10 +390,13 @@ export class NamespaceRepository {
   /**
    * Every period this namespace holds a key row for, as text.
    *
-   * Rendered `period::text` in SQL, like every other read of the column: the
-   * driver parses a `date` at LOCAL midnight, so a Date here would be the
-   * previous day east of UTC and this list would name months that are off by
-   * one on exactly the machines this project runs on.
+   * Rendered through PERIOD_TEXT, like every other read of the column. Two
+   * settings would move it otherwise: the driver parses a `date` at LOCAL
+   * midnight, so a Date here would be the previous day east of UTC and this
+   * list would name months off by one on exactly the machines this project
+   * runs on; and `period::text` renders through the session's DateStyle,
+   * which R17 replaced everywhere for the same reason. This docstring said
+   * `::text` until Task 7, which is what the shared helper exists to stop.
    */
   async periodsOf(namespaceId: string): Promise<string[]> {
     const rows = await sql<{ period: string }>`
