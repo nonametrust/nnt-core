@@ -191,12 +191,14 @@ describe("the v0 policy", () => {
   const A1_DELIVERY = 646_890;
   const ORDER_OF_MAGNITUDE = 10;
   it("is the rule applied to the measurement, not a number the rule was fitted to", () => {
-    // The smallest power of ten that leaves a full order of magnitude over
-    // the largest delivery measured to date.
+    // The rule: a full order of magnitude over the largest delivery measured.
     const required = A1_DELIVERY * ORDER_OF_MAGNITUDE;
-    const derived = 10 ** Math.ceil(Math.log10(required));
-    expect(RETENTION_V0.producerMaxObservations).toBe(derived);
     expect(RETENTION_V0.producerMaxObservations).toBeGreaterThanOrEqual(required);
+    // The convention, applied after the rule and not part of it: round up to
+    // the next power of ten. Asserted separately so the two are visibly
+    // different claims -- the rule is the reasoning and this is a preference
+    // for a round number, and only the first would survive a veto.
+    expect(RETENTION_V0.producerMaxObservations).toBe(10 ** Math.ceil(Math.log10(required)));
   });
 });
 

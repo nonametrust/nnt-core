@@ -4,6 +4,7 @@ import {
   ChainBroken,
   ConstraintViolation,
   NamespaceAltered,
+  PeriodKeyAltered,
   StoreError,
   TagAltered,
   TimestampAltered,
@@ -29,6 +30,7 @@ describe("mapPgError", () => {
     ["NNT03", ChainBroken],
     ["NNT04", TimestampAltered],
     ["NNT05", NamespaceAltered],
+    ["NNT06", PeriodKeyAltered],
     ["NNT07", TagAltered],
   ])("maps %s to the named class", (code, Ctor) => {
     const mapped = mapPgError(pgError(code));

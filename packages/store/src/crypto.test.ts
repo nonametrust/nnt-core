@@ -5,6 +5,7 @@ import {
   newDataKey,
   open,
   payloadAad,
+  periodKeyAad,
   permanentAad,
   seal,
   type PayloadBinding,
@@ -500,6 +501,26 @@ describe("permanentAad", () => {
     ]) {
       expect(() => permanentAad(record(move)), JSON.stringify(move)).toThrow(RangeError);
     }
+  });
+});
+
+describe("periodKeyAad", () => {
+  // The claim this function makes is that it inherits the envelope's refusals
+  // rather than restating them -- and that claim was untested: hand-
+  // concatenating the two parts passed every other test, because both callers
+  // build the binding the same way and a consistent mistake round-trips.
+  it("inherits the separator and well-formedness refusals from the join", () => {
+    expect(() => periodKeyAad("a\u0000b", "2026-09-01")).toThrow(RangeError);
+    expect(() => periodKeyAad(NS, "2026-09\u000001")).toThrow(RangeError);
+    expect(() => periodKeyAad("a\uD800b", "2026-09-01")).toThrow(RangeError);
+  });
+
+  // Two distinct pairs cannot render the same binding, which is what stops a
+  // wrapped month key being useful in another row.
+  it("cannot be re-partitioned into a different pair", () => {
+    expect(periodKeyAad("ab", "c")).not.toEqual(periodKeyAad("a", "bc"));
+    expect(periodKeyAad(NS, "2026-09-01")).not.toEqual(periodKeyAad(NS, "2026-10-01"));
+    expect(periodKeyAad(NS, "2026-09-01")).not.toEqual(periodKeyAad(OTHER_NS, "2026-09-01"));
   });
 });
 

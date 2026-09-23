@@ -4,7 +4,7 @@ import { namespaceRefSchema } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
-import { keyRingFromEnv, newDataKey } from "../crypto.js";
+import { keyRingFromEnv, newDataKey, periodKeyAad, unwrapUnder } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import {
   CiphertextRejected, NamespaceAltered, NamespaceNotFound, NamespaceShredded, PayloadExpired,
@@ -341,16 +341,120 @@ describe("the month key", () => {
     await repo.periodKey(a, "2026-09-01");
     await repo.periodKey(a, "2026-10-01");
     await repo.periodKey(b, "2026-09-01");
+    // The guard refuses a live key being replaced at all (R14), so the copy is
+    // planted with the trigger off. That is not a weaker test: the associated
+    // data's threat model is an attacker with write access to the table, and
+    // under that model the trigger is already assumed bypassed. This is the
+    // layer underneath it.
+    async function copyKey(fromNs: string, fromPeriod: string, toNs: string, toPeriod: string) {
+      await sql`alter table namespace_key disable trigger namespace_key_guarded`.execute(db);
+      try {
+        await sql`update namespace_key set key_wrapped =
+          (select key_wrapped from namespace_key
+           where namespace_id = ${fromNs} and period = ${fromPeriod}::date)
+          where namespace_id = ${toNs} and period = ${toPeriod}::date`.execute(db);
+      } finally {
+        await sql`alter table namespace_key enable trigger namespace_key_guarded`.execute(db);
+      }
+    }
     // Another namespace, same period.
-    await sql`update namespace_key set key_wrapped =
-      (select key_wrapped from namespace_key where namespace_id = ${a} and period = date '2026-09-01')
-      where namespace_id = ${b} and period = date '2026-09-01'`.execute(db);
+    await copyKey(a, "2026-09-01", b, "2026-09-01");
     await expect(repo.openPeriodKey(b, "2026-09-01")).rejects.toBeInstanceOf(CiphertextRejected);
     // Same namespace, another period.
-    await sql`update namespace_key set key_wrapped =
-      (select key_wrapped from namespace_key where namespace_id = ${a} and period = date '2026-09-01')
-      where namespace_id = ${a} and period = date '2026-10-01'`.execute(db);
+    await copyKey(a, "2026-09-01", a, "2026-10-01");
     await expect(repo.openPeriodKey(a, "2026-10-01")).rejects.toBeInstanceOf(CiphertextRejected);
+  });
+
+  // R14, the guard branch above the cipher. The namespace table admits a live
+  // re-wrap on purpose, because rotating the master re-wraps every namespace
+  // key under it; no such reason exists one level down, where a month key is
+  // wrapped under a data key M1 rules is never rotated. A live month silently
+  // re-keyed strands every payload already sealed under the old key while the
+  // row still says the month is live.
+  it("refuses a live month key being replaced, above the cipher", async () => {
+    const ns = await aNamespace("PERIODREWRAP");
+    await repo.periodKey(ns, "2026-09-01");
+    const attempt = sql`update namespace_key set key_wrapped = ${Buffer.alloc(61, 7)}
+      where namespace_id = ${ns}`.execute(db);
+    await expect(attempt).rejects.toMatchObject({ code: "NNT06" });
+    await expect(attempt).rejects.toThrow(/live month key is not replaced/);
+    await expect(repo.openPeriodKey(ns, "2026-09-01")).resolves.toHaveLength(32);
+  });
+
+  // The two-level key is the whole design, and nothing held it: wrapping the
+  // month key under ring.deriveKey(namespaceId) instead of the namespace's
+  // own data key passes every other test here. Under that mistake a shred
+  // stops destroying the month keys and merely hides them behind a TypeScript
+  // ordering -- anyone holding the master key and the database recovers every
+  // month of an erased counterparty, which is the shred evasion the ring's
+  // own comment warns about.
+  it("wraps the month key under the namespace's data key, so a shred destroys it", async () => {
+    const ns = await aNamespace("PERIODTWOLEVEL");
+    await repo.periodKey(ns, "2026-09-01");
+    const dataKey = await repo.dataKey(ns);
+    const row = await db.selectFrom("namespace_key").select(["key_wrapped"])
+      .where("namespace_id", "=", ns).executeTakeFirst();
+    const wrapped = row!.key_wrapped!;
+    const aad = periodKeyAad(ns, "2026-09-01");
+    expect(unwrapUnder(dataKey, wrapped, aad)).toHaveLength(32);
+    // Not under anything derivable from the master alone. If it were, the
+    // shred below would destroy nothing.
+    expect(() => unwrapUnder(ring.deriveKey(ns), wrapped, aad)).toThrow(CiphertextRejected);
+
+    await repo.shred(ns);
+    // The row and its bytes are still there, and now nothing in the system
+    // can open them: the only key that could is gone.
+    const after = await db.selectFrom("namespace_key").select(["key_wrapped"])
+      .where("namespace_id", "=", ns).executeTakeFirst();
+    expect(after?.key_wrapped?.equals(wrapped)).toBe(true);
+    expect(() => unwrapUnder(ring.deriveKey(ns), wrapped, aad)).toThrow(CiphertextRejected);
+  });
+
+  // The binding is the pair as the DATABASE spells it, not as the caller
+  // typed it. A uuid in another case names the same row and `2026-9-1` is the
+  // same date to Postgres; bound to the caller's spelling, a mint and a read
+  // that disagree on either produce a CiphertextRejected -- a tamper report
+  // for a formatting difference.
+  it("opens whatever spelling of the pair the caller uses", async () => {
+    const ns = await aNamespace("PERIODSPELLING");
+    await repo.periodKey(ns.toUpperCase(), "2026-9-1");
+    const canonical = await repo.openPeriodKey(ns, "2026-09-01");
+    expect(canonical).toHaveLength(32);
+    expect((await repo.openPeriodKey(ns.toUpperCase(), "2026-09-01")).equals(canonical)).toBe(true);
+    expect((await repo.openPeriodKey(ns, "2026-9-1")).equals(canonical)).toBe(true);
+    expect(await repo.periodsOf(ns)).toEqual(["2026-09-01"]);
+  });
+
+  it("stamps created_at from the injected clock", async () => {
+    const ns = await aNamespace("PERIODCREATED");
+    await repo.periodKey(ns, "2026-09-01");
+    const row = await db.selectFrom("namespace_key").select(["created_at"])
+      .where("namespace_id", "=", ns).executeTakeFirst();
+    expect(row?.created_at.toISOString()).toBe(clock.now().toISOString());
+  });
+
+  // graceDays = 0 expires a month at its close, which assertRetentionPolicy
+  // explicitly admits as a policy rather than a defect. Both database
+  // boundaries are `>=` for that reason, and nothing pinned either: mutating
+  // expires_after_period or shred_not_early to `>` left the suite green.
+  //
+  // This is also the only test that overrides a RetentionPolicy field, which
+  // the plan's own habit requires -- without it, the required constructor
+  // parameter is indistinguishable from a hardcoded ninety.
+  it("admits a zero grace at both boundaries: expiry at the close, shred at expiry", async () => {
+    const eager = new NamespaceRepository(db, ring, clock, { ...RETENTION_V0, graceDays: 0 });
+    const ns = (await eager.ensure({ kind: "wallet", id: "PERIODGRACE0" })).namespaceId;
+    await eager.periodKey(ns, "2026-09-01");
+    const row = await db.selectFrom("namespace_key").select(["expires_at"])
+      .where("namespace_id", "=", ns).executeTakeFirst();
+    // The close itself, with no grace after it.
+    expect(row?.expires_at.toISOString()).toBe("2026-10-01T00:00:00.000Z");
+    // And a sweep may shred at exactly that instant, which is what
+    // expirePeriods will do at its own boundary: it sets shredded_at = now on
+    // the first sweep where expires_at <= now.
+    await sql`update namespace_key set key_wrapped = null, shredded_at = ${row!.expires_at}
+      where namespace_id = ${ns}`.execute(db);
+    await expect(eager.openPeriodKey(ns, "2026-09-01")).rejects.toBeInstanceOf(PayloadExpired);
   });
 
   it("refuses to mint under a shredded namespace, and writes no row", async () => {

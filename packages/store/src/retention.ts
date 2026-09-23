@@ -49,10 +49,15 @@ export interface RetentionPolicy {
    * have refused that backfill sixty times over and turned our own indexer
    * into a denial of service.
    *
-   * The rule is a full order of magnitude over that measurement, so the cap is
-   * the smallest power of ten at or above 6,468,900: ten million. The test
-   * COMPUTES that from the rule rather than comparing the constant to a band,
-   * because a band is a threshold chosen after the constant.
+   * The rule is a full order of magnitude over that measurement: any cap at or
+   * above 6,468,900 satisfies it. Rounding up to the next power of ten is a
+   * CONVENTION applied after the rule, not part of the reasoning, and saying
+   * so is the point -- it was added in the same change that moved the
+   * constant, so calling it "the rule" would be the same reverse-engineering
+   * this paragraph exists to record. The test computes both halves rather
+   * than comparing the constant to a band, because a band is a threshold
+   * chosen after the constant. Note the convention is discontinuous: a
+   * measurement of 1,000,001 would demand a hundred million.
    *
    * This reverses an earlier decision and the reversal is the point. The
    * number was first 1,000,000 beside a comment claiming an order of

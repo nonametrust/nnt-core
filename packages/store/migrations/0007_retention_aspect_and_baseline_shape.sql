@@ -263,6 +263,17 @@ alter table observation
 -- expires_at on the affected rows, and re-enables it -- the same shape the
 -- tests use, and the same shape M2 chose for lowering the saturation ceiling
 -- ("a policy change becomes a data migration, loudly rather than silently").
+--
+-- Two things that migration must do, both measured rather than assumed.
+-- Scope it `where shredded_at is null`: with the trigger off, lengthening a
+-- grace over an already-expired row is refused by
+-- namespace_key_shred_not_early and aborts the whole statement, and
+-- SHORTENING one is admitted, which would rewrite the basis of a compliance
+-- record that has already been acted on. And set a lock_timeout: `alter
+-- table ... disable trigger` takes ShareRowExclusiveLock, so it queues behind
+-- every in-flight append and every writer queues behind it until commit.
+-- (It is transactional on 17.7 -- a rollback restores the trigger -- so the
+-- window cannot be left open by a failure.)
 -- Without that sentence written down, the guard below reads as "expiry can
 -- never change", which is not what is meant.
 --
@@ -293,15 +304,41 @@ create table namespace_key (
   -- which is why wrapUnder was lifted out of the ring rather than copied.
   constraint namespace_key_present
     check (key_wrapped is null or octet_length(key_wrapped) > 29),
-  -- A month cannot expire before it has closed. `timezone('UTC', ...)` over a
-  -- plain timestamp is immutable and a bare comparison against timestamptz is
-  -- not, which a check constraint refuses; verified on the repository's 17.7
-  -- cluster rather than assumed.
+  -- A month cannot expire before it has closed, where "closed" means the UTC
+  -- close and not the server's.
+  --
+  -- An earlier version of this comment said Postgres refuses a bare
+  -- timestamptz comparison in a check because it is only stable. That is
+  -- FALSE and review caught it: Postgres enforces immutability for index
+  -- expressions and generated columns, never for CHECK, and
+  -- `check (expires_at >= period + interval '1 month')` is accepted. The form
+  -- below is still the right one, for the reason that actually holds --
+  -- measured on the 17.7 cluster rather than reasoned about:
+  --
+  --   the naive form casts a plain timestamp to timestamptz using the
+  --   SESSION's TimeZone, so for period 2026-03-01 it demands
+  --   2026-04-01T04:00Z under America/New_York and admits 2026-03-31T21:00Z
+  --   under Europe/Istanbul. It is wrong in both directions and which one
+  --   depends on a setting no migration controls. With graceDays = 0 -- a
+  --   policy assertRetentionPolicy explicitly admits -- the New York session
+  --   refuses a legitimate mint outright.
+  --
+  -- `timezone('UTC', <timestamp>)` pins the conversion instead of inheriting
+  -- it. It is also immutable, which matters for a different reason (an index
+  -- on it would be legal), but that is not why it is here.
+  --
+  -- `>=` and not `>`: graceDays = 0 expires a month at its close, which is a
+  -- policy and not a defect, and `>` would refuse every such mint.
   constraint namespace_key_expires_after_period
     check (expires_at >= timezone('UTC', (period + interval '1 month')::timestamp)),
   constraint namespace_key_period_is_month
     check (period = date_trunc('month', period::timestamp)::date),
   -- R2's guard. Expiry is not early, measured against the row's own value.
+  --
+  -- `>=` and not `>`: expirePeriods sweeps where `expires_at <= now` and sets
+  -- `shredded_at = now`, so the very first sweep that may shred a month sets
+  -- the instant to exactly expires_at. `>` would refuse Task 7 at its own
+  -- boundary.
   constraint namespace_key_shred_not_early
     check (shredded_at is null or shredded_at >= expires_at)
 );
@@ -340,6 +377,27 @@ begin
     raise exception using
       errcode = 'NNT06',
       message = 'an expired month stays expired: the instant does not move and no key is put back';
+  end if;
+  -- R14. A live month key is never replaced, only nulled by a shred. The
+  -- namespace table deliberately admits a live re-wrap, because the master
+  -- key may be rotated and every namespace key is re-wrapped under the new
+  -- master; no such reason exists one level down, since a month key is
+  -- wrapped under the namespace data key and M1 rules that key is never
+  -- rotated. Without this branch a live month can be silently re-keyed,
+  -- which strands every payload already sealed under the old key while the
+  -- row still says the month is live -- and the read reports it as a tamper,
+  -- naming the ciphertext rather than the write that caused it.
+  --
+  -- Review found this hole by noticing that the row-copy test depended on
+  -- it: the test moved a wrapped key between live rows and read the refusal
+  -- from the cipher. That test now disables this trigger, which is honest,
+  -- because the envelope's threat model assumes exactly that.
+  if old.key_wrapped is not null
+     and new.key_wrapped is not null
+     and new.key_wrapped is distinct from old.key_wrapped then
+    raise exception using
+      errcode = 'NNT06',
+      message = 'a live month key is not replaced; the only move is to null with a shred instant';
   end if;
   return new;
 end

@@ -148,18 +148,48 @@ export class NamespaceRepository {
    */
   async periodKey(namespaceId: string, period: string): Promise<void> {
     const dataKey = await this.dataKey(namespaceId);
+    // Bound to the spellings the database will report, not to the ones the
+    // caller passed, for the reason `dataKey` unwraps under the column rather
+    // than the argument: the uuid column locates the row whatever case the
+    // caller spelled it in, and `2026-9-1` is the same date to Postgres as
+    // `2026-09-01`, but the wrap's associated data is bytes. Bound to the
+    // caller's spelling, a mint and a read that disagree on case produce a
+    // CiphertextRejected -- a tamper report for a formatting difference.
+    const canonical = await this.canonicalPair(namespaceId, period);
     await this.db
       .insertInto("namespace_key")
       .values({
         namespace_id: namespaceId,
         period,
-        key_wrapped: wrapUnder(dataKey, newDataKey(), periodKeyAad(namespaceId, period)),
-        expires_at: expiresAt(period, this.policy),
+        key_wrapped: wrapUnder(dataKey, newDataKey(), periodKeyAad(canonical.namespaceId, canonical.period)),
+        expires_at: expiresAt(canonical.period, this.policy),
         shredded_at: null,
         created_at: this.clock.now(),
       })
       .onConflict((oc) => oc.columns(["namespace_id", "period"]).doNothing())
       .execute();
+  }
+
+  /**
+   * The pair as the database spells it: the uuid in its canonical lowercase
+   * form and the period as `YYYY-MM-DD`. Both come back through the same
+   * rendering every other read of this column uses, so the binding a key is
+   * minted under and the binding it is opened under are the same bytes even
+   * when two callers spell the pair differently.
+   *
+   * A period the database cannot read as a date fails here, as a
+   * ConstraintViolation-shaped driver error rather than deep inside a cipher.
+   */
+  private async canonicalPair(
+    namespaceId: string,
+    period: string,
+  ): Promise<{ namespaceId: string; period: string }> {
+    const row = await sql<{ namespace_id: string; period: string }>`
+      select namespace_id::text as namespace_id, ${period}::date::text as period
+      from namespace where namespace_id = ${namespaceId}`.execute(this.db);
+    const only = row.rows[0];
+    if (!only) throw new NamespaceNotFound(`no namespace ${namespaceId}`);
+    return { namespaceId: only.namespace_id, period: only.period };
   }
 
   /**
@@ -178,20 +208,25 @@ export class NamespaceRepository {
    */
   async openPeriodKey(namespaceId: string, period: string): Promise<Buffer> {
     const dataKey = await this.dataKey(namespaceId);
-    const row = await this.db
-      .selectFrom("namespace_key")
-      .select(["key_wrapped", "shredded_at"])
-      .where("namespace_id", "=", namespaceId)
-      .where(sql<boolean>`period = ${period}::date`)
-      .executeTakeFirst();
+    // Every part of the binding is read back from the row, so the key opens
+    // under what the database holds rather than under what this caller typed.
+    const found = await sql<{
+      namespace_id: string; period: string;
+      key_wrapped: Buffer | null; shredded_at: Date | null;
+    }>`
+      select namespace_id::text as namespace_id, period::text as period,
+             key_wrapped, shredded_at
+      from namespace_key
+      where namespace_id = ${namespaceId} and period = ${period}::date`.execute(this.db);
+    const row = found.rows[0];
     if (!row) throw new Error(`no month key ${period} for namespace ${namespaceId}`);
     if (row.key_wrapped === null) {
       throw new PayloadExpired(
-        `the month ${period} of namespace ${namespaceId} expired at ` +
+        `the month ${row.period} of namespace ${row.namespace_id} expired at ` +
           `${row.shredded_at?.toISOString()}; its payloads are unreadable`,
       );
     }
-    return unwrapUnder(dataKey, row.key_wrapped, periodKeyAad(namespaceId, period));
+    return unwrapUnder(dataKey, row.key_wrapped, periodKeyAad(row.namespace_id, row.period));
   }
 
   /**

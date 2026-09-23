@@ -155,6 +155,37 @@ no part allowed to contain the separator -- so the two envelopes cannot be
 equal for any inputs at all. The test asserts the adversarial case and the
 structural reason, not the slogan.
 
+**R14. A live month key is never replaced, only nulled by a shred.** The
+`namespace` table deliberately admits a live re-wrap, because rotating the
+master re-wraps every namespace key under the new one. No such reason exists a
+level down: a month key is wrapped under the namespace data key, and M1 rules
+that key is never rotated. Without the guard branch a live month can be
+silently re-keyed, stranding every payload already sealed under the old key
+while the row still says the month is live -- and the read reports it as a
+tamper, naming the ciphertext rather than the write that caused it. Found
+because the row-copy test depended on the hole; that test now disables the
+trigger, which is honest, since the envelope's threat model assumes exactly
+that. Cost: a future master rotation that also re-keys month keys becomes a
+migration rather than an UPDATE.
+
+**Correction to Task 5's reasoning about check constraints.** The migration
+first said Postgres refuses a bare `timestamptz` comparison in a CHECK because
+it is only stable. That is false: Postgres enforces immutability for index
+expressions and generated columns, never for CHECK. The immutable form is
+still correct, for the reason that actually holds and was measured -- the
+naive form converts using the SESSION's TimeZone, so for period `2026-03-01`
+it demands `2026-04-01T04:00Z` under America/New_York and admits
+`2026-03-31T21:00Z` under Europe/Istanbul. It is wrong in both directions and
+which one depends on a setting no migration controls.
+
+**Correction to the cap's derivation.** §6's rule is a full order of magnitude
+over the measured delivery, which any value at or above 6,468,900 satisfies.
+Rounding up to the next power of ten is a *convention* applied after the rule,
+added in the same commit that moved the constant; calling it part of the rule
+would be the reverse-engineering the section exists to record. The test now
+asserts the rule and the convention as two separate claims, so a veto of the
+convention leaves the rule standing.
+
 **Carried, not ruled:** a tag may still move from `open` to `saturated` with
 the count unchanged. Nothing in M2's arithmetic produces it and nothing
 refuses it; it belongs on M4's card beside retirement rather than being
