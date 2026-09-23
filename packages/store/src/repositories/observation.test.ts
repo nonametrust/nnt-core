@@ -6,10 +6,10 @@ import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv, newDataKey, payloadAad, seal } from "../crypto.js";
 import { fixedClock } from "../clock.js";
-import { RETENTION_V0 } from "../retention.js";
+import { RETENTION_V0, periodOf } from "../retention.js";
 import {
   CiphertextRejected, ConstraintViolation, IdempotencyKeyMismatch, NamespaceShredded,
-  ObservationNotFound, StoreError,
+  ObservationNotFound, PayloadExpired, StoreError,
 } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
@@ -123,27 +123,32 @@ describe("the round trip", () => {
 // constraint name is asserted because it is what tells the two directions
 // apart when one fires.
 describe("the invariant the table holds on its own", () => {
-  function rawRow(evidenceKind: string, datedAt: Date | null) {
+  // The period and its key row are part of the fixture now: the foreign key
+  // means no payload may be stored without a key to open it under, so a raw
+  // writer must mint one first exactly as `append` does. Loud if forgotten,
+  // which is the point of the constraint.
+  async function rawRow(evidenceKind: string, datedAt: Date | null) {
+    const ns = (await namespaces.ensure({ kind: "wallet", id: "RAWROWS" })).namespaceId;
+    const period = periodOf(clock.now());
+    await namespaces.periodKey(ns, period);
     return sql`
       insert into observation (
         observation_id, idempotency_key, namespace_id, channel, kind, evidence_kind,
-        dated_at, ingested_at, producer, payload_nonce, payload_tag, payload_ciphertext
-      )
-      select ${randomUUID()}, ${randomUUID()}, namespace_id, 'protocol', 'raw', ${evidenceKind},
-        ${datedAt}, ${clock.now()}, 'raw-writer',
+        dated_at, ingested_at, producer, period, payload_nonce, payload_tag, payload_ciphertext
+      ) values (
+        ${randomUUID()}, ${randomUUID()}, ${ns}, 'protocol', 'raw', ${evidenceKind},
+        ${datedAt}, ${clock.now()}, 'raw-writer', ${period}::date,
         decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
-      from namespace limit 1
+      )
     `.execute(db);
   }
 
   it("refuses a dated state", async () => {
-    await namespaces.ensure({ kind: "wallet", id: "RAWROWS" });
     await expect(rawRow("state", new Date("2026-09-01T00:00:00.000Z")))
       .rejects.toMatchObject({ code: "23514", constraint: "observation_state_is_undated" });
   });
 
   it("refuses an undated event", async () => {
-    await namespaces.ensure({ kind: "wallet", id: "RAWROWS" });
     await expect(rawRow("event", null))
       .rejects.toMatchObject({ code: "23514", constraint: "observation_event_is_dated" });
   });
@@ -237,9 +242,15 @@ describe("idempotency", () => {
   // return that stand-in with `created: false`. This one must rethrow the
   // foreign-key violation, mapped to its class.
   it("does not report a failed insert as already stored", async () => {
+    // `append` now mints and opens a month key as well, so the stand-in
+    // answers those too: what is under test is that an insert refused by a
+    // foreign key is not reported as "already stored", and the stand-in
+    // exists to make that insert fail.
     const orphan = {
       ensure: async () => ({ namespaceId: randomUUID(), kind: "wallet", nsId: "ORPHAN", shreddedAt: null }),
       dataKey: async () => newDataKey(),
+      periodKey: async () => undefined,
+      openPeriodKey: async () => newDataKey(),
     } as unknown as NamespaceRepository;
     const broken = new ObservationRepository(db, orphan, clock);
     const standIn = (await observations.append(anEvent({ source: { ...src, ref: "op:orphan:standin" } }))).observation;
@@ -305,12 +316,9 @@ describe("the columns beside the payload", () => {
       sql`kind = 'tampered'`,
       sql`evidence_kind = 'state', dated_at = null`,
       sql`producer = 'tampered'`,
-      // An hour moves the instant without moving its calendar month; a month
-      // moves the bucket the retention key is chosen by. Both are refused by
-      // the envelope, and the second is the one that would otherwise re-file
-      // a row under a key that was never used to seal it.
+      // An hour moves the instant without moving its calendar month, so the
+      // period column still agrees and the envelope is what refuses it.
       sql`ingested_at = ingested_at + interval '1 hour'`,
-      sql`ingested_at = ingested_at + interval '1 month'`,
     ];
     for (const move of moves) {
       await expect(
@@ -392,7 +400,8 @@ describe("the columns beside the payload", () => {
       .select(["namespace_id", "idempotency_key", "evidence_kind", "channel", "kind",
         "dated_at", "ingested_at", "producer"])
       .where("observation_id", "=", idA).executeTakeFirstOrThrow();
-    const dataKey = await namespaces.dataKey(row.namespace_id);
+    const period = periodOf(row.ingested_at);
+    const dataKey = await namespaces.openPeriodKey(row.namespace_id, period);
     const forged = seal(
       dataKey,
       JSON.stringify({ ...a.observation, observationId: b.observation.observationId }),
@@ -570,5 +579,213 @@ describe("shredding", () => {
     const rows = await db.selectFrom("observation").select(["observation_id"])
       .where("namespace_id", "=", ns.namespaceId).execute();
     expect(rows).toEqual([]);
+  });
+});
+
+// The period column, the month key it points at, and the foreign key that
+// makes "no payload without a key row" a fact rather than an ordering.
+describe("the retention period", () => {
+  it("is the UTC calendar month of ingested_at, and a key row exists for it", async () => {
+    const { observation } = await observations.append(
+      anEvent({ source: { ...src, ref: "op:period:1" } }),
+    );
+    const row = await sql<{ period: string }>`
+      select to_char(period, 'YYYY-MM-DD') as period from observation
+      where observation_id = ${observation.observationId!}`.execute(db);
+    // The clock is 2026-09-07, and the period follows INGEST time, not the
+    // event's: this observation is dated 2026-09-12, a different month from
+    // neither, and the column says September because that is when it was
+    // written. R1's reason, restated as a test: a backfill keyed on the
+    // event's month would be born expired.
+    expect(row.rows[0]?.period).toBe("2026-09-01");
+    const ns = (await namespaces.find("wallet", "GOLDADDRESS"))!.namespaceId;
+    expect(await namespaces.periodsOf(ns)).toContain("2026-09-01");
+  });
+
+  // Derived, not passed in: the same rule every other column beside the
+  // payload follows. A raw writer that disagrees with ingested_at is refused
+  // by name, so the two can never drift.
+  it("refuses a period that is not the month of its own ingested_at, by name", async () => {
+    const { observation } = await observations.append(
+      anEvent({ source: { ...src, ref: "op:period:2" } }),
+    );
+    const id = observation.observationId!;
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+        await sql`update observation set period = date '2026-10-01' where observation_id = ${id}`
+          .execute(trx);
+      }),
+    ).rejects.toMatchObject({ code: "23514", constraint: "observation_period_from_ingested_at" });
+  });
+
+  // This is the assertion that inverted. Before the period column, moving
+  // ingested_at across a month boundary was refused by the ENVELOPE at read
+  // time; now the check refuses the write itself, before any payload is
+  // consulted, and the test says which layer refused. Re-greening it by
+  // deleting it would remove the loud refusal and leave the quiet one.
+  it("refuses a move of ingested_at across a month boundary at the write, not at the read", async () => {
+    const { observation } = await observations.append(
+      anEvent({ source: { ...src, ref: "op:period:3" } }),
+    );
+    const id = observation.observationId!;
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+        await sql`update observation set ingested_at = ingested_at + interval '1 month'
+          where observation_id = ${id}`.execute(trx);
+      }),
+    ).rejects.toMatchObject({ code: "23514", constraint: "observation_period_from_ingested_at" });
+  });
+
+  it("refuses an observation whose month has no key row, by foreign key", async () => {
+    const ns = (await namespaces.ensure({ kind: "wallet", id: "NOKEYROW" })).namespaceId;
+    await expect(
+      sql`insert into observation (
+          observation_id, idempotency_key, namespace_id, channel, kind, evidence_kind,
+          dated_at, ingested_at, producer, period, payload_nonce, payload_tag, payload_ciphertext
+        ) values (
+          ${randomUUID()}, ${randomUUID()}, ${ns}, 'volume', 'payment', 'event',
+          ${clock.now()}, ${clock.now()}, 'raw-writer', date '2026-09-01',
+          decode('00','hex'), decode('00','hex'), decode('00','hex')
+        )`.execute(db),
+    ).rejects.toMatchObject({ code: "23503", constraint: "observation_period_key" });
+  });
+
+  // The payload is sealed under the MONTH key, which is what makes expiry
+  // unreadability rather than a column update. Before this task it was sealed
+  // under the namespace key and expiring a month made nothing unreadable --
+  // measured by review, which is why this test exists rather than a comment.
+  it("seals under the month key, so expiring that month makes it unreadable", async () => {
+    const ns = (await namespaces.ensure({ kind: "wallet", id: "EXPIREME" })).namespaceId;
+    const { observation } = await observations.append(anEvent({
+      source: { ...src, ref: "op:period:4" }, namespace: { kind: "wallet", id: "EXPIREME" },
+    }));
+    const id = observation.observationId!;
+    expect(await observations.get(id)).toBeDefined();
+
+    const row = await db.selectFrom("namespace_key").select(["expires_at"])
+      .where("namespace_id", "=", ns).executeTakeFirstOrThrow();
+    await sql`update namespace_key set key_wrapped = null, shredded_at = ${row.expires_at}
+      where namespace_id = ${ns}`.execute(db);
+
+    await expect(observations.get(id)).rejects.toBeInstanceOf(PayloadExpired);
+    // The row is still there, with its ciphertext: retention is unreadability,
+    // not deletion.
+    const still = await db.selectFrom("observation").select(["payload_ciphertext"])
+      .where("observation_id", "=", id).executeTakeFirst();
+    expect(still?.payload_ciphertext.length).toBeGreaterThan(0);
+  });
+
+  // The check alone admits a null: `period = date_trunc(...)` evaluates to
+  // NULL, not false, and a check constraint passes on NULL. Shape and
+  // presence are two rules. This is the third column on this branch with
+  // exactly that gap -- producer and tag.aspect were the first two -- so it
+  // is written down rather than remembered.
+  it("refuses a period that is absent, which the check alone admits", async () => {
+    const { observation } = await observations.append(
+      anEvent({ source: { ...src, ref: "op:period:5" } }),
+    );
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+        await sql`update observation set period = null where observation_id = ${observation.observationId!}`
+          .execute(trx);
+      }),
+    ).rejects.toMatchObject({ code: "23502", column: "period" });
+  });
+
+  // The month is the UTC month, and this is the only fixture that can tell.
+  // Every other test ingests mid-month, where the session's zone and UTC
+  // agree; at 23:30 on the last day of September they do not, and a check
+  // written `date_trunc('month', ingested_at)` -- which truncates in the
+  // SESSION's zone and is only stable -- says October. The cluster this runs
+  // on sits at UTC+3, so the wrong form is wrong right here, and no test saw
+  // it until this one.
+  it("files the last half-hour of a month under that month, not the next one", async () => {
+    const boundary = fixedClock(new Date("2026-09-30T23:30:00.000Z"));
+    const ns = new NamespaceRepository(db, ring, boundary, RETENTION_V0);
+    const repo = new ObservationRepository(db, ns, boundary);
+    const { observation } = await repo.append(
+      anEvent({ source: { ...src, ref: "op:period:boundary" } }),
+    );
+    const row = await sql<{ period: string }>`
+      select to_char(period, 'YYYY-MM-DD') as period from observation
+      where observation_id = ${observation.observationId!}`.execute(db);
+    expect(row.rows[0]?.period).toBe("2026-09-01");
+    expect(await repo.get(observation.observationId!)).toBeDefined();
+  });
+
+  // R1, as the only test that can see it: the period is the month of INGEST,
+  // not of the event. Every other fixture is dated and ingested in the same
+  // month, so a function reading the wrong instant agrees with itself. This
+  // one is a backfill -- an August event loaded in September -- and under the
+  // event's month it would be born expired, which is the thing R1 refuses.
+  it("keys a backfill on the month it was loaded in, not the month it happened", async () => {
+    const { observation } = await observations.append(anEvent({
+      source: { ...src, ref: "op:period:backfill" },
+      observedAt: "2026-08-20T09:00:00.000Z",
+    }));
+    const row = await sql<{ period: string; dated: string }>`
+      select to_char(period, 'YYYY-MM-DD') as period,
+             to_char(dated_at, 'YYYY-MM-DD') as dated
+      from observation where observation_id = ${observation.observationId!}`.execute(db);
+    expect(row.rows[0]?.dated).toBe("2026-08-20");
+    expect(row.rows[0]?.period).toBe("2026-09-01");
+  });
+
+  // The read path looks its month key up by this string, so the string must
+  // not be rendered by the server's DateStyle.
+  //
+  // The assertion is narrow on purpose. A read as a WHOLE cannot survive a
+  // non-ISO DateStyle whatever this column does, because node-pg then fails
+  // to parse the timestamptz text the server sends and every instant arrives
+  // as null -- which is why the connection pins ISO. What is held here is
+  // just the rendering: `to_char` is the same string in every style and
+  // `period::text` is not, so a future edit back to `::text` would hand
+  // `openPeriodKey` a date it cannot parse the moment anything sets a style.
+  it("renders its period independently of the server's DateStyle", async () => {
+    const { observation } = await observations.append(
+      anEvent({ source: { ...src, ref: "op:period:6" } }),
+    );
+    const id = observation.observationId!;
+    for (const style of ["German", "SQL, MDY"]) {
+      await db.transaction().execute(async (trx) => {
+        await sql.raw(`set local datestyle = '${style}'`).execute(trx);
+        const rendered = await sql<{ stable: string; fragile: string }>`
+          select to_char(period, 'YYYY-MM-DD') as stable, period::text as fragile
+          from observation where observation_id = ${id}`.execute(trx);
+        expect(rendered.rows[0]?.stable, style).toBe("2026-09-01");
+        expect(rendered.rows[0]?.fragile, style).not.toBe("2026-09-01");
+      });
+    }
+  });
+
+  it("holds exactly the columns the design enumerates, so an added column of any name is a decision", async () => {
+    const rows = await sql<{ column_name: string }>`
+      select column_name from information_schema.columns
+      where table_name = 'observation' and table_schema = current_schema()`.execute(db);
+    // `producer` was argued in by the storage card: the read path rebuilds
+    // the payload envelope from the row alone and the envelope binds it, and
+    // the per-producer cap counts rows by it. `period` because retention is
+    // keyed on (namespace, calendar month) and the month must be on the row
+    // for the foreign key to hold "no payload without a key row".
+    expect(rows.rows.map((r) => r.column_name).sort()).toEqual([
+      "channel", "dated_at", "evidence_kind", "idempotency_key", "ingested_at",
+      "kind", "namespace_id", "observation_id", "payload_ciphertext",
+      "payload_nonce", "payload_tag", "period", "producer",
+    ]);
+  });
+
+  // For the per-producer cap in the next task: it counts
+  // `where producer = ? and ingested_at > ?`, which without this index is a
+  // sequential scan of the whole table on every append.
+  it("indexes the producer and its ingest time, for the cap that will count by them", async () => {
+    const rows = await sql<{ indexdef: string }>`
+      select indexdef from pg_indexes
+      where tablename = 'observation' and schemaname = current_schema()
+        and indexname = 'observation_by_producer_ingested'`.execute(db);
+    expect(rows.rows[0]?.indexdef).toMatch(/producer/);
+    expect(rows.rows[0]?.indexdef).toMatch(/ingested_at DESC/i);
   });
 });

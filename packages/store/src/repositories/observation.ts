@@ -5,7 +5,9 @@ import {
 } from "@nonametrust/schema";
 import type { Clock } from "../clock.js";
 import type { Db } from "../db.js";
+import { sql } from "kysely";
 import { open, payloadAad, seal } from "../crypto.js";
+import { periodOf } from "../retention.js";
 import {
   CiphertextRejected, IdempotencyKeyMismatch, ObservationNotFound, mapPgError,
 } from "../errors.js";
@@ -84,10 +86,22 @@ export class ObservationRepository {
     const dated = datedAt(stored);
     const datedColumn = dated === null ? null : new Date(dated);
 
+    // The month the payload is keyed under, from INGEST time: a new
+    // observation therefore always lands in the month it is written in, which
+    // has not closed and so cannot be expired. Minting is idempotent and
+    // never revives an expired month, so a re-delivery of an old month finds
+    // the row exactly as retention left it.
+    //
+    // Minted before the insert because the foreign key requires the row, and
+    // the foreign key exists so that this ordering is a constraint rather
+    // than a habit.
+    const period = periodOf(ingestedAt);
+    await this.namespaces.periodKey(ns.namespaceId, period);
+
     // The payload is bound to every column written beside it, as the Date
     // the column will hold, so that a column rewritten afterwards refuses
     // the read. `read` rebuilds the same binding from the same columns.
-    const dataKey = await this.namespaces.dataKey(ns.namespaceId);
+    const dataKey = await this.namespaces.openPeriodKey(ns.namespaceId, period);
     const sealed = seal(dataKey, JSON.stringify(stored), payloadAad({
       namespaceId: ns.namespaceId,
       observationId,
@@ -113,6 +127,7 @@ export class ObservationRepository {
           dated_at: datedColumn,
           ingested_at: ingestedAt,
           producer: stored.source.producer,
+          period,
           payload_nonce: sealed.nonce,
           payload_tag: sealed.tag,
           payload_ciphertext: sealed.ciphertext,
@@ -156,19 +171,36 @@ export class ObservationRepository {
     column: "observation_id" | "idempotency_key",
     value: string,
   ): Promise<Observation | null> {
-    const row = await this.db
-      .selectFrom("observation")
-      .select([
-        "observation_id", "namespace_id", "idempotency_key", "evidence_kind", "channel", "kind",
-        "dated_at", "ingested_at", "producer",
-        "payload_nonce", "payload_tag", "payload_ciphertext",
-      ])
-      .where(column, "=", value)
-      .executeTakeFirst();
+    // `period` is rendered rather than selected: a `date` read back as a
+    // driver Date is local midnight, which is the previous month's last day
+    // east of UTC, and the key it would then look up is the wrong one.
+    //
+    // `to_char` with an explicit pattern rather than `period::text`, which
+    // renders through the session's DateStyle. That is the second of two
+    // defences and neither is individually necessary -- measured: mutate
+    // either alone and the suite stays green, because the connection pins
+    // DateStyle=ISO and under ISO the two renderings agree. Mutate BOTH and
+    // it fails. So do not remove one as redundant: redundant is what they
+    // are for, and the pin is a session setting a future deployment could
+    // lose.
+    const found = await sql<{
+      observation_id: string; namespace_id: string; idempotency_key: string;
+      evidence_kind: string; channel: string; kind: string;
+      dated_at: Date | null; ingested_at: Date; producer: string; period: string;
+      payload_nonce: Buffer; payload_tag: Buffer; payload_ciphertext: Buffer;
+    }>`
+      select observation_id, namespace_id, idempotency_key, evidence_kind, channel, kind,
+             dated_at, ingested_at, producer, to_char(period, 'YYYY-MM-DD') as period,
+             payload_nonce, payload_tag, payload_ciphertext
+      from observation
+      where ${sql.ref(column)} = ${value}`.execute(this.db);
+    const row = found.rows[0];
     if (!row) return null;
-    // Raises NamespaceShredded when the key is gone, which is the whole point
-    // of shredding: the row survives and the content does not.
-    const dataKey = await this.namespaces.dataKey(row.namespace_id);
+    // Raises NamespaceShredded when the namespace key is gone and
+    // PayloadExpired when only this month's is, in that order: an operator
+    // told a month expired, when the counterparty space was erased on
+    // request, would go looking for a retention sweep instead.
+    const dataKey = await this.namespaces.openPeriodKey(row.namespace_id, row.period);
     const json = open(
       dataKey,
       { nonce: row.payload_nonce, tag: row.payload_tag, ciphertext: row.payload_ciphertext },

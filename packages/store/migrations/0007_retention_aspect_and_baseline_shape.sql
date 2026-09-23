@@ -15,6 +15,7 @@
 --   2. tag: the aspect it was always keyed on, retirement, and the guard
 --   3. observation: the producer column, and the payload layout that moved
 --   4. namespace_key: the month key, its guard, and what expiry may not do
+--   5. observation: the period it is keyed on, and the key row it requires
 
 -- Before anything else: this migration moves the byte layout of the payload
 -- envelope, and a stored payload is sealed under the layout that was in force
@@ -449,3 +450,58 @@ $$;
 create trigger namespace_key_guarded
   before update or delete on namespace_key
   for each row execute function namespace_key_guard();
+
+
+-- === 5. observation: the period it is keyed on, and the key row it requires ==
+-- (Task 6. Sections 1 and 2 were Task 1 and 2, section 3 Task 4b, section 4
+-- Task 5. `observation` is altered here a second time because this section
+-- needs `namespace_key` to exist and that arrives in section 4.)
+--
+-- The month an observation's payload is keyed under, derived from INGEST time
+-- and not from the event's own instant. A state has no dated instant at all,
+-- and a backfill keyed on the event's month would be born expired -- which
+-- contradicts the one rule this design does not bend, that no observation is
+-- dropped at write time. R1 argues it; this column is where it becomes a
+-- fact, and the check below is what stops the two drifting.
+--
+-- It also means a NEW observation can never land in an expired month: its
+-- period is the month it is being written in, and that month has not closed,
+-- so its key cannot yet be shreddable. The only expired-month case is a
+-- RE-delivery of something already stored, which is Task 8's.
+alter table observation add column period date not null;
+
+-- The immutable form, and the choice is measured rather than stylistic.
+--
+-- `date_trunc('month', ingested_at)` alone is STABLE: it truncates in the
+-- session's zone, so an instant at 2026-09-30T23:30Z files under October
+-- fourteen hours east of Greenwich. `date_trunc('month', ingested_at, 'UTC')`
+-- is immutable on its own but is a timestamptz, and `timestamptz::date`
+-- converts in the session's zone too, so the whole expression is stable
+-- again -- verified by putting each in an index, which is the only thing
+-- that enforces immutability (a CHECK does not, which this file learned the
+-- hard way one section up).
+--
+-- `timezone('UTC', ingested_at)` returns a plain timestamp, and every step
+-- after it is session-independent.
+alter table observation
+  add constraint observation_period_from_ingested_at
+  check (period = date_trunc('month', timezone('UTC', ingested_at))::date);
+
+-- No payload without a key row to open it under. Without this the ordering in
+-- `append` would be the only thing keeping the two together, and an ordering
+-- is not a constraint: a raw writer, or a future path that forgot to mint,
+-- would store a payload that nothing can ever decrypt and no error would say
+-- so until the first read.
+--
+-- It points at the pair, not at the namespace, because the key is per pair.
+alter table observation
+  add constraint observation_period_key
+  foreign key (namespace_id, period) references namespace_key (namespace_id, period);
+
+-- For the per-producer cap in Task 8, which counts
+-- `where producer = ? and ingested_at > now - window`. Descending on the
+-- instant because the count always looks at the recent end. Without it every
+-- append scans the table; the index is added here, with the column, rather
+-- than in the task that first reads it, so the column and its access path
+-- arrive together.
+create index observation_by_producer_ingested on observation (producer, ingested_at desc);

@@ -48,6 +48,10 @@ export interface Schema {
     dated_at: Date | null;
     ingested_at: Date;
     producer: string;
+    // The same `never` on the read side as namespace_key.period, for the same
+    // reason: the driver returns a Date for a `date` column, parsed at LOCAL
+    // midnight. Read it with to_char.
+    period: ColumnType<never, string, never>;
     payload_nonce: Buffer;
     payload_tag: Buffer;
     payload_ciphertext: Buffer;

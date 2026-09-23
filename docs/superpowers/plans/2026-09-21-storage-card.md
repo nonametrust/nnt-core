@@ -278,6 +278,14 @@ work is **section 5** and Task 9's permanent columns are **section 6**. The
 header's section list is extended by whichever task adds one, and each section
 names the task that added it.
 
+**Task 6 shipped.** What it added: `observation.period`,
+`observation_period_from_ingested_at`, the `observation_period_key` foreign
+key, the `(producer, ingested_at desc)` index, the observation catalogue pin,
+and `append`/`read` moved onto the month key. `0007` section 5. One design
+question it closed: a NEW observation can never land in an expired month,
+because its period is the month it is written in and that month has not
+closed -- so the only expired-month case is a re-delivery, which is Task 8's.
+
 **Task 6 must not redo Task 4b.** Its text still instructs the preamble, the
 `producer` column and the two move-list additions; all three shipped. Followed
 literally it produces a duplicate column (42701) and two sections numbered 4.
