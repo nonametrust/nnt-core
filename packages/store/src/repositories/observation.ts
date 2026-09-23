@@ -7,15 +7,53 @@ import type { Clock } from "../clock.js";
 import type { Db } from "../db.js";
 import { sql } from "kysely";
 import { open, payloadAad, seal } from "../crypto.js";
-import { periodOf } from "../retention.js";
+import { assertRetentionPolicy, periodOf, type RetentionPolicy } from "../retention.js";
 import {
-  CiphertextRejected, IdempotencyKeyMismatch, ObservationNotFound, mapPgError,
+  CiphertextRejected, IdempotencyKeyMismatch, NamespaceShredded, ObservationNotFound,
+  PayloadExpired, mapPgError,
 } from "../errors.js";
 import { PERIOD_TEXT, type NamespaceRepository } from "./namespace.js";
 
-export interface AppendResult {
-  observation: Observation;
-  created: boolean;
+/**
+ * What `append` answers, in three shapes.
+ *
+ * The third exists because of R19, and its shape because of R18. Before it,
+ * the pre-read opened the payload, so a re-delivery for a namespace erased on
+ * request raised NamespaceShredded out of the RETRY path and the indexer
+ * errored forever for that counterparty -- a denial of service on our own
+ * pipeline. The row is already there; refusing protects nothing, since the
+ * skeleton is what a shred deliberately leaves standing and §2c records
+ * `ns_id` as plaintext through an erasure.
+ *
+ * Two booleans rather than a `reason: "period-expired" | "namespace-erased"`.
+ * The union is the obvious design and it is wrong for the reason the sweep's
+ * own `reason` was wrong one task earlier: an erased namespace can also hold
+ * a month past its grace, so the two are not alternatives, and a union has to
+ * pick one and drop the other from whatever counts it feeds. Both are state
+ * at the moment of the read, not causes.
+ *
+ * `readable` is the discriminant because it is the question the caller
+ * actually has. A NEW observation for an erased namespace is a different
+ * case and still throws; see `append`.
+ */
+export type AppendResult =
+  | { created: true; observation: Observation }
+  | { created: false; readable: true; observation: Observation }
+  | {
+      created: false;
+      readable: false;
+      observationId: string;
+      ingestedAt: Date;
+      periodExpired: boolean;
+      namespaceErased: boolean;
+    };
+
+/** The pre-read's answer: identity and state, never a payload. */
+interface Skeleton {
+  observationId: string;
+  ingestedAt: Date;
+  periodExpired: boolean;
+  namespaceErased: boolean;
 }
 
 // The one insert failure that means "already stored": Postgres's
@@ -40,7 +78,21 @@ export class ObservationRepository {
     private readonly db: Db,
     private readonly namespaces: NamespaceRepository,
     private readonly clock: Clock,
-  ) {}
+    // R16's sibling, and the reason it is required rather than defaulted.
+    // This repository caps on `producerWindowMs` and `producerMaxObservations`
+    // while the namespace repository expires on `graceDays`, and nothing
+    // compares the two policies: handed different objects, the store would
+    // expire under one number and cap under another with no error anywhere.
+    // The composition point passes ONE value to both. A default here is a
+    // policy that reaches production, which is the argument the key ring's
+    // missing default master key already made.
+    private readonly policy: RetentionPolicy,
+  ) {
+    // Asserted here for the reason NamespaceRepository asserts it: this is
+    // where a policy enters, so this is where a malformed one is refused, by
+    // field and by name.
+    assertRetentionPolicy(policy);
+  }
 
   /**
    * Writing the same source event twice is the indexer's normal retry path,
@@ -65,9 +117,17 @@ export class ObservationRepository {
       );
     }
 
-    const existing = await this.byIdempotencyKey(key);
-    if (existing) return { observation: existing, created: false };
+    // The pre-read is a SKELETON: identity and state, no decrypt (R19). It
+    // used to be `byIdempotencyKey`, which opens the payload -- so the retry
+    // path itself threw for exactly the rows retention and erasure are
+    // supposed to leave answerable.
+    const stored0 = await this.skeleton(key);
+    if (stored0) return this.answerStored(key, stored0);
 
+    // Past here the observation is new, and a new observation for an erased
+    // namespace is NOT the case above: it would be resuming collection on a
+    // counterparty who asked to be erased. `periodKey` refuses to mint under
+    // a dead outer key and that refusal stands (M1's rule, R19 records it).
     const ns = await this.namespaces.ensure(parsed.namespace);
     const observationId = randomUUID();
     const ingestedAt = this.clock.now();
@@ -155,12 +215,90 @@ export class ObservationRepository {
       // failed to store, and the caller would be told "already stored" about
       // a failure it never heard of.
       if (isDuplicateKey(e)) {
-        const again = await this.byIdempotencyKey(key);
-        if (again) return { observation: again, created: false };
+        // Through the same skeleton read as the pre-read, and for the same
+        // reason: the row the other writer stored may already be unreadable,
+        // and reaching it through the payload would throw here rather than
+        // answer.
+        const again = await this.skeleton(key);
+        if (again) return this.answerStored(key, again);
       }
       throw mapPgError(e) ?? e;
     }
-    return { observation: stored, created: true };
+    return { created: true, observation: stored };
+  }
+
+  /**
+   * The answer for a key the skeleton found, and the one race between the two
+   * reads.
+   *
+   * When the skeleton says readable the payload is opened, and that open can
+   * still fail: a sweep or an erasure committing in between makes the
+   * skeleton's flags stale by milliseconds. Letting that throw would be the
+   * original defect back inside a narrower window, so the refusal is caught
+   * and the state is read AGAIN -- the second skeleton is what the caller is
+   * told, because it is the one that describes the row the read actually met.
+   *
+   * A read that comes back NULL is different and is not caught. The table is
+   * append-only and the skeleton just saw the row, so "no row" here is not a
+   * race, it is an invariant that has failed; answering `readable: false`
+   * with both flags false would report a row as unreadable while saying
+   * nothing is wrong with it.
+   */
+  private async answerStored(key: string, seen: Skeleton): Promise<AppendResult> {
+    if (seen.periodExpired || seen.namespaceErased) {
+      return { created: false, readable: false, ...seen };
+    }
+    let opened: Observation | null;
+    try {
+      opened = await this.byIdempotencyKey(key);
+    } catch (e) {
+      if (!(e instanceof NamespaceShredded || e instanceof PayloadExpired)) throw e;
+      const fresh = await this.skeleton(key);
+      if (!fresh) throw e;
+      return { created: false, readable: false, ...fresh };
+    }
+    if (!opened) {
+      throw new ObservationNotFound(
+        `observation ${seen.observationId} was found by idempotency key ${key} and then ` +
+          `could not be read: this table is append-only, so a row that vanished between ` +
+          `two reads is a broken invariant rather than a race`,
+      );
+    }
+    return { created: false, readable: true, observation: opened };
+  }
+
+  /**
+   * Identity and state for one idempotency key, with no decrypt.
+   *
+   * Both flags come from ONE statement, joined to the row's own namespace and
+   * month key, because they must describe one instant: asked separately, a
+   * shred landing between the two reads would produce a pair that was never
+   * simultaneously true. The foreign keys make both joins exactly one row --
+   * `observation.period` references `namespace_key` since Task 6 -- so this
+   * cannot drop a row or multiply one.
+   */
+  private async skeleton(idempotencyKey: string): Promise<Skeleton | null> {
+    const found = await sql<{
+      observation_id: string; ingested_at: Date;
+      period_expired: boolean; ns_erased: boolean;
+    }>`
+      select o.observation_id::text as observation_id, o.ingested_at,
+             (k.key_wrapped is null) as period_expired,
+             (n.data_key_wrapped is null) as ns_erased
+      from observation o
+      join namespace n on n.namespace_id = o.namespace_id
+      join namespace_key k
+        on k.namespace_id = o.namespace_id and k.period = o.period
+      where o.idempotency_key = ${idempotencyKey}`.execute(this.db);
+    const row = found.rows[0];
+    return row
+      ? {
+          observationId: row.observation_id,
+          ingestedAt: row.ingested_at,
+          periodExpired: row.period_expired,
+          namespaceErased: row.ns_erased,
+        }
+      : null;
   }
 
   async get(observationId: string): Promise<Observation> {

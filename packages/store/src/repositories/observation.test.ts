@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { deriveIdempotencyKey, type WireObservation } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db } from "../db.js";
-import { withSchema } from "../testing/harness.js";
+import { withSchema, storedObservation } from "../testing/harness.js";
 import { keyRingFromEnv, newDataKey, payloadAad, seal } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import { RETENTION_V0, periodOf } from "../retention.js";
@@ -54,14 +54,16 @@ function aState(over: Record<string, unknown> = {}): WireObservation {
 beforeAll(async () => {
   ({ db, done } = await withSchema("obs_test"));
   namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
-  observations = new ObservationRepository(db, namespaces, clock);
+  observations = new ObservationRepository(db, namespaces, clock, RETENTION_V0);
 });
 afterAll(async () => { await done(); });
 
 describe("the round trip", () => {
   it("returns every wire field it was given", async () => {
     const input = anEvent({ source: { ...src, ref: "op:rt:1" } });
-    const { observation, created } = await observations.append(input);
+    const _r = await observations.append(input);
+    const created = _r.created;
+    const observation = storedObservation(_r);
     expect(created).toBe(true);
     // `get` has already re-parsed the decrypted blob through the schema; that
     // parse is the proof, and a second one here would only hide which one
@@ -73,7 +75,7 @@ describe("the round trip", () => {
   });
 
   it("assigns the two fields ingest owns, and they are well-formed", async () => {
-    const { observation } = await observations.append(anEvent({ source: { ...src, ref: "op:rt:2" } }));
+    const observation = storedObservation(await observations.append(anEvent({ source: { ...src, ref: "op:rt:2" } })));
     expect(observation.observationId).toMatch(/^[0-9a-f-]{36}$/);
     expect(observation.ingestedAt).toBe("2026-09-07T00:00:00.000Z");
   });
@@ -88,13 +90,13 @@ describe("the round trip", () => {
         },
       },
     });
-    const { observation } = await observations.append(input);
+    const observation = storedObservation(await observations.append(input));
     const read = await observations.get(observation.observationId!);
     expect(read.namespace).toEqual((input as Record<string, unknown>).namespace);
   });
 
   it("leaves a state undated, so a standing condition never enters a timing computation", async () => {
-    const { observation } = await observations.append(aState());
+    const observation = storedObservation(await observations.append(aState()));
     const row = await db.selectFrom("observation").select(["dated_at"])
       .where("observation_id", "=", observation.observationId!).executeTakeFirstOrThrow();
     expect(row.dated_at).toBeNull();
@@ -103,7 +105,7 @@ describe("the round trip", () => {
   });
 
   it("dates an event by its own instant", async () => {
-    const { observation } = await observations.append(anEvent({ source: { ...src, ref: "op:rt:4" } }));
+    const observation = storedObservation(await observations.append(anEvent({ source: { ...src, ref: "op:rt:4" } })));
     const row = await db.selectFrom("observation").select(["dated_at"])
       .where("observation_id", "=", observation.observationId!).executeTakeFirstOrThrow();
     expect(row.dated_at?.toISOString()).toBe("2026-09-12T09:00:00.000Z");
@@ -161,7 +163,7 @@ describe("idempotency", () => {
     const second = await observations.append(input);
     expect(first.created).toBe(true);
     expect(second.created).toBe(false);
-    expect(second.observation.observationId).toBe(first.observation.observationId);
+    expect(storedObservation(second).observationId).toBe(storedObservation(first).observationId);
   });
 
   it("keeps the two sides of one payment apart, because the namespace is in the key", async () => {
@@ -173,12 +175,12 @@ describe("idempotency", () => {
       source: { ...src, ref }, namespace: { kind: "wallet", id: "RECEIVER" },
     }));
     expect(receiver.created).toBe(true);
-    expect(receiver.observation.observationId).not.toBe(sender.observation.observationId);
+    expect(storedObservation(receiver).observationId).not.toBe(storedObservation(sender).observationId);
   });
 
   it("stores the derived key, not one a caller invented", async () => {
     const input = anEvent({ source: { ...src, ref: "op:key:1" } });
-    const { observation } = await observations.append(input);
+    const observation = storedObservation(await observations.append(input));
     const row = await db.selectFrom("observation").select(["idempotency_key"])
       .where("observation_id", "=", observation.observationId!).executeTakeFirstOrThrow();
     expect(row.idempotency_key).toBe(
@@ -218,16 +220,25 @@ describe("idempotency", () => {
   it("returns the winner's row when a concurrent writer stored the key first", async () => {
     const input = anEvent({ source: { ...src, ref: "op:race:1" } });
     const winner = await observations.append(input);
-    const loser = new ObservationRepository(db, namespaces, clock);
-    const realRead = loser.byIdempotencyKey.bind(loser);
+    const loser = new ObservationRepository(db, namespaces, clock, RETENTION_V0);
+    // Blinds the SKELETON read, which is what the pre-read is since R19.
+    // Blinding byIdempotencyKey no longer simulates a loser: the skeleton
+    // would still find the row and the insert this test is about would never
+    // be attempted. The stub is one call deep for the same reason as before
+    // -- the loser must read nothing, then insert, then learn it lost from
+    // the duplicate and re-read.
+    const priv = loser as unknown as { skeleton: (k: string) => Promise<unknown> };
+    const realSkeleton = priv.skeleton.bind(loser);
     let blind = true;
-    loser.byIdempotencyKey = async (key: string) => {
+    priv.skeleton = async (key: string) => {
       if (blind) { blind = false; return null; }
-      return realRead(key);
+      return realSkeleton(key);
     };
     const result = await loser.append(input);
-    expect(result.created).toBe(false);
-    expect(result.observation.observationId).toBe(winner.observation.observationId);
+    expect(result).toMatchObject({ created: false, readable: true });
+    if (result.created === false && result.readable) {
+      expect(result.observation.observationId).toBe(storedObservation(winner).observationId);
+    }
   });
 
   // The read-then-insert in append has a race, and the insert's failure is
@@ -252,8 +263,8 @@ describe("idempotency", () => {
       periodKey: async () => undefined,
       openPeriodKey: async () => newDataKey(),
     } as unknown as NamespaceRepository;
-    const broken = new ObservationRepository(db, orphan, clock);
-    const standIn = (await observations.append(anEvent({ source: { ...src, ref: "op:orphan:standin" } }))).observation;
+    const broken = new ObservationRepository(db, orphan, clock, RETENTION_V0);
+    const standIn = storedObservation(await observations.append(anEvent({ source: { ...src, ref: "op:orphan:standin" } })));
     let blind = true;
     broken.byIdempotencyKey = async () => {
       if (blind) { blind = false; return null; }
@@ -271,7 +282,7 @@ describe("idempotency", () => {
 
 describe("append-only", () => {
   it("refuses an UPDATE, loudly and by SQLSTATE", async () => {
-    const { observation } = await observations.append(anEvent({ source: { ...src, ref: "op:ao:1" } }));
+    const observation = storedObservation(await observations.append(anEvent({ source: { ...src, ref: "op:ao:1" } })));
     await expect(
       sql`update observation set kind = 'tampered' where observation_id = ${observation.observationId}`
         .execute(db),
@@ -282,7 +293,7 @@ describe("append-only", () => {
   });
 
   it("refuses a DELETE", async () => {
-    const { observation } = await observations.append(anEvent({ source: { ...src, ref: "op:ao:2" } }));
+    const observation = storedObservation(await observations.append(anEvent({ source: { ...src, ref: "op:ao:2" } })));
     await expect(
       sql`delete from observation where observation_id = ${observation.observationId}`.execute(db),
     ).rejects.toMatchObject({ code: "NNT01" });
@@ -308,7 +319,7 @@ describe("append-only", () => {
 // a transaction it rolls back, and reads through the repository.
 describe("the columns beside the payload", () => {
   it("are bound to it: a rewritten column refuses the read, even with append-only off", async () => {
-    const { observation } = await observations.append(anEvent({ source: { ...src, ref: "op:aad:1" } }));
+    const observation = storedObservation(await observations.append(anEvent({ source: { ...src, ref: "op:aad:1" } })));
     const id = observation.observationId!;
     const moves = [
       sql`dated_at = dated_at + interval '1 day'`,
@@ -325,7 +336,7 @@ describe("the columns beside the payload", () => {
         db.transaction().execute(async (trx) => {
           await sql`alter table observation disable trigger observation_no_update`.execute(trx);
           await sql`update observation set ${move} where observation_id = ${id}`.execute(trx);
-          const inside = new ObservationRepository(trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock);
+          const inside = new ObservationRepository(trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock, RETENTION_V0);
           await inside.get(id);
         }),
       ).rejects.toBeInstanceOf(CiphertextRejected);
@@ -343,7 +354,7 @@ describe("the columns beside the payload", () => {
         await sql`update observation set evidence_kind = 'state' where observation_id = ${id}`
           .execute(trx);
         const inside = new ObservationRepository(
-          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock,
+          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock, RETENTION_V0,
         );
         await inside.get(id);
       }),
@@ -362,7 +373,7 @@ describe("the columns beside the payload", () => {
         await sql`update observation set ingested_at = ingested_at + interval '1 month',
             period = date '2026-10-01' where observation_id = ${id}`.execute(trx);
         const inside = new ObservationRepository(
-          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock,
+          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock, RETENTION_V0,
         );
         await inside.get(id);
       }),
@@ -389,8 +400,8 @@ describe("the columns beside the payload", () => {
     const b = await observations.append(anEvent({
       source: { ...src, ref: "op:swap:b" }, kind: "refund",
     }));
-    const idA = a.observation.observationId!;
-    const idB = b.observation.observationId!;
+    const idA = storedObservation(a).observationId!;
+    const idB = storedObservation(b).observationId!;
     await expect(
       db.transaction().execute(async (trx) => {
         await sql`alter table observation disable trigger observation_no_update`.execute(trx);
@@ -411,7 +422,7 @@ describe("the columns beside the payload", () => {
           from (select * from observation where observation_id = ${idB}) b
           where a.observation_id = ${idA}`.execute(trx);
         const inside = new ObservationRepository(
-          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock,
+          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock, RETENTION_V0,
         );
         await inside.get(idA);
       }),
@@ -433,7 +444,7 @@ describe("the columns beside the payload", () => {
   it("refuses a payload that opens on this row but names another observation", async () => {
     const a = await observations.append(anEvent({ source: { ...src, ref: "op:forge:a" } }));
     const b = await observations.append(anEvent({ source: { ...src, ref: "op:forge:b" } }));
-    const idA = a.observation.observationId!;
+    const idA = storedObservation(a).observationId!;
     const row = await db.selectFrom("observation")
       .select(["namespace_id", "idempotency_key", "evidence_kind", "channel", "kind",
         "dated_at", "ingested_at", "producer"])
@@ -442,7 +453,7 @@ describe("the columns beside the payload", () => {
     const dataKey = await namespaces.openPeriodKey(row.namespace_id, period);
     const forged = seal(
       dataKey,
-      JSON.stringify({ ...a.observation, observationId: b.observation.observationId }),
+      JSON.stringify({ ...storedObservation(a), observationId: storedObservation(b).observationId }),
       payloadAad({
         namespaceId: row.namespace_id,
         observationId: idA,
@@ -462,7 +473,7 @@ describe("the columns beside the payload", () => {
             payload_tag = ${forged.tag}, payload_ciphertext = ${forged.ciphertext}
           where observation_id = ${idA}`.execute(trx);
         const inside = new ObservationRepository(
-          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock,
+          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock, RETENTION_V0,
         );
         await inside.get(idA);
       }),
@@ -475,9 +486,9 @@ describe("the columns beside the payload", () => {
   // TypeScript refuses first and names the class, and the table refuses
   // everyone.
   it("refuses a producer the schema would refuse, from a raw writer, by constraint name", async () => {
-    const { observation } = await observations.append(
+    const observation = storedObservation(await observations.append(
       anEvent({ source: { ...src, ref: "op:producer:2" } }),
-    );
+    ));
     const id = observation.observationId!;
     for (const bad of ["Stellar-Indexer", "stellar_indexer", "-stellar", "stellar--indexer", ""]) {
       await expect(
@@ -499,9 +510,9 @@ describe("the columns beside the payload", () => {
   // non-string and crashes with a TypeError from inside the crypto module,
   // which is neither a refusal this store owns nor one an operator can read.
   it("refuses a producer that is absent, which the shape check alone would admit", async () => {
-    const { observation } = await observations.append(
+    const observation = storedObservation(await observations.append(
       anEvent({ source: { ...src, ref: "op:producer:3" } }),
-    );
+    ));
     const id = observation.observationId!;
     await expect(
       db.transaction().execute(async (trx) => {
@@ -517,9 +528,9 @@ describe("the columns beside the payload", () => {
   // the repository never could -- which is the sentence the migration's own
   // comment makes, so the comment was false until this landed.
   it("refuses a producer longer than the schema's bound, and admits one at it", async () => {
-    const { observation } = await observations.append(
+    const observation = storedObservation(await observations.append(
       anEvent({ source: { ...src, ref: "op:producer:4" } }),
-    );
+    ));
     const id = observation.observationId!;
     const at64 = "a".repeat(64);
     const at65 = "a".repeat(65);
@@ -557,14 +568,14 @@ describe("the columns beside the payload", () => {
       source: { ...src, producer: "x402-gateway", ref: "op:twoproducers:b" },
     }));
     const rows = await db.selectFrom("observation").select(["observation_id", "producer"])
-      .where("observation_id", "in", [a.observation.observationId!, b.observation.observationId!])
+      .where("observation_id", "in", [storedObservation(a).observationId!, storedObservation(b).observationId!])
       .execute();
     const byId = new Map(rows.map((r) => [r.observation_id, r.producer]));
-    expect(byId.get(a.observation.observationId!)).toBe("stellar-indexer");
-    expect(byId.get(b.observation.observationId!)).toBe("x402-gateway");
+    expect(byId.get(storedObservation(a).observationId!)).toBe("stellar-indexer");
+    expect(byId.get(storedObservation(b).observationId!)).toBe("x402-gateway");
     // And both still open, so the column and the envelope agree for each.
-    expect((await observations.get(a.observation.observationId!)).source.producer).toBe("stellar-indexer");
-    expect((await observations.get(b.observation.observationId!)).source.producer).toBe("x402-gateway");
+    expect((await observations.get(storedObservation(a).observationId!)).source.producer).toBe("stellar-indexer");
+    expect((await observations.get(storedObservation(b).observationId!)).source.producer).toBe("x402-gateway");
   });
 
   // The envelope binds the Date the column will hold, and every test in this
@@ -576,10 +587,10 @@ describe("the columns beside the payload", () => {
     let t = new Date("2026-09-07T00:00:00.000Z").getTime();
     const ticking = { now: () => { const d = new Date(t); t += 1_000; return d; } };
     const ns = new NamespaceRepository(db, ring, ticking, RETENTION_V0);
-    const repo = new ObservationRepository(db, ns, ticking);
-    const { observation } = await repo.append(
+    const repo = new ObservationRepository(db, ns, ticking, RETENTION_V0);
+    const observation = storedObservation(await repo.append(
       anEvent({ source: { ...src, ref: "op:ticking:1" } }),
-    );
+    ));
     const id = observation.observationId!;
     // The read must succeed: it rebuilds the envelope from the stored column,
     // so column and envelope agreeing is exactly what this proves.
@@ -593,9 +604,9 @@ describe("the columns beside the payload", () => {
 describe("shredding", () => {
   it("leaves the row and refuses the read, by class", async () => {
     const ns = await namespaces.ensure({ kind: "wallet", id: "SHREDOBS" });
-    const { observation } = await observations.append(anEvent({
+    const observation = storedObservation(await observations.append(anEvent({
       source: { ...src, ref: "op:shred:1" }, namespace: { kind: "wallet", id: "SHREDOBS" },
-    }));
+    })));
     await namespaces.shred(ns.namespaceId);
     const row = await db.selectFrom("observation").select(["observation_id"])
       .where("observation_id", "=", observation.observationId!).executeTakeFirst();
@@ -624,9 +635,9 @@ describe("shredding", () => {
 // makes "no payload without a key row" a fact rather than an ordering.
 describe("the retention period", () => {
   it("is the UTC calendar month of ingested_at, and a key row exists for it", async () => {
-    const { observation } = await observations.append(
+    const observation = storedObservation(await observations.append(
       anEvent({ source: { ...src, ref: "op:period:1" } }),
-    );
+    ));
     const row = await sql<{ period: string }>`
       select to_char(period, 'YYYY-MM-DD') as period from observation
       where observation_id = ${observation.observationId!}`.execute(db);
@@ -644,9 +655,9 @@ describe("the retention period", () => {
   // payload follows. A raw writer that disagrees with ingested_at is refused
   // by name, so the two can never drift.
   it("refuses a period that is not the month of its own ingested_at, by name", async () => {
-    const { observation } = await observations.append(
+    const observation = storedObservation(await observations.append(
       anEvent({ source: { ...src, ref: "op:period:2" } }),
-    );
+    ));
     const id = observation.observationId!;
     await expect(
       db.transaction().execute(async (trx) => {
@@ -663,9 +674,9 @@ describe("the retention period", () => {
   // consulted, and the test says which layer refused. Re-greening it by
   // deleting it would remove the loud refusal and leave the quiet one.
   it("refuses a move of ingested_at across a month boundary at the write, not at the read", async () => {
-    const { observation } = await observations.append(
+    const observation = storedObservation(await observations.append(
       anEvent({ source: { ...src, ref: "op:period:3" } }),
-    );
+    ));
     const id = observation.observationId!;
     await expect(
       db.transaction().execute(async (trx) => {
@@ -696,9 +707,9 @@ describe("the retention period", () => {
   // measured by review, which is why this test exists rather than a comment.
   it("seals under the month key, so expiring that month makes it unreadable", async () => {
     const ns = (await namespaces.ensure({ kind: "wallet", id: "EXPIREME" })).namespaceId;
-    const { observation } = await observations.append(anEvent({
+    const observation = storedObservation(await observations.append(anEvent({
       source: { ...src, ref: "op:period:4" }, namespace: { kind: "wallet", id: "EXPIREME" },
-    }));
+    })));
     const id = observation.observationId!;
     expect(await observations.get(id)).toBeDefined();
 
@@ -721,9 +732,9 @@ describe("the retention period", () => {
   // exactly that gap -- producer and tag.aspect were the first two -- so it
   // is written down rather than remembered.
   it("refuses a period that is absent, which the check alone admits", async () => {
-    const { observation } = await observations.append(
+    const observation = storedObservation(await observations.append(
       anEvent({ source: { ...src, ref: "op:period:5" } }),
-    );
+    ));
     await expect(
       db.transaction().execute(async (trx) => {
         await sql`alter table observation disable trigger observation_no_update`.execute(trx);
@@ -743,10 +754,10 @@ describe("the retention period", () => {
   it("files the last half-hour of a month under that month, not the next one", async () => {
     const boundary = fixedClock(new Date("2026-09-30T23:30:00.000Z"));
     const ns = new NamespaceRepository(db, ring, boundary, RETENTION_V0);
-    const repo = new ObservationRepository(db, ns, boundary);
-    const { observation } = await repo.append(
+    const repo = new ObservationRepository(db, ns, boundary, RETENTION_V0);
+    const observation = storedObservation(await repo.append(
       anEvent({ source: { ...src, ref: "op:period:boundary" } }),
-    );
+    ));
     const row = await sql<{ period: string }>`
       select to_char(period, 'YYYY-MM-DD') as period from observation
       where observation_id = ${observation.observationId!}`.execute(db);
@@ -761,13 +772,13 @@ describe("the retention period", () => {
     // east of it, so the pair refuses the wrong form in either direction.
     const after = fixedClock(new Date("2026-10-01T00:30:00.000Z"));
     const ns2 = new NamespaceRepository(db, ring, after, RETENTION_V0);
-    const repo2 = new ObservationRepository(db, ns2, after);
+    const repo2 = new ObservationRepository(db, ns2, after, RETENTION_V0);
     const october = await repo2.append(
       anEvent({ source: { ...src, ref: "op:period:boundary2" } }),
     );
     const row2 = await sql<{ period: string }>`
       select to_char(period, 'YYYY-MM-DD') as period from observation
-      where observation_id = ${october.observation.observationId!}`.execute(db);
+      where observation_id = ${storedObservation(october).observationId!}`.execute(db);
     expect(row2.rows[0]?.period).toBe("2026-10-01");
   });
 
@@ -777,10 +788,10 @@ describe("the retention period", () => {
   // one is a backfill -- an August event loaded in September -- and under the
   // event's month it would be born expired, which is the thing R1 refuses.
   it("keys a backfill on the month it was loaded in, not the month it happened", async () => {
-    const { observation } = await observations.append(anEvent({
+    const observation = storedObservation(await observations.append(anEvent({
       source: { ...src, ref: "op:period:backfill" },
       observedAt: "2026-08-20T09:00:00.000Z",
-    }));
+    })));
     const row = await sql<{ period: string; dated: string }>`
       select to_char(period, 'YYYY-MM-DD') as period,
              to_char(dated_at, 'YYYY-MM-DD') as dated
@@ -798,12 +809,12 @@ describe("the retention period", () => {
   // pre-read opens the payload and throws instead. Task 8 replaces the
   // pre-read with a skeleton read and gives AppendResult a third shape; when
   // it does, this test inverts.
-  it("throws on a re-delivery whose month expired, which Task 8 owes a shape for", async () => {
+  it("answers a re-delivery whose month expired, and leaves the row untouched", async () => {
     const ns = (await namespaces.ensure({ kind: "wallet", id: "REDELIVER" })).namespaceId;
     const wire = anEvent({
       source: { ...src, ref: "op:redeliver:1" }, namespace: { kind: "wallet", id: "REDELIVER" },
     });
-    const { observation } = await observations.append(wire);
+    const observation = storedObservation(await observations.append(wire));
     const before = await sql<{ x: string }>`
       select xmin::text as x from observation where observation_id = ${observation.observationId!}`
       .execute(db);
@@ -812,9 +823,19 @@ describe("the retention period", () => {
     await sql`update namespace_key set key_wrapped = null, shredded_at = ${row.expires_at}
       where namespace_id = ${ns}`.execute(db);
 
-    await expect(observations.append(wire)).rejects.toBeInstanceOf(PayloadExpired);
-    // Nothing was written or re-sealed: the row is untouched, which is the
-    // baseline Task 8's own xmin assertion will rest on.
+    // Task 8 changed this deliberately, and this test's old name said so: it
+    // asserted that this re-delivery THROWS PayloadExpired. R19 makes it
+    // answer, because that throw sat in the indexer's retry path and wedged
+    // it for the counterparty. What the test was really carrying is the
+    // second half below -- the row is not re-sealed and not touched -- and
+    // that is kept. Not redundant with the R19 block at the end of this file:
+    // this runs under the shipped ninety-day policy, that one under seven.
+    const answer = await observations.append(wire);
+    expect(answer).toMatchObject({
+      created: false, readable: false,
+      observationId: observation.observationId!,
+      periodExpired: true, namespaceErased: false,
+    });
     const after = await sql<{ x: string }>`
       select xmin::text as x from observation where observation_id = ${observation.observationId!}`
       .execute(db);
@@ -832,7 +853,7 @@ describe("the retention period", () => {
     const eager = { ...RETENTION_V0, graceDays: 0 };
     const at = fixedClock(new Date("2026-09-30T23:59:59.999Z"));
     const ns = new NamespaceRepository(db, ring, at, eager);
-    const repo = new ObservationRepository(db, ns, at);
+    const repo = new ObservationRepository(db, ns, at, eager);
     const id = (await ns.ensure({ kind: "wallet", id: "WRITERACE" })).namespaceId;
     await repo.append(anEvent({
       source: { ...src, ref: "op:writerace:a" }, namespace: { kind: "wallet", id: "WRITERACE" },
@@ -878,5 +899,261 @@ describe("the retention period", () => {
     // observation_by_producer_ingested, so /producer/ matched the name and an
     // index on (ingested_at desc) alone passed.
     expect(rows.rows[0]?.indexdef).toMatch(/\(producer, ingested_at DESC\)/i);
+  });
+});
+
+// Task 8, R19. What `append` answers when the row is already there and its
+// payload cannot be opened.
+//
+// Before this, the pre-read was `byIdempotencyKey`, which OPENS the payload,
+// so a re-delivery for an erased namespace raised NamespaceShredded out of
+// the retry path itself and the indexer's normal retry errored forever for
+// that counterparty. The pre-read is now a skeleton: identity and state, no
+// decrypt.
+//
+// The shape carries two booleans and not a reason, and that is R18's lesson
+// applied one task later rather than relearned. A namespace erased on request
+// can also hold a month past its grace; a union would have to pick one, and
+// whichever it picked, the other would vanish from any count built on it.
+// The last test here is the one a union cannot pass.
+describe("a re-delivery whose payload cannot be opened", () => {
+  const grace7 = { ...RETENTION_V0, graceDays: 7 };
+
+  /** Repositories on one policy object at one instant (§2d, R16). */
+  function at(iso: string) {
+    const c = fixedClock(new Date(iso));
+    const ns = new NamespaceRepository(db, ring, c, grace7);
+    return { ns, obs: new ObservationRepository(db, ns, c, grace7) };
+  }
+
+  /** Expire a month by hand, at an instant the shred guard admits. */
+  async function expireMonth(namespaceId: string, period: string, at: string) {
+    await sql`update namespace_key set key_wrapped = null, shredded_at = ${new Date(at)}
+      where namespace_id = ${namespaceId} and period = ${period}::date`.execute(db);
+  }
+
+  async function xminOf(observationId: string): Promise<string> {
+    const r = await sql<{ x: string }>`
+      select xmin::text as x from observation where observation_id = ${observationId}`
+      .execute(db);
+    return r.rows[0]!.x;
+  }
+
+  it("answers a live re-delivery with the observation, as it always has", async () => {
+    const live = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19LIVE" },
+      source: { ...src, ref: "op:r19:live" } });
+    const first = await live.obs.append(wire);
+    expect(first.created).toBe(true);
+    const again = await live.obs.append(wire);
+    expect(again).toMatchObject({ created: false, readable: true });
+    if (again.created === false && again.readable) {
+      expect(storedObservation(again).observationId).toBe(storedObservation(first).observationId);
+    }
+  });
+
+  it("answers an expired month instead of throwing, and touches nothing", async () => {
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19EXPIRED" },
+      source: { ...src, ref: "op:r19:expired" } });
+    const first = await mar.obs.append(wire);
+    const id = storedObservation(first).observationId!;
+    const nsId = (await mar.ns.find("wallet", "R19EXPIRED"))!.namespaceId;
+    const beforeX = await xminOf(id);
+    // 2027-03 expires 2027-04-08 under grace 7.
+    await expireMonth(nsId, "2027-03-01", "2027-04-08T00:00:00.000Z");
+
+    const again = await at("2027-05-01T00:00:00.000Z").obs.append(wire);
+    expect(again).toEqual({
+      created: false, readable: false, observationId: id,
+      ingestedAt: new Date("2027-03-05T00:00:00.000Z"),
+      periodExpired: true, namespaceErased: false,
+    });
+    // Never re-sealed and never touched: a re-delivery that rewrote the row
+    // would be a producer resurrecting a payload retention had removed,
+    // which makes retention a fiction.
+    expect(await xminOf(id)).toBe(beforeX);
+  });
+
+  it("answers an erased namespace instead of wedging the indexer's retry", async () => {
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19ERASED" },
+      source: { ...src, ref: "op:r19:erased" } });
+    const first = await mar.obs.append(wire);
+    const nsId = (await mar.ns.find("wallet", "R19ERASED"))!.namespaceId;
+    await at("2027-03-10T00:00:00.000Z").ns.shred(nsId);
+
+    const again = await at("2027-03-11T00:00:00.000Z").obs.append(wire);
+    expect(again).toEqual({
+      created: false, readable: false,
+      observationId: storedObservation(first).observationId!,
+      ingestedAt: new Date("2027-03-05T00:00:00.000Z"),
+      periodExpired: false, namespaceErased: true,
+    });
+  });
+
+  // The test a `reason` union cannot pass, whichever branch it picked.
+  it("reports both when the namespace is erased AND the month has expired", async () => {
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19BOTH" },
+      source: { ...src, ref: "op:r19:both" } });
+    await mar.obs.append(wire);
+    const nsId = (await mar.ns.find("wallet", "R19BOTH"))!.namespaceId;
+    await expireMonth(nsId, "2027-03-01", "2027-04-08T00:00:00.000Z");
+    await at("2027-04-20T00:00:00.000Z").ns.shred(nsId);
+
+    const again = await at("2027-05-01T00:00:00.000Z").obs.append(wire);
+    expect(again).toMatchObject({
+      created: false, readable: false,
+      periodExpired: true, namespaceErased: true,
+    });
+  });
+
+  // The adjacent case R19 records and does NOT change: a re-delivery is a
+  // retry of something already stored, a NEW observation would be resuming
+  // collection on a counterparty who asked to be erased. The idempotency key
+  // is what tells them apart, which is what the pre-read is for.
+  it("still refuses a NEW observation for an erased namespace", async () => {
+    const mar = at("2027-03-05T00:00:00.000Z");
+    await mar.obs.append(anEvent({ namespace: { kind: "wallet", id: "R19NEW" },
+      source: { ...src, ref: "op:r19:new1" } }));
+    const nsId = (await mar.ns.find("wallet", "R19NEW"))!.namespaceId;
+    await at("2027-03-10T00:00:00.000Z").ns.shred(nsId);
+
+    await expect(at("2027-03-11T00:00:00.000Z").obs.append(
+      anEvent({ namespace: { kind: "wallet", id: "R19NEW" },
+        source: { ...src, ref: "op:r19:new2" } }),
+    )).rejects.toBeInstanceOf(NamespaceShredded);
+  });
+
+  // Five rules below were each a surviving mutant in this task's first
+  // mutation round: the constructor's policy assertion, the mid-read race,
+  // the null-read invariant, the period half of the skeleton's join, and the
+  // duplicate-retry path's use of the skeleton. Every one passed all 376
+  // tests before these were written.
+
+  it("refuses a malformed policy in its own constructor, by field name", async () => {
+    // R16's sibling. Without this the required parameter is indistinguishable
+    // from a decorative one: deleting assertRetentionPolicy(policy) from the
+    // constructor left the whole suite green.
+    const { ns } = at("2027-03-05T00:00:00.000Z");
+    expect(() => new ObservationRepository(
+      db, ns, fixedClock(new Date()), { ...RETENTION_V0, producerMaxObservations: 0 },
+    )).toThrow(/producerMaxObservations/);
+    expect(() => new ObservationRepository(
+      db, ns, fixedClock(new Date()), { ...RETENTION_V0, producerWindowMs: -1 },
+    )).toThrow(/producerWindowMs/);
+  });
+
+  it("answers from a fresh read when the month is shredded mid-answer", async () => {
+    // The skeleton says readable, and an erasure commits before the payload
+    // is opened. Letting that throw is the original R19 defect back inside a
+    // narrower window, so the refusal is caught and the state re-read. The
+    // shred here is real and happens between the two reads, not stubbed.
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19RACE" },
+      source: { ...src, ref: "op:r19:race" } });
+    await mar.obs.append(wire);
+    const nsId = (await mar.ns.find("wallet", "R19RACE"))!.namespaceId;
+
+    const racing = at("2027-03-06T00:00:00.000Z");
+    const priv = racing.obs as unknown as { byIdempotencyKey: (k: string) => Promise<unknown> };
+    const real = priv.byIdempotencyKey.bind(racing.obs);
+    let once = true;
+    priv.byIdempotencyKey = async (k: string) => {
+      if (once) { once = false; await racing.ns.shred(nsId); }
+      return real(k);
+    };
+    const answer = await racing.obs.append(wire);
+    expect(answer).toMatchObject({
+      created: false, readable: false, namespaceErased: true, periodExpired: false,
+    });
+  });
+
+  it("refuses to call a row unreadable when nothing is wrong with it", async () => {
+    // A read that comes back NULL is not a race: the table is append-only and
+    // the skeleton just saw the row. Answering `readable: false` with both
+    // flags false would report a row as unreadable while saying nothing ails
+    // it, which is a lie no caller could act on.
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19NULL" },
+      source: { ...src, ref: "op:r19:null" } });
+    await mar.obs.append(wire);
+    const blind = at("2027-03-06T00:00:00.000Z");
+    const priv = blind.obs as unknown as { byIdempotencyKey: (k: string) => Promise<unknown> };
+    priv.byIdempotencyKey = async () => null;
+    await expect(blind.obs.append(wire)).rejects.toBeInstanceOf(ObservationNotFound);
+    await expect(blind.obs.append(wire)).rejects.toThrow(/append-only/);
+  });
+
+  it("reads the key row of the observation's OWN month, not any month it has", async () => {
+    // The skeleton joins namespace_key on (namespace_id, period). Dropping
+    // the period half leaves one row per MONTH the namespace holds, and the
+    // answer then depends on which one the planner hands back first. Two
+    // months, the older expired and the newer live: a re-delivery from the
+    // newer must still be readable.
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const old = anEvent({ namespace: { kind: "wallet", id: "R19TWOMONTH" },
+      source: { ...src, ref: "op:r19:2m:old" } });
+    await mar.obs.append(old);
+    const apr = at("2027-04-05T00:00:00.000Z");
+    const recent = anEvent({ namespace: { kind: "wallet", id: "R19TWOMONTH" },
+      source: { ...src, ref: "op:r19:2m:new" } });
+    await apr.obs.append(recent);
+    const nsId = (await mar.ns.find("wallet", "R19TWOMONTH"))!.namespaceId;
+    await expireMonth(nsId, "2027-03-01", "2027-04-08T00:00:00.000Z");
+
+    const now = at("2027-04-20T00:00:00.000Z");
+    expect(await now.obs.append(recent)).toMatchObject({ created: false, readable: true });
+    expect(await now.obs.append(old)).toMatchObject({
+      created: false, readable: false, periodExpired: true,
+    });
+  });
+
+  it("answers rather than throws when the writer that won the race left an unreadable row", async () => {
+    // The duplicate-retry path goes through the skeleton for the same reason
+    // the pre-read does. Reached by blinding the skeleton once, so this
+    // append inserts, collides, and re-reads -- with the stored row already
+    // expired. Through byIdempotencyKey that re-read throws, which is the
+    // R19 defect surviving in the one path R19 did not name.
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19DUP" },
+      source: { ...src, ref: "op:r19:dup" } });
+    const first = await mar.obs.append(wire);
+    const nsId = (await mar.ns.find("wallet", "R19DUP"))!.namespaceId;
+    await expireMonth(nsId, "2027-03-01", "2027-04-08T00:00:00.000Z");
+
+    const loser = at("2027-05-01T00:00:00.000Z");
+    const priv = loser.obs as unknown as { skeleton: (k: string) => Promise<unknown> };
+    const real = priv.skeleton.bind(loser.obs);
+    let blind = true;
+    priv.skeleton = async (k: string) => {
+      if (blind) { blind = false; return null; }
+      return real(k);
+    };
+    expect(await loser.obs.append(wire)).toMatchObject({
+      created: false, readable: false, periodExpired: true,
+      observationId: storedObservation(first).observationId!,
+    });
+  });
+
+  // The skeleton read's whole point: it must not decrypt. If it still opened
+  // the payload, every assertion above would have thrown instead of
+  // answering -- but this states it directly, so a future pre-read that
+  // decrypts "just to check" fails here rather than three tests away.
+  it("does not open the payload to decide, so an unreadable row still answers", async () => {
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19NODECRYPT" },
+      source: { ...src, ref: "op:r19:nodecrypt" } });
+    const first = await mar.obs.append(wire);
+    const id = storedObservation(first).observationId!;
+    const nsId = (await mar.ns.find("wallet", "R19NODECRYPT"))!.namespaceId;
+    await expireMonth(nsId, "2027-03-01", "2027-04-08T00:00:00.000Z");
+    // The ciphertext is now unopenable by anyone. `get` says so; `append`
+    // answers anyway.
+    await expect(at("2027-05-01T00:00:00.000Z").obs.get(id))
+      .rejects.toBeInstanceOf(PayloadExpired);
+    const again = await at("2027-05-01T00:00:00.000Z").obs.append(wire);
+    expect(again.created).toBe(false);
   });
 });

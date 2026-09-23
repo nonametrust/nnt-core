@@ -5,7 +5,7 @@ import { sql } from "kysely";
 import type { Db, Schema } from "../db.js";
 import { withIsoDates } from "../db.js";
 import type { Selectable } from "kysely";
-import { urlForSchema, withSchema } from "../testing/harness.js";
+import { urlForSchema, withSchema, storedObservation } from "../testing/harness.js";
 import { keyRingFromEnv, newDataKey, periodKeyAad, unwrapUnder } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import {
@@ -932,7 +932,7 @@ describe("expirePeriods: expiry is unreadability and nothing else", () => {
   function at(iso: string) {
     const c = fixedClock(new Date(iso));
     const namespaces = new NamespaceRepository(sdb, ring, c, grace7);
-    return { namespaces, observations: new ObservationRepository(sdb, namespaces, c) };
+    return { namespaces, observations: new ObservationRepository(sdb, namespaces, c, grace7) };
   }
 
   /**
@@ -989,7 +989,7 @@ describe("expirePeriods: expiry is unreadability and nothing else", () => {
 
   it("shreds nothing one millisecond before the expiry, and the month at it", async () => {
     const september = at("2026-09-07T00:00:00.000Z");
-    const { observation } = await september.observations.append(anEvent("SWEEPSEPT", "op:sweep:1"));
+    const observation = storedObservation(await september.observations.append(anEvent("SWEEPSEPT", "op:sweep:1")));
     const id = observation.observationId!;
     // Readable before anything sweeps, so the refusal below is the sweep's
     // doing and not the fixture's.
@@ -1054,9 +1054,9 @@ describe("expirePeriods: expiry is unreadability and nothing else", () => {
 
     const swept = await at(due.toISOString()).namespaces.expirePeriods();
     expect(swept.shredded.map((s) => s.period)).toEqual([SEPT]);
-    await expect(late.observations.get(stale.observation.observationId!))
+    await expect(late.observations.get(storedObservation(stale).observationId!))
       .rejects.toBeInstanceOf(PayloadExpired);
-    expect((await october.observations.get(live.observation.observationId!)).channel)
+    expect((await october.observations.get(storedObservation(live).observationId!)).channel)
       .toBe("volume");
     expect(await october.namespaces.periodsOf(await idOf("SWEEPOCT"))).toEqual([OCT]);
   });

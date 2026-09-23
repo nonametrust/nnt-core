@@ -33,7 +33,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { validateObservation, type Observation } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db } from "./db.js";
-import { withSchema } from "./testing/harness.js";
+import { withSchema, storedObservation } from "./testing/harness.js";
 import { keyRingFromEnv } from "./crypto.js";
 import { fixedClock } from "./clock.js";
 import { RETENTION_V0 } from "./retention.js";
@@ -192,7 +192,9 @@ function idOf(o: Observation): string {
 // assertion.
 async function ingest(wire: Observation, at: Date): Promise<Observation> {
   advanceTo(at);
-  const { observation, created } = await observations.append(wire);
+  const _r = await observations.append(wire);
+    const created = _r.created;
+    const observation = storedObservation(_r);
   expect(created).toBe(true);
   await audit("observation.appended", {
     observationId: idOf(observation), idempotencyKey: observation.idempotencyKey,
@@ -230,7 +232,7 @@ async function tagRowVersions(): Promise<string[]> {
 beforeAll(async () => {
   ({ db, done } = await withSchema("acceptance"));
   namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
-  observations = new ObservationRepository(db, namespaces, clock);
+  observations = new ObservationRepository(db, namespaces, clock, RETENTION_V0);
   tags = new TagRepository(db, clock);
   triggers = new TriggerEventRepository(db, clock);
   records = new PermanentRecordRepository(db, clock);

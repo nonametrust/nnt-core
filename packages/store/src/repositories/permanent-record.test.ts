@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { WireObservation } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db } from "../db.js";
-import { withSchema } from "../testing/harness.js";
+import { withSchema, storedObservation } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import { RETENTION_V0 } from "../retention.js";
@@ -66,7 +66,7 @@ function aState(over: Record<string, unknown> = {}): WireObservation {
 beforeAll(async () => {
   ({ db, done } = await withSchema("permrec_test"));
   namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
-  observations = new ObservationRepository(db, namespaces, clock);
+  observations = new ObservationRepository(db, namespaces, clock, RETENTION_V0);
   records = new PermanentRecordRepository(db, clock);
   ns = (await namespaces.ensure({ kind: "wallet", id: "GOLDADDRESS" })).namespaceId;
 });
@@ -83,7 +83,7 @@ describe("the instant a promotion carries", () => {
   // copied the ingestion instant would pass this test by coincidence.
   it("keeps the day-twelve instant when read on day twenty-one", async () => {
     clock.advance(HOUR);
-    const { observation } = await observations.append(anEventOn("2026-09-12T09:00:00.000Z"));
+    const observation = storedObservation(await observations.append(anEventOn("2026-09-12T09:00:00.000Z")));
     expect(observation.ingestedAt).toBe("2026-09-12T10:00:00.000Z");
     clock.advance(9 * DAY);
     const record = await records.promote({
@@ -99,7 +99,7 @@ describe("the instant a promotion carries", () => {
   });
 
   it("carries the identifiers and the confidence back out as given", async () => {
-    const { observation } = await observations.append(anEventOn("2026-09-12T10:00:00.000Z"));
+    const observation = storedObservation(await observations.append(anEventOn("2026-09-12T10:00:00.000Z")));
     const record = await records.promote({
       observationId: observation.observationId!, namespaceId: ns,
       rescuedBy: null, confidence: 0.25,
@@ -123,7 +123,7 @@ describe("the instant a promotion carries", () => {
 // NNT04 is the SQLSTATE mapPgError turns into TimestampAltered.
 describe("the invariant the table holds on its own", () => {
   it("refuses a record whose instant disagrees with its source, by SQLSTATE", async () => {
-    const { observation } = await observations.append(anEventOn("2026-09-13T09:00:00.000Z"));
+    const observation = storedObservation(await observations.append(anEventOn("2026-09-13T09:00:00.000Z")));
     await expect(
       sql`insert into permanent_record
             (record_id, observation_id, namespace_id, original_dated_at, promoted_at, confidence)
@@ -142,7 +142,7 @@ describe("the invariant the table holds on its own", () => {
   // append-only trigger off inside a transaction that is then rolled back,
   // and the instant still refused.
   it("refuses an update that moves the instant afterwards, even with append-only off", async () => {
-    const { observation } = await observations.append(anEventOn("2026-09-14T09:00:00.000Z"));
+    const observation = storedObservation(await observations.append(anEventOn("2026-09-14T09:00:00.000Z")));
     const record = await records.promote({
       observationId: observation.observationId!, namespaceId: ns,
       rescuedBy: null, confidence: 0.8,
@@ -169,7 +169,7 @@ describe("the invariant the table holds on its own", () => {
   // The trigger sees a null source against a non-null record and refuses;
   // the honest null is refused by the column instead. Both leave no row.
   it("refuses a record of a state whether it invents an instant or writes none", async () => {
-    const { observation } = await observations.append(aState());
+    const observation = storedObservation(await observations.append(aState()));
     await expect(
       sql`insert into permanent_record
             (record_id, observation_id, namespace_id, original_dated_at, promoted_at, confidence)
@@ -185,7 +185,7 @@ describe("the invariant the table holds on its own", () => {
   });
 
   it("refuses an UPDATE of any column, loudly, by SQLSTATE and by class", async () => {
-    const { observation } = await observations.append(anEventOn("2026-09-14T10:00:00.000Z"));
+    const observation = storedObservation(await observations.append(anEventOn("2026-09-14T10:00:00.000Z")));
     const record = await records.promote({
       observationId: observation.observationId!, namespaceId: ns,
       rescuedBy: null, confidence: 0.8,
@@ -201,7 +201,7 @@ describe("the invariant the table holds on its own", () => {
   // is the one thing a permanent record must not allow. Erasure is by key
   // shredding and needs no delete path here.
   it("refuses a DELETE", async () => {
-    const { observation } = await observations.append(anEventOn("2026-09-14T11:00:00.000Z"));
+    const observation = storedObservation(await observations.append(anEventOn("2026-09-14T11:00:00.000Z")));
     const record = await records.promote({
       observationId: observation.observationId!, namespaceId: ns,
       rescuedBy: null, confidence: 0.8,
@@ -218,7 +218,7 @@ describe("the invariant the table holds on its own", () => {
   });
 
   it("promotes an observation at most once", async () => {
-    const { observation } = await observations.append(anEventOn("2026-09-15T09:00:00.000Z"));
+    const observation = storedObservation(await observations.append(anEventOn("2026-09-15T09:00:00.000Z")));
     const input = {
       observationId: observation.observationId!, namespaceId: ns,
       rescuedBy: null, confidence: 0.8,
@@ -234,7 +234,7 @@ describe("the invariant the table holds on its own", () => {
   // belong to, and surface in the wrong counterparty's brief.
   it("refuses a record filed under a namespace its observation does not belong to", async () => {
     const other = await namespaces.ensure({ kind: "wallet", id: "SOMEONEELSE" });
-    const { observation } = await observations.append(anEventOn("2026-09-16T09:00:00.000Z"));
+    const observation = storedObservation(await observations.append(anEventOn("2026-09-16T09:00:00.000Z")));
     const filed = records.promote({
       observationId: observation.observationId!, namespaceId: other.namespaceId,
       rescuedBy: null, confidence: 0.8,
@@ -247,7 +247,7 @@ describe("the invariant the table holds on its own", () => {
 
   it("holds confidence to the unit interval, NaN included", async () => {
     for (const confidence of [-0.1, 1.1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      const { observation } = await observations.append(anEventOn("2026-09-17T09:00:00.000Z"));
+      const observation = storedObservation(await observations.append(anEventOn("2026-09-17T09:00:00.000Z")));
       const promoted = records.promote({
         observationId: observation.observationId!, namespaceId: ns,
         rescuedBy: null, confidence,
@@ -264,7 +264,7 @@ describe("what the repository refuses before writing", () => {
   // promoting a state can tell that from a disk error, and so that the
   // refusal happens before anything is written rather than as a rollback.
   it("refuses to promote a state, by class, because it has no instant to preserve", async () => {
-    const { observation } = await observations.append(aState());
+    const observation = storedObservation(await observations.append(aState()));
     await expect(records.promote({
       observationId: observation.observationId!, namespaceId: ns,
       rescuedBy: null, confidence: 0.5,
@@ -280,9 +280,9 @@ describe("what the repository refuses before writing", () => {
   // is still readable, so nothing in the database refuses this on its own.
   it("refuses to promote into a shredded namespace, by class, and writes nothing", async () => {
     const shredded = await namespaces.ensure({ kind: "wallet", id: "SHREDPROMO" });
-    const { observation } = await observations.append(anEventOn("2026-09-18T09:00:00.000Z", {
+    const observation = storedObservation(await observations.append(anEventOn("2026-09-18T09:00:00.000Z", {
       namespace: { kind: "wallet", id: "SHREDPROMO" },
-    }));
+    })));
     await namespaces.shred(shredded.namespaceId);
     await expect(records.promote({
       observationId: observation.observationId!, namespaceId: shredded.namespaceId,

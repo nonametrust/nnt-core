@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { WireObservation } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db } from "../db.js";
-import { withSchema } from "../testing/harness.js";
+import { withSchema, storedObservation } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import { RETENTION_V0 } from "../retention.js";
@@ -49,16 +49,16 @@ function anEvent(over: Record<string, unknown> = {}): WireObservation {
 // Three observations under one namespace, each with its own source ref so the
 // idempotency key keeps them apart.
 async function appendUnder(nsId: string, ref: string): Promise<string> {
-  const { observation } = await observations.append(
+  const observation = storedObservation(await observations.append(
     anEvent({ source: { ...src, ref }, namespace: { kind: "wallet", id: nsId } }),
-  );
+  ));
   return observation.observationId!;
 }
 
 beforeAll(async () => {
   ({ db, done } = await withSchema("tag_test"));
   namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
-  observations = new ObservationRepository(db, namespaces, clock);
+  observations = new ObservationRepository(db, namespaces, clock, RETENTION_V0);
   repo = new TagRepository(db, clock);
   obs = await appendUnder("GOLDADDRESS", "op:tag:1");
   obs2 = await appendUnder("GOLDADDRESS", "op:tag:2");

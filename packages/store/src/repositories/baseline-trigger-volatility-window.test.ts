@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { WireObservation } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db } from "../db.js";
-import { withSchema } from "../testing/harness.js";
+import { withSchema, storedObservation } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import { RETENTION_V0 } from "../retention.js";
@@ -47,14 +47,14 @@ const src = {
 let seq = 0;
 async function appendUnder(nsId: string): Promise<string> {
   seq += 1;
-  const { observation } = await observations.append({
+  const observation = storedObservation(await observations.append({
     schemaVersion: "0.1.0",
     namespace: { kind: "wallet", id: nsId },
     channel: "volume", evidenceKind: "event", kind: "payment",
     observedAt: "2026-09-12T08:00:00.000Z",
     source: { ...src, ref: `op:${seq}` }, payload: { amount: "500.0000000" },
     salienceHints: { amount: "500.0000000" },
-  } as WireObservation);
+  } as WireObservation));
   return observation.observationId!;
 }
 
@@ -71,7 +71,7 @@ function aBaseline(over: Partial<BaselineState> = {}): BaselineState {
 beforeAll(async () => {
   ({ db, done } = await withSchema("later_tables_test"));
   namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
-  observations = new ObservationRepository(db, namespaces, clock);
+  observations = new ObservationRepository(db, namespaces, clock, RETENTION_V0);
   records = new PermanentRecordRepository(db, clock);
   baselines = new BaselineRepository(db, clock);
   triggers = new TriggerEventRepository(db, clock);
