@@ -190,7 +190,7 @@ describe("the v0 policy", () => {
   // A rule the test computes cannot be fitted to a constant after the fact.
   const A1_DELIVERY = 646_890;
   const ORDER_OF_MAGNITUDE = 10;
-  it("is the rule applied to the measurement, not a number the rule was fitted to", () => {
+  it("is pinned to the rule and, separately, to the rounding convention", () => {
     // The rule: a full order of magnitude over the largest delivery measured.
     const required = A1_DELIVERY * ORDER_OF_MAGNITUDE;
     expect(RETENTION_V0.producerMaxObservations).toBeGreaterThanOrEqual(required);

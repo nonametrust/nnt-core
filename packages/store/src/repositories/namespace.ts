@@ -1,11 +1,34 @@
 import { randomUUID } from "node:crypto";
-import { sql } from "kysely";
+import { sql, type RawBuilder } from "kysely";
 import type { NamespaceRef } from "@nonametrust/schema";
 import type { Clock } from "../clock.js";
 import type { Db } from "../db.js";
 import { newDataKey, periodKeyAad, unwrapUnder, wrapUnder, type KeyRing } from "../crypto.js";
-import { NamespaceNotFound, NamespaceShredded, PayloadExpired } from "../errors.js";
-import { expiresAt, type RetentionPolicy } from "../retention.js";
+import {
+  NamespaceNotFound, NamespaceShredded, PayloadExpired, PeriodKeyAltered,
+} from "../errors.js";
+import { assertRetentionPolicy, expiresAt, type RetentionPolicy } from "../retention.js";
+
+/**
+ * How a `date` column becomes the string this package binds keys to and hands
+ * back to callers.
+ *
+ * NOT `period::text`, which renders through the server's DateStyle: the same
+ * date is `2026-09-01` under ISO, `01.09.2026` under German and `09/01/2026`
+ * under SQL/MDY. The month key's associated data is built from this string,
+ * so a key minted under one DateStyle and opened under another refuses as
+ * CiphertextRejected -- a tamper report for a postgresql.conf line, or for an
+ * `alter role ... set datestyle`. It is the same class of mistake as reading
+ * a `date` back as a driver Date (R8), and the same class of mistake as the
+ * naive CHECK that inherits the session's TimeZone: a value that depends on a
+ * setting no migration controls.
+ *
+ * `to_char` with an explicit pattern depends on nothing. It is only STABLE
+ * rather than immutable, which would matter in a check constraint or an index
+ * and does not matter here.
+ */
+const PERIOD_TEXT = (column: RawBuilder<unknown>) =>
+  sql<string>`to_char(${column}, 'YYYY-MM-DD')`;
 
 export interface StoredNamespace {
   namespaceId: string;
@@ -24,7 +47,18 @@ export class NamespaceRepository {
     // defaulted, for the reason the key ring has no default master key -- a
     // fallback policy is a policy that reaches production.
     private readonly policy: RetentionPolicy,
-  ) {}
+  ) {
+    // The docstring on assertRetentionPolicy said "the composition point calls
+    // this once, and every arithmetic trusts it". There was no composition
+    // point: nothing in src called it at all, so a fractional graceDays wrote
+    // a fractional expiry silently and a negative one surfaced three layers
+    // down as a 23514 from a check constraint that was never meant to be the
+    // one refusing it. That made this the sixth property on this branch that
+    // was true only because nothing enforced it.
+    //
+    // Here is where a policy enters the store, so here is where it is refused.
+    assertRetentionPolicy(policy);
+  }
 
   /**
    * Returns the namespace for this reference, creating it with a fresh data
@@ -177,6 +211,27 @@ export class NamespaceRepository {
       })
       .onConflict((oc) => oc.columns(["namespace_id", "period"]).doNothing())
       .execute();
+
+    // On conflict this wrote nothing, which is what keeps an expired month
+    // expired -- and also what would let a row planted before the mint stand
+    // in for it. The table bounds the expiry to a range; this refuses any
+    // expiry that is not the one THIS policy computes, so a month minted
+    // under a different policy version is a named refusal rather than a
+    // silently different retention.
+    const expected = expiresAt(canonical.period, this.policy);
+    const stored = await this.db
+      .selectFrom("namespace_key")
+      .select(["expires_at"])
+      .where("namespace_id", "=", namespaceId)
+      .where(sql<boolean>`period = ${period}::date`)
+      .executeTakeFirst();
+    if (stored && stored.expires_at.getTime() !== expected.getTime()) {
+      throw new PeriodKeyAltered(
+        `the stored expiry of month ${canonical.period} in namespace ` +
+          `${canonical.namespaceId} is ${stored.expires_at.toISOString()}, which is not the ` +
+          `expiry policy ${this.policy.version} computes for it, ${expected.toISOString()}`,
+      );
+    }
   }
 
   /**
@@ -194,7 +249,7 @@ export class NamespaceRepository {
     period: string,
   ): Promise<{ namespaceId: string; period: string }> {
     const row = await sql<{ namespace_id: string; period: string }>`
-      select namespace_id::text as namespace_id, ${period}::date::text as period
+      select namespace_id::text as namespace_id, ${PERIOD_TEXT(sql`${period}::date`)} as period
       from namespace where namespace_id = ${namespaceId}`.execute(this.db);
     const only = row.rows[0];
     if (!only) throw new NamespaceNotFound(`no namespace ${namespaceId}`);
@@ -231,7 +286,7 @@ export class NamespaceRepository {
       namespace_id: string; period: string;
       key_wrapped: Buffer | null; shredded_at: Date | null;
     }>`
-      select namespace_id::text as namespace_id, period::text as period,
+      select namespace_id::text as namespace_id, ${PERIOD_TEXT(sql`period`)} as period,
              key_wrapped, shredded_at
       from namespace_key
       where namespace_id = ${namespaceId} and period = ${period}::date`.execute(this.db);
@@ -256,7 +311,7 @@ export class NamespaceRepository {
    */
   async periodsOf(namespaceId: string): Promise<string[]> {
     const rows = await sql<{ period: string }>`
-      select period::text as period from namespace_key
+      select ${PERIOD_TEXT(sql`period`)} as period from namespace_key
       where namespace_id = ${namespaceId} order by period`.execute(this.db);
     return rows.rows.map((r) => r.period);
   }

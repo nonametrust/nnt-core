@@ -195,6 +195,27 @@ describe("what the table refuses to hold", () => {
   // live tags on one (namespace, channel). This is the same null-versus-check
   // gap the producer column had one migration section down; review deleted
   // `alter column aspect set not null` and the whole suite stayed green.
+  // R11 was a guard branch, and the guard fires on UPDATE and DELETE only --
+  // so a raw INSERT could write a tag already retired before it was opened
+  // and nothing refused it. A tag cannot retire before it exists, whichever
+  // statement writes it, so the rule is a check constraint as well.
+  it("refuses a tag retired before it was opened, on insert as well as on update", async () => {
+    const opened = clock.now();
+    await expect(
+      sql`insert into tag (tag_id, namespace_id, observation_id, channel, aspect, g0, tagged_at, retired_at)
+          values (${randomUUID()}, ${ns}, ${obs}, 'volume', 'r11', 0.5, ${opened},
+                  ${new Date(opened.getTime() - 1)})`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "tag_retired_after_opened" });
+    // The same instant is allowed: a tag opened and retired in one operation
+    // is not a contradiction, and nothing in the design forbids it.
+    await expect(
+      sql`insert into tag (tag_id, namespace_id, observation_id, channel, aspect, g0, tagged_at, retired_at)
+          values (${randomUUID()}, ${ns}, ${obs}, 'volume', 'r11b', 0.5, ${opened}, ${opened})`
+        .execute(db),
+    ).resolves.toBeDefined();
+  });
+
   it("refuses a tag with no aspect at all, which the nonempty check alone admits", async () => {
     await expect(
       sql`insert into tag (tag_id, namespace_id, observation_id, channel, aspect, g0, tagged_at)

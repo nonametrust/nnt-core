@@ -90,10 +90,18 @@ alter table tag add column aspect text;
 alter table tag alter column aspect set not null;
 alter table tag add constraint tag_aspect_nonempty check (length(aspect) > 0);
 
+
 -- Retirement is named in the M0 spec, the M1 spec and the repository's own
 -- docstring, and existed nowhere. The column lands here because the unique
 -- index below is partial on it; the nightly operation that sets it is M4's.
 alter table tag add column retired_at timestamptz;
+-- R11 as a check as well as a guard branch. The guard fires on UPDATE and
+-- DELETE, like every guard in this schema, so a raw INSERT could write a tag
+-- retired eleven days before it was opened and nothing refused it -- measured,
+-- not supposed. A tag cannot retire before it exists, whichever statement
+-- writes it.
+alter table tag add constraint tag_retired_after_opened
+  check (retired_at is null or retired_at >= tagged_at);
 
 -- Partial, so a retired tag frees the pair rather than blocking it forever.
 create unique index tag_one_live_per_pair
@@ -189,7 +197,7 @@ begin
 end
 $$;
 
-create trigger tag_guard_trigger
+create trigger tag_guarded
   before update or delete on tag
   for each row execute function tag_guard();
 
@@ -235,11 +243,16 @@ alter table observation
 -- === 4. namespace_key: the month key, its guard, and what expiry may not do ==
 --
 -- Retention in this design is unreadability on a clock, not deletion. A
--- payload is sealed under a key per (namespace, calendar month); that month
--- key is wrapped under the namespace's own key, so there are two levels and
--- the outer one is the namespace. Shredding a month key makes that month
+-- payload is to be sealed under a key per (namespace, calendar month); that
+-- month key is wrapped under the namespace's own key, so there are two levels
+-- and the outer one is the namespace. Shredding a month key makes that month
 -- unreadable while every row, foreign key, audit entry and day seal stays
 -- exactly where it is and stays verifiable.
+--
+-- This section builds the table, its constraints and its guard. It does NOT
+-- make any payload depend on a month key: the observation layer still seals
+-- under the namespace key until Task 6 wires it, so at the commit that adds
+-- this section, expiring a month makes nothing unreadable.
 --
 -- The primary key is the pair, which is also what the wrap is bound to. That
 -- binding is what stops a shred being evaded by a row copy: a wrapped key
@@ -315,7 +328,10 @@ create table namespace_key (
   -- and without this an empty bytea would count as live above. The same
   -- number, from the same layout, as namespace_key_present on namespace --
   -- which is why wrapUnder was lifted out of the ring rather than copied.
-  constraint namespace_key_present
+  -- Named for THIS table: `namespace_key_present` already exists on
+  -- `namespace` (0001), and two constraints of one name in one schema make an
+  -- operator's error line ambiguous about which table refused.
+  constraint namespace_key_wrapped_present
     check (key_wrapped is null or octet_length(key_wrapped) > 29),
   -- A month cannot expire before it has closed, where "closed" means the UTC
   -- close and not the server's.
@@ -342,8 +358,22 @@ create table namespace_key (
   --
   -- `>=` and not `>`: graceDays = 0 expires a month at its close, which is a
   -- policy and not a defect, and `>` would refuse every such mint.
-  constraint namespace_key_expires_after_period
-    check (expires_at >= timezone('UTC', (period + interval '1 month')::timestamp)),
+  --
+  -- The UPPER bound is not decoration. This table has no INSERT guard (the
+  -- trigger below is update/delete only, like every guard in this schema) and
+  -- periodKey is on-conflict-do-nothing, so a planted row WINS over the
+  -- legitimate mint. Planted with expires_at in 2999, the month is never
+  -- reached by the sweep and its payloads stay readable for a thousand years.
+  -- Measured by review, not imagined.
+  --
+  -- Ten years is deliberately generous rather than tight: it is not a policy
+  -- number, it is the line between a grace and a mistake, and a policy that
+  -- genuinely wanted longer would be a migration. The repository additionally
+  -- refuses a row whose expiry is not the one its own policy computes, which
+  -- is the same plant arriving before the mint rather than after it.
+  constraint namespace_key_expires_in_range
+    check (expires_at >= timezone('UTC', (period + interval '1 month')::timestamp)
+       and expires_at <= timezone('UTC', (period + interval '10 years')::timestamp)),
   constraint namespace_key_period_is_month
     check (period = date_trunc('month', period::timestamp)::date),
   -- R2's guard. Expiry is not early, measured against the row's own value.

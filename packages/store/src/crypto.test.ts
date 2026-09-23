@@ -31,6 +31,9 @@ function flipByte(buf: Buffer, i: number): void {
   buf[i] = buf.readUInt8(i) ^ 0xff;
 }
 
+const RECORD = "33333333-3333-4333-8333-333333333333";
+const OBSERVATION = "44444444-4444-4444-8444-444444444444";
+
 // The two instants differ, and by more than a rounding. An observation is
 // ingested after it is observed, and on a fixture where the two were equal a
 // function reading the wrong one would agree with itself and no test would
@@ -38,6 +41,7 @@ function flipByte(buf: Buffer, i: number): void {
 function binding(over: Partial<PayloadBinding> = {}): PayloadBinding {
   return {
     namespaceId: NS,
+    observationId: OBSERVATION,
     idempotencyKey: "abc123",
     evidenceKind: "event",
     channel: "volume",
@@ -48,9 +52,6 @@ function binding(over: Partial<PayloadBinding> = {}): PayloadBinding {
     ...over,
   };
 }
-
-const RECORD = "33333333-3333-4333-8333-333333333333";
-const OBSERVATION = "44444444-4444-4444-8444-444444444444";
 
 // Promoted eight days after the observation it rescues: a permanent record is
 // written when a trigger fires, not when the evidence arrived.
@@ -239,6 +240,7 @@ describe("seal and open", () => {
   it("refuses a ciphertext whose bound columns were rewritten, one column at a time", () => {
     const s = seal(dk, '{"a":1}', aad);
     const moves: Partial<PayloadBinding>[] = [
+      { observationId: RECORD },
       { evidenceKind: "state", datedAt: null },
       { channel: "latency" },
       { kind: "tampered" },
@@ -321,9 +323,10 @@ describe("payloadAad", () => {
   // Last is a convention, not a necessity: with a fixed part count and a
   // separator no part may contain, an empty part is unambiguous anywhere.
   // This pin is what holds the order; nothing deeper does.
-  it("renders the eight parts in one fixed order, the two instants last", () => {
+  it("renders the nine parts in one fixed order, the two instants last", () => {
     expect(payloadAad(binding()).toString("utf8").split("\u0000")).toEqual([
       NS,
+      OBSERVATION,
       "abc123",
       "event",
       "volume",
@@ -363,7 +366,8 @@ describe("payloadAad", () => {
   // because this function's signature is strings and it cannot see which.
   it("refuses a part that contains the separator, in every position", () => {
     for (const move of [
-      { namespaceId: "a\u0000b" }, { idempotencyKey: "a\u0000b" }, { evidenceKind: "a\u0000b" },
+      { namespaceId: "a\u0000b" }, { observationId: "a\u0000b" },
+      { idempotencyKey: "a\u0000b" }, { evidenceKind: "a\u0000b" },
       { channel: "a\u0000b" }, { kind: "a\u0000b" }, { producer: "a\u0000b" },
     ]) {
       expect(() => payloadAad(binding(move)), JSON.stringify(move)).toThrow(RangeError);
@@ -405,7 +409,7 @@ describe("payloadAad", () => {
     // match at all. Nothing caught this until the flag was mutated away.
     for (const good of ["a\u{1F600}b", "\u{1F600}", "ödeme-çğş", "日本語"]) {
       expect(() => payloadAad(binding({ kind: good })), good).not.toThrow();
-      expect(payloadAad(binding({ kind: good })).toString("utf8").split("\u0000")[4]).toBe(good);
+      expect(payloadAad(binding({ kind: good })).toString("utf8").split("\u0000")[5]).toBe(good);
     }
   });
 
@@ -452,9 +456,9 @@ describe("permanentAad", () => {
     expect(impostor.equals(permanentAad(record()))).toBe(false);
     // What actually holds it: the two carry a different number of parts, and
     // no part may contain the separator, so one join has five separators and
-    // the other seven. They cannot be equal for any inputs at all.
+    // the other eight. They cannot be equal for any inputs at all.
     expect(permanentAad(record()).toString("utf8").split("\u0000").length).toBe(6);
-    expect(impostor.toString("utf8").split("\u0000").length).toBe(8);
+    expect(impostor.toString("utf8").split("\u0000").length).toBe(9);
   });
 
   it("renders the six parts in one fixed order, the domain literal first", () => {

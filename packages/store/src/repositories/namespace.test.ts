@@ -3,8 +3,9 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { namespaceRefSchema } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db, Schema } from "../db.js";
+import { withIsoDates } from "../db.js";
 import type { Selectable } from "kysely";
-import { withSchema } from "../testing/harness.js";
+import { urlForSchema, withSchema } from "../testing/harness.js";
 import { keyRingFromEnv, newDataKey, periodKeyAad, unwrapUnder } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import {
@@ -462,9 +463,7 @@ describe("the month key", () => {
     const ns = await aNamespace("PERIODSHRED1");
     await repo.shred(ns);
     await expect(repo.periodKey(ns, "2026-09-01")).rejects.toBeInstanceOf(NamespaceShredded);
-    const rows = await db.selectFrom("namespace_key").select(["period"])
-      .where("namespace_id", "=", ns).execute();
-    expect(rows).toEqual([]);
+    expect(await repo.periodsOf(ns)).toEqual([]);
   });
 
   // The namespace key is the outer one. Once it is gone there is no inner key
@@ -476,6 +475,10 @@ describe("the month key", () => {
     await repo.periodKey(ns, "2026-09-01");
     await repo.periodKey(ns, "2026-10-01");
     const before = await keyVersions();
+    // Without this the second half is vacuous: delete the two mints above and
+    // "leaves the rows alone" still passes, because it compares one empty
+    // list to another.
+    expect(before.filter((v) => v.startsWith(ns))).toHaveLength(2);
     await repo.shred(ns);
     for (const period of ["2026-09-01", "2026-10-01"]) {
       await expect(repo.openPeriodKey(ns, period)).rejects.toBeInstanceOf(NamespaceShredded);
@@ -579,16 +582,66 @@ describe("the period column under a skewed zone", () => {
   //
   // tsconfig.test.json has `"exclude": []`, so this file is typechecked and
   // the line below is enforced by `pnpm typecheck`, not by vitest.
-  it("cannot be read as anything but text, by the type", () => {
-    // With `never` on the read side Kysely drops the key from Selectable
-    // altogether, so the column is not merely typed as nothing -- it cannot
-    // be named in a select at all. Widen the declaration back to `string` and
-    // the key reappears, `true` no longer assigns to `false`, and the build
-    // fails. That is the whole pin.
+  // What the type actually buys, stated precisely, because the first version
+  // of this comment overstated it and review measured the overstatement:
+  // `never` removes the column from `Selectable`, but Kysely's `.select()`
+  // takes its names from the table type, so `.select(["period"])` still
+  // COMPILES and hands back `period: never` -- which assigns to `string`
+  // silently, because never assigns to everything. The type stops a row
+  // shape from claiming the column is readable; it does not stop the select.
+  //
+  // The select is stopped lexically instead, by the gate below.
+  it("is absent from the readable row shape", () => {
     type PeriodIsUnreadable =
       "period" extends keyof Selectable<Schema["namespace_key"]> ? false : true;
     const unreadable: PeriodIsUnreadable = true;
     expect(unreadable).toBe(true);
+  });
+
+  // The zone is not the only server setting that can move this string.
+  // `date::text` renders through DateStyle: the same date is 2026-09-01 under
+  // ISO, 01.09.2026 under German and 09/01/2026 under SQL/MDY. The month
+  // key's binding is built from that rendering, so a key minted under one
+  // DateStyle and opened under another would refuse as CiphertextRejected --
+  // a tamper report for a postgresql.conf line. That is the same argument
+  // this branch used against the naive CHECK, one function away.
+  it("binds the period independently of the server's DateStyle", async () => {
+    const ns = (await repo.ensure({ kind: "wallet", id: "DATESTYLE" })).namespaceId;
+    await repo.periodKey(ns, "2026-09-01");
+    for (const style of ["German", "SQL, MDY", "Postgres"]) {
+      await db.transaction().execute(async (trx) => {
+        await sql.raw(`set local datestyle = '${style}'`).execute(trx);
+        const inside = new NamespaceRepository(trx, ring, clock, RETENTION_V0);
+        // The key still opens: its binding is rendered by to_char with an
+        // explicit pattern, not by `period::text`, which would be
+        // 01.09.2026 here and refuse as a tamper.
+        expect(await inside.openPeriodKey(ns, "2026-09-01"), style).toHaveLength(32);
+        expect(await inside.periodsOf(ns), style).toEqual(["2026-09-01"]);
+      });
+    }
+  });
+
+  // The other half, and a separate mechanism. `to_char` fixes what this
+  // package RENDERS; it does nothing about what the driver PARSES. Under a
+  // non-ISO DateStyle the server sends timestamptz as 01.09.2026 ..., node-pg
+  // does not recognise it, and every timestamp column arrives as null -- a
+  // read then crashes on .getTime() with an error this package does not own.
+  // So every connection announces ISO, which beats a server default, an
+  // `alter role ... set datestyle` and a PGDATESTYLE in the environment.
+  //
+  // (The test above defeats this deliberately with `set local`, because it is
+  // testing the rendering. This one tests the pin.)
+  it("pins DateStyle on its own connections, so the driver can read a timestamp", async () => {
+    const shown = await sql<{ s: string }>`select current_setting('DateStyle') as s`.execute(db);
+    expect(shown.rows[0]?.s).toMatch(/^ISO/);
+    expect(withIsoDates("postgres://h/db")).toContain("datestyle%3DISO");
+    // Appended, not assigned: urlForSchema already puts a search_path in
+    // `options`, and a second `options` parameter would replace it.
+    const both = withIsoDates(urlForSchema("postgres://h/db", "some_schema"));
+    expect(both).toContain("search_path");
+    expect(both).toContain("datestyle");
+    // Idempotent, so wrapping a url twice does not stack the flag.
+    expect(withIsoDates(both)).toBe(both);
   });
 
   it("round-trips the same month in every zone the process might run in", async () => {
@@ -659,13 +712,43 @@ describe("what the namespace_key table refuses to hold", () => {
     });
   });
 
+  // The lower bound alone lets a writer plant a month that never expires.
+  // Measured by review: a row with expires_at in 2999 is accepted, and
+  // because periodKey is on-conflict-do-nothing the plant WINS over the
+  // legitimate mint -- so the sweep never reaches that month and its payloads
+  // stay readable for a thousand years. The ceiling is generous rather than
+  // tight: it is not a policy, it is the difference between a grace and a
+  // mistake, and a policy that wanted more would be a migration.
+  it("refuses an expiry absurdly far after the period, by name", async () => {
+    const ns = (await repo.ensure({ kind: "wallet", id: "RAWPERIODFAR" })).namespaceId;
+    await expect(
+      sql`insert into namespace_key (namespace_id, period, key_wrapped, expires_at, shredded_at, created_at)
+          values (${ns}, date '2026-09-01', ${Buffer.alloc(61)}, ${new Date("2999-01-01T00:00:00Z")}, null, ${clock.now()})`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_expires_in_range" });
+  });
+
+  // And the repository refuses a row it did not write the expiry of, which is
+  // the same plant arriving before the legitimate mint: on conflict do
+  // nothing means periodKey would otherwise accept it silently.
+  it("refuses to use a month whose expiry is not the one the policy gives", async () => {
+    const ns = (await repo.ensure({ kind: "wallet", id: "PLANTEDEXPIRY" })).namespaceId;
+    const wrong = new Date("2027-06-01T00:00:00.000Z");
+    await sql`insert into namespace_key (namespace_id, period, key_wrapped, expires_at, shredded_at, created_at)
+        values (${ns}, date '2026-09-01', ${Buffer.alloc(61)}, ${wrong}, null, ${clock.now()})`
+      .execute(db);
+    const minted = repo.periodKey(ns, "2026-09-01");
+    await expect(minted).rejects.toBeInstanceOf(PeriodKeyAltered);
+    await expect(minted).rejects.toThrow(/expiry/);
+  });
+
   it("refuses an expiry before the period closes, by name", async () => {
     const ns = (await repo.ensure({ kind: "wallet", id: "RAWPERIOD2" })).namespaceId;
     await expect(
       sql`insert into namespace_key (namespace_id, period, key_wrapped, expires_at, shredded_at, created_at)
           values (${ns}, date '2026-09-01', ${Buffer.alloc(61)}, ${new Date("2026-09-30T00:00:00Z")}, null, ${clock.now()})`
         .execute(db),
-    ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_expires_after_period" });
+    ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_expires_in_range" });
   });
 
   // R2's guard, and the reason expiry is a column at all: an early shred is
@@ -699,7 +782,7 @@ describe("what the namespace_key table refuses to hold", () => {
       sql`insert into namespace_key (namespace_id, period, key_wrapped, expires_at, shredded_at, created_at)
           values (${ns}, date '2026-09-01', ${Buffer.alloc(29)}, ${new Date("2027-01-01")}, null, ${clock.now()})`
         .execute(db),
-    ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_present" });
+    ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_wrapped_present" });
   });
 });
 

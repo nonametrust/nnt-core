@@ -6,7 +6,9 @@ import {
 import type { Clock } from "../clock.js";
 import type { Db } from "../db.js";
 import { open, payloadAad, seal } from "../crypto.js";
-import { IdempotencyKeyMismatch, ObservationNotFound, mapPgError } from "../errors.js";
+import {
+  CiphertextRejected, IdempotencyKeyMismatch, ObservationNotFound, mapPgError,
+} from "../errors.js";
 import type { NamespaceRepository } from "./namespace.js";
 
 export interface AppendResult {
@@ -88,6 +90,7 @@ export class ObservationRepository {
     const dataKey = await this.namespaces.dataKey(ns.namespaceId);
     const sealed = seal(dataKey, JSON.stringify(stored), payloadAad({
       namespaceId: ns.namespaceId,
+      observationId,
       idempotencyKey: key,
       evidenceKind: stored.evidenceKind,
       channel: stored.channel,
@@ -156,8 +159,8 @@ export class ObservationRepository {
     const row = await this.db
       .selectFrom("observation")
       .select([
-        "namespace_id", "idempotency_key", "evidence_kind", "channel", "kind", "dated_at",
-        "ingested_at", "producer",
+        "observation_id", "namespace_id", "idempotency_key", "evidence_kind", "channel", "kind",
+        "dated_at", "ingested_at", "producer",
         "payload_nonce", "payload_tag", "payload_ciphertext",
       ])
       .where(column, "=", value)
@@ -171,6 +174,7 @@ export class ObservationRepository {
       { nonce: row.payload_nonce, tag: row.payload_tag, ciphertext: row.payload_ciphertext },
       payloadAad({
         namespaceId: row.namespace_id,
+        observationId: row.observation_id,
         idempotencyKey: row.idempotency_key,
         evidenceKind: row.evidence_kind,
         channel: row.channel,
@@ -180,6 +184,17 @@ export class ObservationRepository {
         datedAt: row.dated_at,
       }),
     );
-    return observationSchema.parse(JSON.parse(json)) as Observation;
+    const parsed = observationSchema.parse(JSON.parse(json)) as Observation;
+    // The envelope already binds the row's primary key, so a payload that
+    // opens here belongs to this row. This is the second reading of the same
+    // rule, kept because the docstring above claims the store never serves a
+    // payload under an identifier that is not its own, and a claim this cheap
+    // to enforce should not rest on one layer.
+    if (parsed.observationId !== row.observation_id) {
+      throw new CiphertextRejected(
+        `payload on row ${row.observation_id} carries observation id ${String(parsed.observationId)}`,
+      );
+    }
+    return parsed;
   }
 }

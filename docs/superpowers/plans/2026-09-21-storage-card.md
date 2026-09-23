@@ -186,10 +186,161 @@ would be the reverse-engineering the section exists to record. The test now
 asserts the rule and the convention as two separate claims, so a veto of the
 convention leaves the rule standing.
 
+**R15. The row's own primary key is inside the payload envelope.** `payloadAad`
+bound the namespace and the idempotency key but not `observation_id`, which is
+what every foreign key in the schema hangs from. Measured by review: with the
+append-only trigger off, exchanging the whole contents of two rows in one
+namespace -- idempotency key, derived columns and ciphertext together -- left
+both opening, so the evidence behind a tag became another observation's and
+nothing in the store could tell. Nine parts now, and `read` additionally
+refuses a payload whose parsed id is not the row's. Cost: the layout moved a
+third time, which is free only until the first deployed row, and the migration
+preamble is what keeps that true.
+
+**R16. `expires_at` is bounded above as well as below, and the repository
+refuses a month whose expiry its own policy did not compute.** `namespace_key`
+has no INSERT guard -- every guard in this schema is update/delete -- and
+`periodKey` is on-conflict-do-nothing, so a row planted before the legitimate
+mint WINS. Planted with an expiry in 2999 the month is never swept and its
+payloads stay readable indefinitely. The check bounds expiry to ten years past
+the period, which is deliberately generous: it is not a policy number, it is
+the line between a grace and a mistake. Cost: a policy that genuinely wanted
+longer is a migration, which is the same shape as R2.
+
+**R17. Every connection this package opens pins `DateStyle=ISO`, and the
+period is rendered by `to_char` rather than by `::text`.** Two separate
+mechanisms for one setting. The binding a month key is wrapped under was built
+from `period::text`, which renders through the session's DateStyle: the same
+date is `2026-09-01` under ISO and `01.09.2026` under German, so a key minted
+under one and opened under another refused as `CiphertextRejected` -- a tamper
+report for a `postgresql.conf` line. That is the same class of mistake as the
+naive CHECK inheriting the session's TimeZone, one function away. Separately,
+under a non-ISO DateStyle node-pg cannot parse the timestamptz text the server
+sends and returns **null** for every timestamp column, so a read crashes on
+`.getTime()` with an error this package does not own. `to_char` fixes what we
+render; the connection pin fixes what the driver parses.
+
+## 2c. Limits of crypto-shredding, recorded rather than fixed
+
+Two things a security review measured that no schema change can close. They
+belong in the card because the whitepaper's erasure sentence is read by people
+who will assume otherwise.
+
+**A shred is reversible by anyone who can restore a pre-shred copy of the
+wrapped key into its own row.** The wrap's associated data binds a key to its
+row's identity, not to time, so the row-copy defence (which holds in every
+direction tested) says nothing about a same-row restore. With the guard
+disabled, writing captured bytes back with `key_shredded_at = null` makes the
+namespace readable again; the same holds for a month key. The guard is the
+only line, and the threat model this design states assumes it bypassed. **The
+realistic form of this attacker is a database backup.** Irreversible erasure
+therefore needs two things this repository does not have: a master-key
+rotation runbook whose old master is destroyed after a shred, and a backup
+retention policy shorter than the erasure promise. Until both exist, the
+honest claim is "unreadable in the live database", not "erased".
+
+**Erasure is content-only: the metadata around it survives, and the
+idempotency key leaks the source references.** After a shred the following are
+still plaintext: the counterparty identifier itself (`namespace.ns_id`, a
+wallet address), every observation's `channel`, `kind`, `evidence_kind`,
+`dated_at`, `ingested_at` and `producer`, every tag's strength and instant,
+every baseline's `mean` and `median_est`, and all `permanent_record` metadata.
+Two of those are worse than they look. A baseline over a single observation
+has a `mean` equal to that observation's amount, so an aggregate column holds
+the payload value. And `idempotency_key` is an unkeyed SHA-256 over
+`(producer, network, ref, channel, kind, namespace id)` where every part but
+`ref` is a column in the clear and `ref` is a public-ledger operation id: a
+three-hundred-candidate dictionary recovered 3 of 3 source references of a
+shredded namespace. So "which on-ledger operations were observed about this
+wallet" survives erasure.
+
+*Not decided here.* The fix, if it is one, is to derive the idempotency key
+under a per-namespace HMAC, which is possible because the only reader is the
+retry pre-read and that already refuses on a shredded namespace. It touches
+`@nonametrust/schema`, changes every stored key, and belongs on its own card
+with the baseline and tag survivals beside it. Recorded now so that nobody
+reads the retention card as a privacy guarantee it does not make.
+
 **Carried, not ruled:** a tag may still move from `open` to `saturated` with
 the count unchanged. Nothing in M2's arithmetic produces it and nothing
 refuses it; it belongs on M4's card beside retirement rather than being
 invented here.
+
+## 2d. What the remaining tasks must read instead of their own text
+
+The plan was written before execution and execution moved work between tasks.
+Where a Task section below contradicts this list, this list wins.
+
+**Section numbers in `0007` are one higher than every Task says**, because
+R13 gave the file a section 3 (`observation.producer`). The file now reads: 1
+baseline, 2 tag, 3 observation.producer, 4 namespace_key. So Task 6's period
+work is **section 5** and Task 9's permanent columns are **section 6**. The
+header's section list is extended by whichever task adds one, and each section
+names the task that added it.
+
+**Task 6 must not redo Task 4b.** Its text still instructs the preamble, the
+`producer` column and the two move-list additions; all three shipped. Followed
+literally it produces a duplicate column (42701) and two sections numbered 4.
+What remains for Task 6: the `period` column, `observation_period_from_ingested_at`,
+the foreign key to `namespace_key`, the `(producer, ingested_at desc)` index,
+the observation catalogue pin, and moving `append`/`read` onto the month key.
+
+**Task 6 will turn one existing assertion red, on purpose.**
+`observation.test.ts` asserts that a raw `ingested_at + interval '1 month'` is
+refused as `CiphertextRejected`. Once the period check exists, that UPDATE
+fails at 23514 before the envelope is consulted, so the assertion becomes
+23514 by constraint name and the test must say which layer refused. The
+one-hour move stays `CiphertextRejected`. Re-greening it without reading this
+removes a gate.
+
+**Task 6's check form is settled and measured.** `period = date_trunc('month',
+timezone('UTC', ingested_at))::date`. The three-argument
+`date_trunc('month', ingested_at, 'UTC')::date` is NOT equivalent: the
+`timestamptz::date` cast converts in the session's zone, so the whole
+expression is only stable and an index refuses it. To prove any expression
+immutable, put it in an index -- a CHECK does not enforce it.
+
+**Task 6 must not select `period` as a column.** `never` on the read side
+removes it from `Selectable`, but Kysely takes select names from the table
+type, so `.select(["period"])` compiles and hands back a driver `Date` at
+local midnight. Read it through `periodsOf`, or with `to_char(period,
+'YYYY-MM-DD')`.
+
+**Task 8: the policy must be the same object.** `ObservationRepository` gains
+a `RetentionPolicy` beside `NamespaceRepository`'s. Two repositories handed
+different policies would expire under one number and cap under another with
+nothing comparing them; the composition point passes one value to both, and
+each constructor asserts it (R16's sibling, added in this round).
+
+**Task 8 owes a ruling the plan never made: a re-delivery for a SHREDDED
+namespace.** `openPeriodKey` reads the namespace key first, so such a
+re-delivery throws `NamespaceShredded` out of `append`, and the indexer's
+normal retry path errors forever for that counterparty. F8 named the month
+version of this; the namespace version has existed since M1 and is not
+written down. Either give the third `AppendResult` shape a reason field
+covering both, or record that the M1 ruling makes the throw intended.
+
+**Task 9 owes a composition answer.** Its text says `observations.get(id)`
+runs "inside the same transaction", but repositories are bound to a `Db` at
+construction and `promote` creates its own `trx`. Either the constructor takes
+`(db, ring, clock, policy)` and builds transaction-bound repositories, or the
+plan records that the pre-read is outside the transaction and why that is
+acceptable.
+
+**Task 10 has lost one item and gained none.** `index.ts` already exports
+`retention.js`, because Task 5 made the policy a required constructor
+argument and the package could not otherwise construct its own repository.
+
+**Gate table corrections.** G8's "producer shaped" and all of G9 shipped in
+Task 4b; G10's "migration refuses data" shipped there too. What remains: G8's
+period, foreign key and catalogue pin (Task 6), G10's expiry (Task 7), G11
+(Task 9), G12 (Tasks 8 and 10).
+
+**Two names in the plan that are wrong.** The file is
+`0007_retention_aspect_and_baseline_shape.sql`, not `..._and_checks.sql`. R8
+and Task 5 say `period` is typed `ColumnType<string, string, never>`; it ships
+as `ColumnType<never, string, never>`, because the read side must not claim a
+type the driver does not return.
 
 ## 3. Global constraints for every task
 

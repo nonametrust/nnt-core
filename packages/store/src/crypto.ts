@@ -39,10 +39,12 @@ const WRAP_HEADER_BYTES = 1 + NONCE_BYTES + TAG_BYTES;
 //
 // The byte layout of the associated data is frozen once a payload is stored.
 // Changing it makes every existing ciphertext fail to open. It has been
-// changed twice, both times before anything was deployed: once to take in the
-// columns the store derives beside the payload, and once more to take in the
-// last two of them, `producer` and `ingested_at`. That cost nothing both
-// times and would be a re-encryption of every row now, which is why the
+// changed three times, all before anything was deployed: once to take in the
+// columns the store derives beside the payload, once more for the last two of
+// them (`producer` and `ingested_at`), and once to take in the row's own
+// primary key, without which two rows of one namespace could have their whole
+// contents exchanged. That cost nothing each time and would be a
+// re-encryption of every row now, which is why the
 // migration that adds those columns refuses to run over a non-empty table
 // rather than leaving the cost to be discovered at the first read.
 const SEPARATOR = "\u0000";
@@ -89,8 +91,14 @@ export function newDataKey(): Buffer {
  * store derived from it and keeps beside it. The namespace and the key put
  * the ciphertext on one row; without them an attacker with write access to
  * the table could swap two counterparties' evidence without breaking any
- * signature we hold. The other six are the same threat carried one step
- * further. Under that model the append-only trigger is already assumed
+ * signature we hold. `observationId` is the row's own primary key and every
+ * foreign key in the schema hangs from it -- a tag, a permanent record and a
+ * trigger event all name an observation by it. Without it bound, two rows in
+ * one namespace can have their whole contents exchanged (idempotency key,
+ * derived columns and ciphertext together) and each still opens: the evidence
+ * behind a tag becomes another observation's, and nothing in the store can
+ * tell. That was measured on this branch, not imagined. The other six are
+ * the same threat carried one step further. Under that model the append-only trigger is already assumed
  * bypassed, since a swap needs an UPDATE too, and so a derived column can be
  * moved while the payload still opens: the promotion trigger measures a
  * record against the dated column, not against the evidence, and a moved
@@ -113,6 +121,7 @@ export function newDataKey(): Buffer {
  */
 export interface PayloadBinding {
   namespaceId: string;
+  observationId: string;
   idempotencyKey: string;
   evidenceKind: string;
   channel: string;
@@ -136,6 +145,7 @@ export interface PayloadBinding {
 export function payloadAad(b: PayloadBinding): Buffer {
   return joinParts([
     b.namespaceId,
+    b.observationId,
     b.idempotencyKey,
     b.evidenceKind,
     b.channel,

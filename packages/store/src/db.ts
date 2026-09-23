@@ -156,8 +156,39 @@ export interface Schema {
 
 export type Db = Kysely<Schema>;
 
+/**
+ * Every connection this package opens announces `DateStyle=ISO`, and that is
+ * not cosmetic.
+ *
+ * The driver parses `timestamptz` out of the text the server sends, and the
+ * server renders that text through DateStyle. Under `German` or `SQL, MDY` it
+ * sends `01.09.2026 ...`, node-pg does not recognise it, and every timestamp
+ * column in this store comes back as NULL -- so a read crashes on
+ * `.getTime()` with an error this package does not own, rather than refusing
+ * anything. `date` columns render the same way, which is why period is read
+ * through `to_char` with an explicit pattern.
+ *
+ * A server-wide setting, an `alter role ... set datestyle`, a `PGDATESTYLE`
+ * in the environment or one connection of a mixed pool is enough to produce
+ * it. `options` on the connection is per session and beats all of them, so
+ * this is the one place it can be settled.
+ *
+ * It is appended rather than assigned, because `urlForSchema` already puts a
+ * `search_path` in `options` and a second `options` parameter would replace
+ * the first instead of adding to it.
+ */
 export function openDb(url: string): Db {
   return new Kysely<Schema>({
-    dialect: new PostgresDialect({ pool: new pg.Pool({ connectionString: url }) }),
+    dialect: new PostgresDialect({ pool: new pg.Pool({ connectionString: withIsoDates(url) }) }),
   });
+}
+
+const ISO_DATES = "-c datestyle=ISO";
+
+export function withIsoDates(url: string): string {
+  const parsed = new URL(url);
+  const existing = parsed.searchParams.get("options");
+  if (existing?.includes("datestyle=")) return url;
+  parsed.searchParams.set("options", existing ? `${existing} ${ISO_DATES}` : ISO_DATES);
+  return parsed.toString();
 }

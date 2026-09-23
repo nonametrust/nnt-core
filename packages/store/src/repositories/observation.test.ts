@@ -4,7 +4,7 @@ import { deriveIdempotencyKey, type WireObservation } from "@nonametrust/schema"
 import { sql } from "kysely";
 import type { Db } from "../db.js";
 import { withSchema } from "../testing/harness.js";
-import { keyRingFromEnv, newDataKey } from "../crypto.js";
+import { keyRingFromEnv, newDataKey, payloadAad, seal } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import { RETENTION_V0 } from "../retention.js";
 import {
@@ -330,19 +330,96 @@ describe("the columns beside the payload", () => {
     expect(again.kind).toBe("payment");
   });
 
-  // The producer is derived by `append` from the source the observation
-  // carries, not passed in beside it: every column beside the payload comes
-  // from the one parsed object, which is the rule observation.test's own
-  // derived-column test states. It is a column of its own because the read
-  // path has to rebuild the envelope from the row alone, and because the
-  // producer cap counts rows by it.
-  it("writes the producer the source named, as a column of its own", async () => {
-    const { observation } = await observations.append(
-      anEvent({ source: { ...src, ref: "op:producer:1" } }),
+  // The row's own primary key is inside the envelope, and this is the attack
+  // that needs it. Every foreign key in the schema names an observation by
+  // observation_id -- a tag, a permanent record, a trigger event -- so an
+  // attacker who exchanges the whole contents of two rows in one namespace
+  // (idempotency key, derived columns and ciphertext together, which the
+  // unique key forces to happen in steps) repoints the evidence behind a tag
+  // at another observation. Before the key was bound, both rows still opened
+  // and nothing in the store could tell.
+  it("refuses a payload whose row was exchanged with another observation's", async () => {
+    const a = await observations.append(anEvent({ source: { ...src, ref: "op:swap:a" } }));
+    const b = await observations.append(anEvent({
+      source: { ...src, ref: "op:swap:b" }, kind: "refund",
+    }));
+    const idA = a.observation.observationId!;
+    const idB = b.observation.observationId!;
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+        // idempotency_key is unique, so the exchange goes through parking
+        // values. Every statement here succeeds; nothing relies on an error.
+        const keyB = (await sql<{ k: string }>`
+          select idempotency_key as k from observation where observation_id = ${idB}`
+          .execute(trx)).rows[0]!.k;
+        await sql`update observation set idempotency_key = 'parked-a' where observation_id = ${idA}`
+          .execute(trx);
+        await sql`update observation set idempotency_key = 'parked-b' where observation_id = ${idB}`
+          .execute(trx);
+        await sql`update observation a set
+            idempotency_key = ${keyB}, kind = b.kind, channel = b.channel,
+            evidence_kind = b.evidence_kind, dated_at = b.dated_at, producer = b.producer,
+            payload_nonce = b.payload_nonce, payload_tag = b.payload_tag,
+            payload_ciphertext = b.payload_ciphertext
+          from (select * from observation where observation_id = ${idB}) b
+          where a.observation_id = ${idA}`.execute(trx);
+        const inside = new ObservationRepository(
+          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock,
+        );
+        await inside.get(idA);
+      }),
+    ).rejects.toBeInstanceOf(CiphertextRejected);
+    // Rolled back: both rows read as they were written.
+    expect((await observations.get(idA)).kind).toBe("payment");
+    expect((await observations.get(idB)).kind).toBe("refund");
+  });
+
+  // The second layer, which the envelope alone does not exercise: a payload
+  // sealed CORRECTLY for this row but carrying another observation's id
+  // inside it. The envelope authenticates it, because every bound column is
+  // this row's; only the comparison after the parse catches it.
+  //
+  // The attacker who can do this holds the data key, and one who holds it can
+  // forge a consistent id too -- so this is not a defence against them. It is
+  // a defence against us: a future path that seals the wrong object under the
+  // right associated data, which is one copy-paste away in promote.
+  it("refuses a payload that opens on this row but names another observation", async () => {
+    const a = await observations.append(anEvent({ source: { ...src, ref: "op:forge:a" } }));
+    const b = await observations.append(anEvent({ source: { ...src, ref: "op:forge:b" } }));
+    const idA = a.observation.observationId!;
+    const row = await db.selectFrom("observation")
+      .select(["namespace_id", "idempotency_key", "evidence_kind", "channel", "kind",
+        "dated_at", "ingested_at", "producer"])
+      .where("observation_id", "=", idA).executeTakeFirstOrThrow();
+    const dataKey = await namespaces.dataKey(row.namespace_id);
+    const forged = seal(
+      dataKey,
+      JSON.stringify({ ...a.observation, observationId: b.observation.observationId }),
+      payloadAad({
+        namespaceId: row.namespace_id,
+        observationId: idA,
+        idempotencyKey: row.idempotency_key,
+        evidenceKind: row.evidence_kind,
+        channel: row.channel,
+        kind: row.kind,
+        producer: row.producer,
+        ingestedAt: row.ingested_at,
+        datedAt: row.dated_at,
+      }),
     );
-    const row = await db.selectFrom("observation").select(["producer"])
-      .where("observation_id", "=", observation.observationId!).executeTakeFirst();
-    expect(row?.producer).toBe("stellar-indexer");
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+        await sql`update observation set payload_nonce = ${forged.nonce},
+            payload_tag = ${forged.tag}, payload_ciphertext = ${forged.ciphertext}
+          where observation_id = ${idA}`.execute(trx);
+        const inside = new ObservationRepository(
+          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock,
+        );
+        await inside.get(idA);
+      }),
+    ).rejects.toThrow(/carries observation id/);
   });
 
   // The schema already refuses a producer that is not a bare lowercase name,

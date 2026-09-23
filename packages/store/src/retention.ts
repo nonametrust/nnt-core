@@ -2,13 +2,21 @@
  * Retention, as the storage card rules it: not deletion but unreadability on
  * a clock.
  *
- * No observation is dropped at write time. A payload is sealed under a key
- * per `(namespace, calendar month)`, and that month key is wrapped under the
- * namespace's own key. A fixed grace after the month closes, the month key is
- * shredded: the payload becomes unreadable while the row skeleton, every
- * foreign key and every audit row stay where they are. A promotion re-seals
- * the rescued payload under the namespace key, which is how a captured trace
- * outlives its month.
+ * No observation is dropped at write time. A payload is to be sealed under a
+ * key per `(namespace, calendar month)`, and that month key is wrapped under
+ * the namespace's own key. A fixed grace after the month closes, the month
+ * key is shredded: the payload becomes unreadable while the row skeleton,
+ * every foreign key and every audit row stay where they are. A promotion
+ * re-seals the rescued payload under the namespace key, which is how a
+ * captured trace outlives its month.
+ *
+ * NOT YET TRUE AT THIS COMMIT, and the tense matters because a reader would
+ * otherwise take it for shipped: `append` still seals under the NAMESPACE
+ * key, nothing outside this module's own tests calls `periodKey`, and
+ * `permanent_record` has no payload columns. So expiring a month currently
+ * makes nothing unreadable. The month key, its table and its guard exist; the
+ * wiring is Task 6, the sweep is Task 7 and the permanent copy is Task 9.
+ * Review measured this by expiring a month and reading the payload back.
  *
  * This module is the arithmetic and the declared numbers only. It touches no
  * database and reads no clock.
@@ -160,9 +168,11 @@ export function periodCloses(period: string): Date {
  * grace after the day it was loaded.
  *
  * It does not assert the policy: a fractional `graceDays` produces a
- * fractional instant here rather than a named refusal. The composition point
- * calls `assertRetentionPolicy` once, and this function trusts it, the way
- * every other arithmetic in this package trusts its validated inputs.
+ * fractional instant here rather than a named refusal. What makes that safe
+ * is that every repository taking a policy asserts it in its constructor, so
+ * an unvalidated policy cannot reach this function from inside the store.
+ * That was a claim about a "composition point" that did not exist until
+ * review pointed out nothing in src called the assertion at all.
  */
 export function expiresAt(period: string, policy: RetentionPolicy): Date {
   return new Date(periodCloses(period).getTime() + policy.graceDays * DAY_MS);

@@ -295,10 +295,14 @@ describe("2. a tag's strength is derivable at an arbitrary instant", () => {
       // (tagging reading.ts, the address_integrity template).
       namespaceId: provider, observationId: idOf(stored.movedAway!),
       channel: "address_integrity", aspect: "transition", g0: 0.6,
-      // From the decision, which stamps the event's own instant. The clock
-      // here happens to agree; on a backfill it would not, and the store
-      // writes what it is handed either way.
-      taggedAt: day(12, "16:50"),
+      // From the decision, which stamps the EVENT's own instant -- 08:15,
+      // when the address moved -- while the clock reads 16:50, when the
+      // decision was made. The two must differ here or this story cannot see
+      // the inversion the card was written to remove: with them equal, `open`
+      // stamping from the clock instead of the decision passes every
+      // assertion below. A mutation audit found exactly that, and the comment
+      // this replaces conceded it ("the clock here happens to agree").
+      taggedAt: day(12, "08:15"),
     });
     await audit("tag.opened", {
       tagId: limboTag.tagId, observationId: limboTag.observationId,
@@ -318,8 +322,11 @@ describe("2. a tag's strength is derivable at an arbitrary instant", () => {
     // The number comes from the curve, not from what makes the test pass.
     // M2's refreshTag holds max(decayedStrength, freshG0), so a fresh
     // deviation weaker than what is already there leaves the decayed value
-    // standing: forty minutes into a seven-day half-life, 0.6 has decayed to
-    // 0.598352… and that is what the decision returns.
+    // standing: nine and a quarter hours from the tag's own instant into a
+    // seven-day half-life, 0.6 has decayed to 0.577533… and that is what the
+    // decision returns. Nine and a quarter hours, not the forty minutes
+    // between the two clock readings, because the decay runs from when the
+    // address moved and not from when anyone noticed.
     const decayed = strengthAt(limboTag, refreshedAt, HALF_LIFE);
     const held = Math.max(decayed, 0.1);
     expect(held).toBe(decayed);
@@ -331,12 +338,16 @@ describe("2. a tag's strength is derivable at an arbitrary instant", () => {
     expect(after.refreshCount).toBe(1);
     // M1's arithmetic took greatest(stored g0, new g0) and would have left
     // 0.6 here. M2's takes the maximum over the DECAYED strength and returns
-    // 0.598352…, which is smaller. The two differ in the twelfth digit and
-    // that difference is the whole substitution this card removed.
+    // 0.577533…, which is smaller, and that difference is the whole
+    // substitution this card removed.
     expect(after.g0).toBe(held);
     expect(after.g0).toBeLessThan(0.6);
-    expect(after.g0).toBeCloseTo(0.598352, 6);
+    expect(after.g0).toBeCloseTo(0.577533, 6);
     expect(after.taggedAt.toISOString()).toBe(refreshedAt.toISOString());
+    // And the tag was opened at the event's instant, not at the clock's. This
+    // is the assertion that makes the story able to see F2 at all.
+    expect(limboTag.taggedAt.toISOString()).toBe(day(12, "08:15").toISOString());
+    expect(limboTag.aspect).toBe("transition");
     expect(await tags.listLive(provider)).toHaveLength(1);
   });
 

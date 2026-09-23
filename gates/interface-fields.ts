@@ -40,8 +40,11 @@ export function fieldsOf(source: string, name: string, where: string): string[] 
         `TypeScript merges them and this gate compares one`,
     );
   }
+  // No second block-comment strip here: line 28 already blanked every block
+  // comment in the source, keeping the newlines, so by this point there are
+  // none left to remove. The strip that used to sit here was unreachable --
+  // a mutation audit found it by deleting it and nothing went red.
   return blocks[0]![1]!
-    .replace(/\/\*[\s\S]*?\*\//g, "")
     .split("\n")
     .map((line) => line.replace(/\/\/.*$/, "").trim())
     .filter((line) => line.length > 0)
