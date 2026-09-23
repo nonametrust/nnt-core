@@ -31,19 +31,51 @@ export const PERIOD_TEXT = (column: RawBuilder<unknown>) =>
   sql<string>`to_char(${column}, 'YYYY-MM-DD')`;
 
 /**
- * Why a month stopped being readable. Two erasures reach the same column by
- * two different routes and a caller that cannot tell them apart will report
- * one as the other: `retention-expiry` is the policy's clock reaching a
- * month, `erased-namespace` is a month swept because the counterparty space
- * it belongs to was erased on request (R18). The compliance record for the
- * second is `namespace.key_shredded_at`, not this sweep.
+ * One month the sweep made unreadable.
+ *
+ * This carried a `reason` of `"retention-expiry" | "erased-namespace"` for
+ * one commit and adversarial review took it apart, correctly. Two things were
+ * wrong with it and both are worth keeping written down, because the union
+ * read as the more careful design and was the less honest one.
+ *
+ * It asserted an exclusivity the data does not have. The sweep's WHERE admits
+ * only rows past their grace, so EVERY row it returns is a retention expiry;
+ * belonging to an erased namespace is an additional fact about the same row,
+ * not an alternative to it. Measured consequence: a month whose grace ran out
+ * three weeks BEFORE its namespace was erased -- a sweep that did not run,
+ * then an erasure request -- came back as `erased-namespace` and vanished
+ * from the retention count, which is exactly the outage case someone would be
+ * counting in order to find.
+ *
+ * And it named a cause the code never reads. The sweep does not select a row
+ * because a namespace was erased; it selects on `expires_at <= now` and then
+ * looks at what the namespace column says AT THAT MOMENT. So the flag is
+ * state, and it is named for state.
+ *
+ * What M4 gets from the pair: the retention count is every row, and
+ * `namespaceErasedAtSweep` says which of those months belonged to a
+ * counterparty space already erased on request. The compliance record for
+ * THAT erasure is `namespace.key_shredded_at` and never this sweep -- these
+ * months had been unreadable through the API since that instant, and what
+ * the sweep changed is that their keys are no longer sitting live under a
+ * dead one.
  */
-export type ExpiryReason = "retention-expiry" | "erased-namespace";
-
 export interface ExpiredPeriod {
   namespaceId: string;
   period: string;
-  reason: ExpiryReason;
+  /**
+   * Whether the namespace was erased on request as of the sweep's snapshot.
+   * Not a cause, and not history: a namespace erased after this sweep reads
+   * false here forever, and one whose key was restored by hand reads false
+   * on the next sweep. Under READ COMMITTED the joined `namespace` row is the
+   * statement's snapshot, so an erasure committing while the sweep is in
+   * flight reads false -- measured, with the sweep blocked on a row lock.
+   */
+  namespaceErasedAtSweep: boolean;
+}
+
+export interface SweepResult {
+  shredded: ExpiredPeriod[];
 }
 
 export interface StoredNamespace {
@@ -318,8 +350,12 @@ export class NamespaceRepository {
   }
 
   /**
-   * The nightly sweep: every month past its grace becomes unreadable, and
-   * nothing else about it changes.
+   * The nightly sweep: every month past its grace loses its key, and nothing
+   * else about it changes. Not quite "becomes unreadable", which is what this
+   * line said until review measured the exception: a month under a namespace
+   * already erased on request has been unreadable through this API since that
+   * erasure, and what the sweep changes for it is that its key is no longer
+   * sitting live under a dead one.
    *
    * One statement, for the reason `shred` is one statement -- the set it acts
    * on and the set it reports are then the same set by construction, and a
@@ -335,9 +371,14 @@ export class NamespaceRepository {
    * `now` from the injected clock, never `now()`, so a simulated day is a
    * simulated day all the way down.
    *
-   * The store writes no audit row here. It never has -- the caller does, and
-   * `acceptance.test.ts:174-182` is where that division is pinned. What this
-   * returns is what that caller needs in order to write one.
+   * The store writes no audit row here, as it never has: the caller writes
+   * it, the way the acceptance story's own `audit()` helper does beside every
+   * other operation. (This cited `acceptance.test.ts:174-182` as "where that
+   * division is pinned" until review read those lines: they are the story's
+   * journal helper, not an assertion that the store writes nothing. The
+   * division is a convention this package keeps, not a gate -- worth knowing
+   * before anyone relies on it.) What this returns is what that caller needs
+   * in order to write one.
    *
    * The two `where` clauses are each a rule. `expires_at <= now` is the
    * retention promise itself; `key_wrapped is not null` is what keeps the
@@ -347,26 +388,41 @@ export class NamespaceRepository {
    * into a no-op.
    *
    * R18: the join, and why the sweep reaches an erased namespace. Such a
-   * namespace keeps its month keys, each still carrying a live wrapped key.
-   * Those keys are unopenable today only because the OUTER key is gone, and
-   * the plan's §2c measures that the realistic attacker on a shred is a
-   * backup restoring that outer key into its own row. Left alone, one restore
-   * returns every month the namespace ever had; swept, it returns only the
-   * months still inside their grace. What the sweep must NOT do is tell M4
-   * these were retention: the compliance record for an erasure request is
-   * `namespace.key_shredded_at`, and a retention count that silently includes
-   * subject requests measures neither of the two questions it would be read
-   * for. So the reason is read from the namespace's own column in the same
-   * statement. The foreign key guarantees exactly one matching row, so the
-   * join changes which rows are swept not at all.
+   * namespace keeps its month keys, each still carrying a live wrapped key,
+   * and sweeping them keeps those past-grace months under the same two dead
+   * keys a live namespace's expired months get. A filter would leave them
+   * under one.
    *
-   * The instant is `now` for both kinds, and not the erasure request's
-   * instant for the second, truer though that one would be:
-   * `namespace_key_shred_not_early` refuses a `shredded_at` before
-   * `expires_at`, and an erasure request is usually earlier. The reason field
-   * carries what the instant cannot.
+   * That is the whole claim, and it is deliberately smaller than the one this
+   * comment made first. It said a restore of the outer key recovers, after a
+   * sweep, "only the months still inside their grace". Review measured all
+   * three parts. True for an attacker who restores exactly ONE row, the
+   * namespace's, into its own row: unswept months then opened, swept months
+   * refused. False for the backup §2c actually names, which holds the
+   * `namespace_key` rows too and restores both tables: everything came back,
+   * swept or not. And false against the disk in any case -- pageinspect read
+   * the swept keys out of dead heap tuples before a vacuum, and
+   * pg_walinspect found each one in the mint's WAL record afterwards. So the
+   * sweep is strictly better than a filter, and it is better only through
+   * this API and only against that one narrow restore. Outward, §2c's limit
+   * stands unchanged.
+   *
+   * The foreign key guarantees exactly one matching namespace row, so the
+   * join changes which rows are swept not at all. What it adds is
+   * `namespaceErasedAtSweep`, per row, read from the namespace's own column
+   * in the same statement -- a snapshot under READ COMMITTED rather than a
+   * serialization, so an erasure committing while this statement is in
+   * flight reads false. Measured by blocking the sweep on a row lock; the
+   * window is one statement and the recorded instants stay ordered.
+   *
+   * The instant is `now` for every row. For a month whose namespace was
+   * erased BEFORE the month's own expiry, `namespace_key_shred_not_early`
+   * refuses the erasure instant outright, so `now` is forced. For one erased
+   * after it, the earlier instant would be accepted and `now` is a
+   * uniformity choice rather than a forced one -- review measured both, and
+   * the ruling's one-line justification covered only the first.
    */
-  async expirePeriods(): Promise<{ shredded: ExpiredPeriod[] }> {
+  async expirePeriods(): Promise<SweepResult> {
     const now = this.clock.now();
     const swept = await sql<{ namespace_id: string; period: string; erased: boolean }>`
       update namespace_key k
@@ -379,11 +435,24 @@ export class NamespaceRepository {
                 ${PERIOD_TEXT(sql`k.period`)} as period,
                 (n.data_key_wrapped is null) as erased`.execute(this.db);
     return {
-      shredded: swept.rows.map((row) => ({
-        namespaceId: row.namespace_id,
-        period: row.period,
-        reason: row.erased ? "erased-namespace" : "retention-expiry",
-      })),
+      shredded: swept.rows
+        .map((row) => ({
+          namespaceId: row.namespace_id,
+          period: row.period,
+          namespaceErasedAtSweep: row.erased,
+        }))
+        // Sorted here rather than in SQL, because `UPDATE ... RETURNING`
+        // cannot be ordered without wrapping the whole statement in a CTE and
+        // the statement being one statement is load-bearing. Sorted at all
+        // because review measured the unsorted order to be HEAP order --
+        // interleaved by insertion, and free to change across a vacuum or a
+        // restore. An M4 audit body built from an array that reorders itself
+        // between runs is not reproducible, and reproducibility is the whole
+        // point of the row it will write.
+        .sort((a, b) =>
+          a.namespaceId === b.namespaceId
+            ? a.period.localeCompare(b.period)
+            : a.namespaceId.localeCompare(b.namespaceId)),
     };
   }
 
