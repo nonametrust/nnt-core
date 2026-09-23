@@ -139,8 +139,17 @@ export class NamespaceRepository {
    * would mint a fresh key for a month that had been expired, quietly undoing
    * the erasure. `do nothing` leaves an expired row exactly as it is.
    *
-   * `dataKey` is read first, so a shredded namespace refuses before any row is
-   * written: there is no inner key to mint under a null outer one. That is
+   * `dataKey` is read first, so a shredded namespace is refused rather than
+   * minted under: there is no inner key to mint under a null outer one.
+   *
+   * That ordering is not a transactional guarantee and the docstring used to
+   * imply it was. Nothing spans the read and the insert, so a shred that
+   * commits in between leaves a row whose own columns say the month is live;
+   * measured, it happens in every interleaving tried. It is not an evasion --
+   * the outer key is gone, so `openPeriodKey` raises NamespaceShredded and
+   * the month key can never be unwrapped by anyone -- but a row that reads as
+   * live under an erased counterparty is worth knowing about before someone
+   * writes a report off these columns. That is
    * also the restatement M1's re-key argument needed once period keys existed
    * (F9): a namespace shred is total because the outer key is gone, not
    * because readable and unreadable rows may not sit behind one marker --
@@ -201,6 +210,14 @@ export class NamespaceRepository {
    * month expired, when the counterparty space was erased on request, would
    * go looking for a retention sweep instead of the erasure that actually
    * happened. The namespace is the outer key and its refusal wins.
+   *
+   * `periodKey` compares nothing to the clock, so minting a month that is
+   * already past its grace produces a live key: a backfill of 2020 under a
+   * 2026 clock is readable until the next sweep reaches it. That follows from
+   * R2 (expiry comes from the period, never from the clock) and is left to
+   * Task 7's sweep rather than refused here, because refusing it would drop
+   * the observation at write time, which is the one thing this design does
+   * not do.
    *
    * A period with no row is a caller defect rather than a store condition --
    * the only reader is a path whose row already exists - so it is a plain

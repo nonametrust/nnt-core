@@ -2,7 +2,8 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { namespaceRefSchema } from "@nonametrust/schema";
 import { sql } from "kysely";
-import type { Db } from "../db.js";
+import type { Db, Schema } from "../db.js";
+import type { Selectable } from "kysely";
 import { withSchema } from "../testing/harness.js";
 import { keyRingFromEnv, newDataKey, periodKeyAad, unwrapUnder } from "../crypto.js";
 import { fixedClock } from "../clock.js";
@@ -564,6 +565,32 @@ describe("the month key", () => {
 // 2026-08-31T21:00Z east of Greenwich and the wrong month's key is looked up,
 // silently. Every select of `period` renders it as text for that reason.
 describe("the period column under a skewed zone", () => {
+  // The read type is the rule, and the rule was held by its own declaration:
+  // changing `period` back to a readable `string` left the suite green and
+  // the typecheck clean, because nothing ever selected it.
+  //
+  // A `@ts-expect-error` on the select itself does NOT pin it -- selecting a
+  // `never` column compiles perfectly well, you simply get `never` back --
+  // and the first version of this test asserted exactly that non-error and so
+  // failed in both directions. The rule is about the TYPE THAT COMES BACK, so
+  // that is what is asserted: the tuple wrapper stops `never` distributing,
+  // and assigning `true` to `false` is the compile error when the read type
+  // widens to anything at all.
+  //
+  // tsconfig.test.json has `"exclude": []`, so this file is typechecked and
+  // the line below is enforced by `pnpm typecheck`, not by vitest.
+  it("cannot be read as anything but text, by the type", () => {
+    // With `never` on the read side Kysely drops the key from Selectable
+    // altogether, so the column is not merely typed as nothing -- it cannot
+    // be named in a select at all. Widen the declaration back to `string` and
+    // the key reappears, `true` no longer assigns to `false`, and the build
+    // fails. That is the whole pin.
+    type PeriodIsUnreadable =
+      "period" extends keyof Selectable<Schema["namespace_key"]> ? false : true;
+    const unreadable: PeriodIsUnreadable = true;
+    expect(unreadable).toBe(true);
+  });
+
   it("round-trips the same month in every zone the process might run in", async () => {
     const was = process.env.TZ;
     try {
@@ -597,6 +624,39 @@ describe("what the namespace_key table refuses to hold", () => {
           values (${ns}, date '2026-09-15', ${Buffer.alloc(61)}, ${new Date("2027-01-01")}, null, ${clock.now()})`
         .execute(db),
     ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_period_is_month" });
+  });
+
+  // The constraint pins its UTC conversion instead of inheriting the
+  // session's, and nothing held that: the naive form
+  // `expires_at >= period + interval '1 month'` passes this whole suite,
+  // because under a UTC or an eastern session it is equal to or looser than
+  // the pinned one. It is only visibly wrong west of Greenwich, and that is
+  // where nobody runs the tests.
+  //
+  // `set local` is scoped to this transaction, so a pooled connection carries
+  // nothing out of it. The row is a zero-grace mint at exactly the UTC close:
+  // the pinned form admits it, and the naive form demands 04:00Z under New
+  // York and would refuse it.
+  it("measures the close in UTC and not in the session's zone", async () => {
+    const ns = (await repo.ensure({ kind: "wallet", id: "RAWPERIODTZ" })).namespaceId;
+    await db.transaction().execute(async (trx) => {
+      await sql`set local timezone = 'America/New_York'`.execute(trx);
+      await sql`insert into namespace_key
+          (namespace_id, period, key_wrapped, expires_at, shredded_at, created_at)
+        values (${ns}, date '2026-09-01', ${Buffer.alloc(61)},
+          ${new Date("2026-10-01T00:00:00.000Z")}, null, ${clock.now()})`.execute(trx);
+      // And the naive form, built here, refuses the row the shipped one just
+      // took -- which is the whole reason the shipped one is written the way
+      // it is, asserted rather than left in a comment.
+      await sql`create temp table naive_probe (
+        period date not null, expires_at timestamptz not null,
+        constraint naive check (expires_at >= period + interval '1 month')
+      ) on commit drop`.execute(trx);
+      await expect(
+        sql`insert into naive_probe values (date '2026-09-01', ${new Date("2026-10-01T00:00:00.000Z")})`
+          .execute(trx),
+      ).rejects.toMatchObject({ code: "23514", constraint: "naive" });
+    });
   });
 
   it("refuses an expiry before the period closes, by name", async () => {

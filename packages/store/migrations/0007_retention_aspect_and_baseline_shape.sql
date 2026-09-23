@@ -264,16 +264,29 @@ alter table observation
 -- tests use, and the same shape M2 chose for lowering the saturation ceiling
 -- ("a policy change becomes a data migration, loudly rather than silently").
 --
--- Two things that migration must do, both measured rather than assumed.
+-- Three things that migration must do, all measured on 17.7 rather than
+-- assumed.
+--
+-- ALL THREE STATEMENTS IN ONE TRANSACTION. This is the one that matters and
+-- an earlier version of this comment did not say it. `alter table ... disable
+-- trigger` is transactional, so inside a transaction it takes
+-- ShareRowExclusiveLock and every other writer blocks until commit -- the
+-- guard is never off for anyone else, and a rollback restores it. Run as
+-- three statements in psql autocommit it is the opposite: the trigger is off
+-- for EVERY session in between, and a concurrent UPDATE of expires_at from an
+-- unrelated backend succeeds and is never refused afterwards. That was
+-- measured, not feared. migrate.ts already wraps each file in a transaction,
+-- so a migration file is safe by construction; a hand-run sequence is not.
+--
 -- Scope it `where shredded_at is null`: with the trigger off, lengthening a
 -- grace over an already-expired row is refused by
 -- namespace_key_shred_not_early and aborts the whole statement, and
 -- SHORTENING one is admitted, which would rewrite the basis of a compliance
--- record that has already been acted on. And set a lock_timeout: `alter
--- table ... disable trigger` takes ShareRowExclusiveLock, so it queues behind
--- every in-flight append and every writer queues behind it until commit.
--- (It is transactional on 17.7 -- a rollback restores the trigger -- so the
--- window cannot be left open by a failure.)
+-- record that has already been acted on.
+--
+-- Set a lock_timeout. The ALTER queues behind every in-flight writer and
+-- every writer queues behind it; without a timeout it waits indefinitely,
+-- with one it fails cleanly as 55P03.
 -- Without that sentence written down, the guard below reads as "expiry can
 -- never change", which is not what is meant.
 --

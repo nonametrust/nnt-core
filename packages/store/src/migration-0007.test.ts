@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { copyFileSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
@@ -7,11 +7,12 @@ import { sql } from "kysely";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { openDb, type Db } from "./db.js";
 import { migrate } from "./migrate.js";
-import { requireTestUrl, urlForSchema } from "./testing/harness.js";
+import { requireTestUrl, sweepTempDirs, urlForSchema } from "./testing/harness.js";
 
 const url = requireTestUrl();
 const MIGRATIONS = fileURLToPath(new URL("../migrations/", import.meta.url));
 const schemaName = "migration_0007_test";
+const PREFIX = "nnt-0007-";
 
 let db: Db;
 let dir: string;
@@ -22,7 +23,12 @@ beforeAll(async () => {
   await sql.raw(`create schema ${schemaName}`).execute(admin);
   await admin.destroy();
   db = openDb(urlForSchema(url, schemaName));
-  dir = mkdtempSync(join(tmpdir(), "nnt-0007-"));
+  // Sweep this file's own leftovers before making a new one. afterAll removes
+  // the directory on any ordinary failure, but a SIGKILL leaves it behind and
+  // they accumulate; the schema harness drops on ENTRY for the same reason,
+  // so nothing depends on teardown having happened.
+  sweepTempDirs(PREFIX);
+  dir = mkdtempSync(join(tmpdir(), PREFIX));
 });
 
 afterAll(async () => {
@@ -114,7 +120,7 @@ describe("0007 over stored observations", () => {
   // fails -- so a deployment in that state must still migrate.
   it("runs over an empty observation table, even with other rows present", async () => {
     const fresh = `${schemaName}_fresh`;
-    const freshDir = mkdtempSync(join(tmpdir(), "nnt-0007-fresh-"));
+    const freshDir = mkdtempSync(join(tmpdir(), `${PREFIX}fresh-`));
     const admin = openDb(url);
     await sql.raw(`drop schema if exists ${fresh} cascade`).execute(admin);
     await sql.raw(`create schema ${fresh}`).execute(admin);
@@ -144,5 +150,18 @@ describe("0007 over stored observations", () => {
       await cleanup.destroy();
       rmSync(freshDir, { recursive: true, force: true });
     }
+  });
+});
+
+// A killed run leaves its temp directory behind, so the sweep is what stops
+// them accumulating. Held here rather than trusted: the mutant that deletes
+// the sweep call leaves the whole suite green.
+describe("the suite's own leftovers", () => {
+  it("sweeps stale temp directories by prefix, the way a killed run leaves them", () => {
+    const stale = join(tmpdir(), `${PREFIX}stale-probe`);
+    mkdirSync(stale, { recursive: true });
+    expect(readdirSync(tmpdir()).filter((n) => n.startsWith(PREFIX)).length).toBeGreaterThan(0);
+    sweepTempDirs(`${PREFIX}stale-probe`);
+    expect(readdirSync(tmpdir()).filter((n) => n.startsWith(`${PREFIX}stale-probe`))).toEqual([]);
   });
 });
