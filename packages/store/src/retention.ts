@@ -10,13 +10,17 @@
  * re-seals the rescued payload under the namespace key, which is how a
  * captured trace outlives its month.
  *
- * NOT YET TRUE AT THIS COMMIT, and the tense matters because a reader would
- * otherwise take it for shipped: `append` still seals under the NAMESPACE
- * key, nothing outside this module's own tests calls `periodKey`, and
- * `permanent_record` has no payload columns. So expiring a month currently
- * makes nothing unreadable. The month key, its table and its guard exist; the
- * wiring is Task 6, the sweep is Task 7 and the permanent copy is Task 9.
- * Review measured this by expiring a month and reading the payload back.
+ * Shipped so far: the month key, its table and its guard (Task 5), and the
+ * wiring -- `append` seals under the month key and `read` opens under it
+ * (Task 6), so expiring a month now does make its payloads unreadable through
+ * every path the store offers. What is NOT shipped: the sweep that expires a
+ * month on a clock (Task 7), so today expiry only happens when something
+ * writes the shred by hand; and the permanent copy that lets a promoted trace
+ * outlive its month (Task 9), so `permanent_record` still holds no payload.
+ *
+ * "Unreadable" means through this store's API. It is not erasure from the
+ * disk: see the plan's §2c, which records what a holder of the master key and
+ * the filesystem can still recover.
  *
  * This module is the arithmetic and the declared numbers only. It touches no
  * database and reads no clock.

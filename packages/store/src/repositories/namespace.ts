@@ -27,7 +27,7 @@ import { assertRetentionPolicy, expiresAt, type RetentionPolicy } from "../reten
  * rather than immutable, which would matter in a check constraint or an index
  * and does not matter here.
  */
-const PERIOD_TEXT = (column: RawBuilder<unknown>) =>
+export const PERIOD_TEXT = (column: RawBuilder<unknown>) =>
   sql<string>`to_char(${column}, 'YYYY-MM-DD')`;
 
 export interface StoredNamespace {

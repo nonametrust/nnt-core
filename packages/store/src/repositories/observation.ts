@@ -11,7 +11,7 @@ import { periodOf } from "../retention.js";
 import {
   CiphertextRejected, IdempotencyKeyMismatch, ObservationNotFound, mapPgError,
 } from "../errors.js";
-import type { NamespaceRepository } from "./namespace.js";
+import { PERIOD_TEXT, type NamespaceRepository } from "./namespace.js";
 
 export interface AppendResult {
   observation: Observation;
@@ -86,11 +86,25 @@ export class ObservationRepository {
     const dated = datedAt(stored);
     const datedColumn = dated === null ? null : new Date(dated);
 
-    // The month the payload is keyed under, from INGEST time: a new
-    // observation therefore always lands in the month it is written in, which
-    // has not closed and so cannot be expired. Minting is idempotent and
-    // never revives an expired month, so a re-delivery of an old month finds
-    // the row exactly as retention left it.
+    // The month the payload is keyed under, from INGEST time, so a new
+    // observation lands in the month it is written in. Minting is idempotent
+    // and never revives an expired month, so a re-delivery of an old month
+    // finds the row exactly as retention left it.
+    //
+    // A previous version of this comment said a new observation can THEREFORE
+    // never land in an expired month. That is false and review measured it:
+    // with `graceDays: 0` -- a policy assertRetentionPolicy explicitly admits
+    // -- a month expires at its own close, so a sweep running at 00:00 on the
+    // first can shred the month an append captured its instant in at
+    // 23:59:59.999 the night before. The append then throws PayloadExpired
+    // and the observation is dropped at write time, which is the one thing
+    // this design says it does not do.
+    //
+    // The general condition is that the grace must exceed the skew between
+    // the appending clock and the sweeping one; at the shipped ninety days it
+    // is unreachable outside a simulated clock. It is recorded in the plan's
+    // §2c rather than fixed here, because the fix is a shape for the result
+    // of `append` and that shape belongs to Task 8.
     //
     // Minted before the insert because the foreign key requires the row, and
     // the foreign key exists so that this ordering is a constraint rather
@@ -175,14 +189,22 @@ export class ObservationRepository {
     // driver Date is local midnight, which is the previous month's last day
     // east of UTC, and the key it would then look up is the wrong one.
     //
-    // `to_char` with an explicit pattern rather than `period::text`, which
-    // renders through the session's DateStyle. That is the second of two
-    // defences and neither is individually necessary -- measured: mutate
-    // either alone and the suite stays green, because the connection pins
-    // DateStyle=ISO and under ISO the two renderings agree. Mutate BOTH and
-    // it fails. So do not remove one as redundant: redundant is what they
-    // are for, and the pin is a session setting a future deployment could
-    // lose.
+    // Through the shared PERIOD_TEXT rather than a second copy of the format
+    // string: one pattern in two files is the drift this docstring warns
+    // about everywhere else.
+    //
+    // Honest about what this buys: NOT much, and a previous version of this
+    // comment claimed a joint defence that review showed does not exist. The
+    // connection pins DateStyle=ISO, and under ISO the two renderings are the
+    // same string. Under a non-ISO style the read fails earlier anyway --
+    // node-pg cannot parse the timestamptz text the server sends and every
+    // instant arrives as null -- and the period lookup would still have
+    // worked, because Postgres parses '01.09.2026'::date in the same session
+    // that rendered it. So the PIN is the defence; this is a belt, kept
+    // because it costs nothing and does not depend on a session setting, and
+    // it is held by no test. Said plainly rather than dressed up: the earlier
+    // claim that mutating both together failed was true only because
+    // removing the pin breaks the pin's OWN unit test.
     const found = await sql<{
       observation_id: string; namespace_id: string; idempotency_key: string;
       evidence_kind: string; channel: string; kind: string;
@@ -190,7 +212,7 @@ export class ObservationRepository {
       payload_nonce: Buffer; payload_tag: Buffer; payload_ciphertext: Buffer;
     }>`
       select observation_id, namespace_id, idempotency_key, evidence_kind, channel, kind,
-             dated_at, ingested_at, producer, to_char(period, 'YYYY-MM-DD') as period,
+             dated_at, ingested_at, producer, ${PERIOD_TEXT(sql`period`)} as period,
              payload_nonce, payload_tag, payload_ciphertext
       from observation
       where ${sql.ref(column)} = ${value}`.execute(this.db);

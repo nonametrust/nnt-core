@@ -254,6 +254,40 @@ three-hundred-candidate dictionary recovered 3 of 3 source references of a
 shredded namespace. So "which on-ledger operations were observed about this
 wallet" survives erasure.
 
+**Shredding a key erases nothing from the disk, and this is the one that most
+needs saying.** Both shreds are an UPDATE that nulls a column, so:
+
+- the previous heap tuple, carrying the wrapped key, stays on the page until
+  vacuum reaches it. Review read it back with `pageinspect` and opened an
+  expired month's payload from it; a plain `VACUUM` removed the bytes, and on
+  a six-row table autovacuum may not run for a long time.
+- the WAL record of the original INSERT carries the wrapped key. Review did a
+  **blind** scan of `pg_wal` -- no prior copy of the key, only the public
+  `(namespace, period)` binding -- found a wrapped key that authenticated, and
+  opened the payload, *after* `VACUUM FULL`. `wal_compression=off`,
+  `wal_level=replica`, which are the defaults.
+
+So anything that archives WAL, streams to a replica or takes base backups
+keeps every month key and every namespace key for as long as it keeps those,
+and "the key is gone" is true only of the live heap after vacuum. This is a
+property of shred-by-UPDATE on Postgres rather than anything this card chose,
+and it is exactly what the sentence "shredding that key is what retention is"
+rests on. Until there is a WAL-retention and backup policy shorter than the
+erasure promise, the defensible claim is **unreadable through the store's
+API**, and the card should not say more than that anywhere it faces outward.
+
+**A new observation CAN land in an expired month, so the write-time rule has a
+condition.** "No observation is dropped at write time" is the rule this design
+does not bend, and the branch asserted in three places that the period coming
+from ingest time makes it automatic. It does not. With `graceDays: 0`, which
+`assertRetentionPolicy` admits as a policy, a month expires at its own close:
+an append that captured its instant at 23:59:59.999 and a sweep that runs at
+00:00:00.000 leave the append throwing `PayloadExpired` with nothing stored.
+Reproduced end to end. The general condition is that the grace must exceed the
+skew between the appending clock and the sweeping one; at ninety days it is
+unreachable outside a simulated clock. Pinned by a test so Task 8, which owns
+the shape of what `append` returns, changes it deliberately.
+
 *Not decided here.* The fix, if it is one, is to derive the idempotency key
 under a per-namespace HMAC, which is possible because the only reader is the
 retry pre-read and that already refuses on a shredded namespace. It touches
@@ -313,6 +347,29 @@ removes it from `Selectable`, but Kysely takes select names from the table
 type, so `.select(["period"])` compiles and hands back a driver `Date` at
 local midnight. Read it through `periodsOf`, or with `to_char(period,
 'YYYY-MM-DD')`.
+
+**Tasks 7 and 11: every repository touching one namespace must be built from
+the SAME policy object.** R16 made `periodKey` refuse a stored expiry that its
+own policy did not compute, so a second repository under a different grace is
+a `PeriodKeyAltered` on the next append to that namespace -- measured. Task 7's
+text says "Override `graceDays` to 7 in this test" and both test files hold
+file-level repositories under `RETENTION_V0`: append the fixture through one
+and sweep with the other and either nothing is shredded at +7, or the next
+append there refuses. Build the whole fixture from the overridden policy, or
+use a namespace no file-level repository touches.
+
+**Task 7: `returning namespace_id::text, to_char(period, 'YYYY-MM-DD')`, not
+`period::text`.** The plan's text says `::text`, which R17 replaced. Under the
+connection's ISO pin the two agree, so a `::text` implementation stays green
+and the divergence survives review -- this branch already recorded that pair
+as an equivalent mutant. `PERIOD_TEXT` in `namespace.ts` is the shared form.
+
+**Task 7 owes a ruling on already-shredded namespaces.** The sweep as written
+also nulls month keys belonging to namespaces that were erased on request --
+their `namespace_key` rows still carry a key -- and returns those periods to
+M4's audit as retention expiries. Reads are unaffected, since `openPeriodKey`
+answers `NamespaceShredded` first; what needs deciding is whether the sweep
+filters them out or reports them and says what they are.
 
 **Task 8: the policy must be the same object.** `ObservationRepository` gains
 a `RetentionPolicy` beside `NamespaceRepository`'s. Two repositories handed

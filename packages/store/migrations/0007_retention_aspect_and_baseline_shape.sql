@@ -464,10 +464,14 @@ create trigger namespace_key_guarded
 -- dropped at write time. R1 argues it; this column is where it becomes a
 -- fact, and the check below is what stops the two drifting.
 --
--- It also means a NEW observation can never land in an expired month: its
--- period is the month it is being written in, and that month has not closed,
--- so its key cannot yet be shreddable. The only expired-month case is a
--- RE-delivery of something already stored, which is Task 8's.
+-- A new observation therefore lands in the month it is written in, and under
+-- the shipped ninety-day grace that month cannot already be expired. Not
+-- "never", which is what this comment used to say: with a zero grace -- a
+-- policy the arithmetic admits -- a month expires at its own close, and a
+-- sweep at 00:00 on the first can shred the month an append captured its
+-- instant in moments earlier. Measured, not supposed. The plan's §2c records
+-- it; the mechanism is Task 8's, because the fix is a shape for what `append`
+-- returns.
 alter table observation add column period date not null;
 
 -- The immutable form, and the choice is measured rather than stylistic.

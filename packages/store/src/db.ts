@@ -18,13 +18,19 @@ export interface Schema {
   };
   // The month key, one row per (namespace, calendar month).
   //
-  // `period` is typed as a string on the way in and out and is NEVER
-  // selectable as a driver Date: the driver parses a `date` at LOCAL
-  // midnight, so east of UTC a round-tripped 2026-09-01 comes back as
-  // 2026-08-31T21:00Z and looks up the wrong month's key with nothing to
-  // show for it. Every select renders it `period::text`. The `never` on the
-  // update side is the other half of the guard's rule: the column is fixed
-  // at mint and the type says so before the trigger has to.
+  // `period` goes in as a string and is NEVER read back as a driver Date:
+  // the driver parses a `date` at LOCAL midnight, so east of UTC a
+  // round-tripped 2026-09-01 comes back as 2026-08-31T21:00Z and looks up
+  // the wrong month's key with nothing to show for it. Every read renders it
+  // through PERIOD_TEXT. The `never` on the update side is the other half of
+  // the guard's rule: the column is fixed at mint and the type says so
+  // before the trigger has to.
+  //
+  // What `never` on the READ side buys is narrower than it looks: it removes
+  // the column from `Selectable`, but Kysely takes select names from the
+  // table type, so `.select(["period"])` still compiles and hands back
+  // `never`, which assigns to anything. It is documentation with teeth on
+  // the row shape, not a barrier.
   namespace_key: {
     namespace_id: string;
     // `never` on the SELECT side, not `string`: the driver returns a Date for

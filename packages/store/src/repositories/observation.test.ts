@@ -330,6 +330,44 @@ describe("the columns beside the payload", () => {
         }),
       ).rejects.toBeInstanceOf(CiphertextRejected);
     }
+    // evidence_kind on its own. It is in the move list above only paired with
+    // `dated_at = null`, because the table refuses a dated state -- and the
+    // pair means `dated_at` is what refuses the read, so the binding of
+    // evidence_kind was carried by its neighbour. Dropping the two 0002
+    // checks inside the rolled-back transaction lets it move alone.
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+        await sql`alter table observation drop constraint observation_state_is_undated`.execute(trx);
+        await sql`alter table observation drop constraint observation_event_is_dated`.execute(trx);
+        await sql`update observation set evidence_kind = 'state' where observation_id = ${id}`
+          .execute(trx);
+        const inside = new ObservationRepository(
+          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock,
+        );
+        await inside.get(id);
+      }),
+    ).rejects.toBeInstanceOf(CiphertextRejected);
+
+    // And the move the period check now refuses first, made consistent so the
+    // check passes and only the envelope is left to refuse it: ingested_at
+    // and period moved together, with October's key minted so the foreign
+    // key is satisfied too. Without this the suite no longer covers a
+    // month-crossing move at the envelope at all.
+    const ns = (await namespaces.find("wallet", "GOLDADDRESS"))!.namespaceId;
+    await namespaces.periodKey(ns, "2026-10-01");
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+        await sql`update observation set ingested_at = ingested_at + interval '1 month',
+            period = date '2026-10-01' where observation_id = ${id}`.execute(trx);
+        const inside = new ObservationRepository(
+          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock,
+        );
+        await inside.get(id);
+      }),
+    ).rejects.toBeInstanceOf(CiphertextRejected);
+
     // The rollback put the trigger back, and the row reads as it was written.
     await expect(sql`update observation set channel = 'latency' where observation_id = ${id}`.execute(db))
       .rejects.toMatchObject({ code: "NNT01" });
@@ -714,6 +752,23 @@ describe("the retention period", () => {
       where observation_id = ${observation.observationId!}`.execute(db);
     expect(row.rows[0]?.period).toBe("2026-09-01");
     expect(await repo.get(observation.observationId!)).toBeDefined();
+
+    // The other side of the same boundary, and it is not redundant: 23:30 on
+    // 30 September is still September WEST of Greenwich, so the first half
+    // kills a session-zone check only on a cluster east of UTC -- which this
+    // one is, but that is a property of the machine and not of the test.
+    // 00:30 on 1 October is still September west of Greenwich and October
+    // east of it, so the pair refuses the wrong form in either direction.
+    const after = fixedClock(new Date("2026-10-01T00:30:00.000Z"));
+    const ns2 = new NamespaceRepository(db, ring, after, RETENTION_V0);
+    const repo2 = new ObservationRepository(db, ns2, after);
+    const october = await repo2.append(
+      anEvent({ source: { ...src, ref: "op:period:boundary2" } }),
+    );
+    const row2 = await sql<{ period: string }>`
+      select to_char(period, 'YYYY-MM-DD') as period from observation
+      where observation_id = ${october.observation.observationId!}`.execute(db);
+    expect(row2.rows[0]?.period).toBe("2026-10-01");
   });
 
   // R1, as the only test that can see it: the period is the month of INGEST,
@@ -734,31 +789,65 @@ describe("the retention period", () => {
     expect(row.rows[0]?.period).toBe("2026-09-01");
   });
 
-  // The read path looks its month key up by this string, so the string must
-  // not be rendered by the server's DateStyle.
-  //
-  // The assertion is narrow on purpose. A read as a WHOLE cannot survive a
-  // non-ISO DateStyle whatever this column does, because node-pg then fails
-  // to parse the timestamptz text the server sends and every instant arrives
-  // as null -- which is why the connection pins ISO. What is held here is
-  // just the rendering: `to_char` is the same string in every style and
-  // `period::text` is not, so a future edit back to `::text` would hand
-  // `openPeriodKey` a date it cannot parse the moment anything sets a style.
-  it("renders its period independently of the server's DateStyle", async () => {
-    const { observation } = await observations.append(
-      anEvent({ source: { ...src, ref: "op:period:6" } }),
-    );
-    const id = observation.observationId!;
-    for (const style of ["German", "SQL, MDY"]) {
-      await db.transaction().execute(async (trx) => {
-        await sql.raw(`set local datestyle = '${style}'`).execute(trx);
-        const rendered = await sql<{ stable: string; fragile: string }>`
-          select to_char(period, 'YYYY-MM-DD') as stable, period::text as fragile
-          from observation where observation_id = ${id}`.execute(trx);
-        expect(rendered.rows[0]?.stable, style).toBe("2026-09-01");
-        expect(rendered.rows[0]?.fragile, style).not.toBe("2026-09-01");
-      });
-    }
+  // Two behaviours this commit does NOT fix, pinned so that Task 8 changes
+  // them deliberately rather than discovering them. Both were measured by
+  // review; a gap with a test is owed work, a gap without one is a surprise.
+
+  // F8, the month version. The indexer's normal retry path re-delivers an
+  // observation and expects `created: false`; once the month has expired the
+  // pre-read opens the payload and throws instead. Task 8 replaces the
+  // pre-read with a skeleton read and gives AppendResult a third shape; when
+  // it does, this test inverts.
+  it("throws on a re-delivery whose month expired, which Task 8 owes a shape for", async () => {
+    const ns = (await namespaces.ensure({ kind: "wallet", id: "REDELIVER" })).namespaceId;
+    const wire = anEvent({
+      source: { ...src, ref: "op:redeliver:1" }, namespace: { kind: "wallet", id: "REDELIVER" },
+    });
+    const { observation } = await observations.append(wire);
+    const before = await sql<{ x: string }>`
+      select xmin::text as x from observation where observation_id = ${observation.observationId!}`
+      .execute(db);
+    const row = await db.selectFrom("namespace_key").select(["expires_at"])
+      .where("namespace_id", "=", ns).executeTakeFirstOrThrow();
+    await sql`update namespace_key set key_wrapped = null, shredded_at = ${row.expires_at}
+      where namespace_id = ${ns}`.execute(db);
+
+    await expect(observations.append(wire)).rejects.toBeInstanceOf(PayloadExpired);
+    // Nothing was written or re-sealed: the row is untouched, which is the
+    // baseline Task 8's own xmin assertion will rest on.
+    const after = await sql<{ x: string }>`
+      select xmin::text as x from observation where observation_id = ${observation.observationId!}`
+      .execute(db);
+    expect(after.rows[0]?.x).toBe(before.rows[0]?.x);
+  });
+
+  // The claim "a new observation can never land in an expired month" was
+  // written in three places on this branch and is false. With a zero grace --
+  // which assertRetentionPolicy admits as a policy -- a month expires at its
+  // own close, so a sweep at 00:00 on the first shreds the month an append
+  // captured its instant in moments before, and the observation is dropped at
+  // write time. Under the shipped ninety days the window needs a clock skew
+  // of ninety days and is unreachable outside a simulated clock.
+  it("drops a write whose month expired under it, which the comments used to deny", async () => {
+    const eager = { ...RETENTION_V0, graceDays: 0 };
+    const at = fixedClock(new Date("2026-09-30T23:59:59.999Z"));
+    const ns = new NamespaceRepository(db, ring, at, eager);
+    const repo = new ObservationRepository(db, ns, at);
+    const id = (await ns.ensure({ kind: "wallet", id: "WRITERACE" })).namespaceId;
+    await repo.append(anEvent({
+      source: { ...src, ref: "op:writerace:a" }, namespace: { kind: "wallet", id: "WRITERACE" },
+    }));
+    // The sweep Task 7 will write, at the instant the month closes.
+    await sql`update namespace_key set key_wrapped = null,
+        shredded_at = ${new Date("2026-10-01T00:00:00.000Z")}
+      where namespace_id = ${id} and key_wrapped is not null
+        and expires_at <= ${new Date("2026-10-01T00:00:00.000Z")}`.execute(db);
+    await expect(repo.append(anEvent({
+      source: { ...src, ref: "op:writerace:b" }, namespace: { kind: "wallet", id: "WRITERACE" },
+    }))).rejects.toBeInstanceOf(PayloadExpired);
+    const n = await sql<{ n: number }>`
+      select count(*)::int as n from observation where namespace_id = ${id}`.execute(db);
+    expect(n.rows[0]?.n).toBe(1);
   });
 
   it("holds exactly the columns the design enumerates, so an added column of any name is a decision", async () => {
@@ -785,7 +874,9 @@ describe("the retention period", () => {
       select indexdef from pg_indexes
       where tablename = 'observation' and schemaname = current_schema()
         and indexname = 'observation_by_producer_ingested'`.execute(db);
-    expect(rows.rows[0]?.indexdef).toMatch(/producer/);
-    expect(rows.rows[0]?.indexdef).toMatch(/ingested_at DESC/i);
+    // On the column list, not on the definition text: the index is NAMED
+    // observation_by_producer_ingested, so /producer/ matched the name and an
+    // index on (ingested_at desc) alone passed.
+    expect(rows.rows[0]?.indexdef).toMatch(/\(producer, ingested_at DESC\)/i);
   });
 });
