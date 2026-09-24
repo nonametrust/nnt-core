@@ -265,11 +265,26 @@ describe("idempotency", () => {
     } as unknown as NamespaceRepository;
     const broken = new ObservationRepository(db, orphan, clock, RETENTION_V0);
     const standIn = storedObservation(await observations.append(anEvent({ source: { ...src, ref: "op:orphan:standin" } })));
+    // The stand-in must be reachable through the PRE-READ, which since R19
+    // is `skeleton` and not `byIdempotencyKey`. Stubbing only the latter left
+    // this test green for the wrong reason: the real skeleton read found no
+    // row, so the stub was never reached and the catch's guard was held by
+    // nothing. Measured, and not by me -- rewriting `if (isDuplicateKey(e))`
+    // to `if (true)` passed the whole suite at the commit that moved the
+    // pre-read, and failed at its parent, which is this test doing its job
+    // right up until the line it depends on moved out from under it.
     let blind = true;
-    broken.byIdempotencyKey = async () => {
+    const priv = broken as unknown as { skeleton: (k: string) => Promise<unknown> };
+    priv.skeleton = async () => {
       if (blind) { blind = false; return null; }
-      return standIn;
+      return {
+        observationId: standIn.observationId!,
+        ingestedAt: new Date(standIn.ingestedAt!),
+        periodExpired: false,
+        namespaceErased: false,
+      };
     };
+    broken.byIdempotencyKey = async () => standIn;
     const input = anEvent({ source: { ...src, ref: "op:orphan:1" }, namespace: { kind: "wallet", id: "ORPHAN" } });
     const attempt = broken.append(input);
     await expect(attempt).rejects.toBeInstanceOf(ConstraintViolation);
@@ -1141,6 +1156,135 @@ describe("a re-delivery whose payload cannot be opened", () => {
   // the payload, every assertion above would have thrown instead of
   // answering -- but this states it directly, so a future pre-read that
   // decrypts "just to check" fails here rather than three tests away.
+  it("never opens the payload when the skeleton already says it is unreadable", async () => {
+    // The test below asserts the OUTCOME and review showed that is not the
+    // same rule: deleting the early return in `answerStored`, so every
+    // unreadable re-delivery goes through the open and is rescued by the
+    // mid-answer catch, left all 381 tests green. Observable behaviour is
+    // identical and the design property -- the pre-read decides without
+    // decrypting -- was enforced by nothing. So this one counts the calls.
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19SPY" },
+      source: { ...src, ref: "op:r19:spy" } });
+    await mar.obs.append(wire);
+    const nsId = (await mar.ns.find("wallet", "R19SPY"))!.namespaceId;
+    await expireMonth(nsId, "2027-03-01", "2027-04-08T00:00:00.000Z");
+
+    const after = at("2027-05-01T00:00:00.000Z");
+    const priv = after.obs as unknown as { byIdempotencyKey: (k: string) => Promise<unknown> };
+    const real = priv.byIdempotencyKey.bind(after.obs);
+    let opens = 0;
+    priv.byIdempotencyKey = async (k: string) => { opens += 1; return real(k); };
+    expect(await after.obs.append(wire)).toMatchObject({ readable: false, periodExpired: true });
+    expect(opens, "the pre-read decrypted a payload it had already ruled unreadable").toBe(0);
+  });
+
+  it("catches a month EXPIRING mid-answer, not only a namespace erasure", async () => {
+    // The catch's instanceof list has two arms and only one was held: review
+    // narrowed it to NamespaceShredded alone and all 381 tests stayed green,
+    // so the expiry half of the mid-answer race was the original R19 defect
+    // still sitting in a narrow window. The test that looked like it covered
+    // this shreds the NAMESPACE despite its name; this one expires the MONTH.
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19MONTHRACE" },
+      source: { ...src, ref: "op:r19:monthrace" } });
+    await mar.obs.append(wire);
+    const nsId = (await mar.ns.find("wallet", "R19MONTHRACE"))!.namespaceId;
+
+    const racing = at("2027-05-01T00:00:00.000Z");
+    const priv = racing.obs as unknown as { byIdempotencyKey: (k: string) => Promise<unknown> };
+    const real = priv.byIdempotencyKey.bind(racing.obs);
+    let once = true;
+    priv.byIdempotencyKey = async (k: string) => {
+      // A real expiry, committed between the skeleton and the open.
+      if (once) { once = false; await expireMonth(nsId, "2027-03-01", "2027-04-08T00:00:00.000Z"); }
+      return real(k);
+    };
+    expect(await racing.obs.append(wire)).toMatchObject({
+      created: false, readable: false, periodExpired: true, namespaceErased: false,
+    });
+  });
+
+  it("lets a tamper out of the retry path instead of calling it unreadable", async () => {
+    // The other side of the same list. A catch that swallowed everything
+    // passed all 381 tests while answering `readable: false` with both flags
+    // clear for a REWRITTEN row -- reporting a tamper as retention, which is
+    // the one thing the audit chain exists to keep apart. A corrupted or
+    // re-keyed payload wedges the indexer's retry forever, and that is a
+    // decision rather than an oversight: a tamper must be loud.
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19TAMPER" },
+      source: { ...src, ref: "op:r19:tamper" } });
+    await mar.obs.append(wire);
+    const later = at("2027-03-06T00:00:00.000Z");
+    const priv = later.obs as unknown as { byIdempotencyKey: (k: string) => Promise<unknown> };
+    priv.byIdempotencyKey = async () => {
+      throw new CiphertextRejected("the payload did not authenticate");
+    };
+    await expect(later.obs.append(wire)).rejects.toBeInstanceOf(CiphertextRejected);
+  });
+
+  it("still reports a tamper when a sweep lands on top of it", async () => {
+    // The instanceof list and the both-flags-clear rethrow cover the same
+    // ground everywhere except here, which is why a catch that swallowed
+    // everything survived until this test existed: a genuine tamper, with a
+    // real expiry committing on the same row before the state is re-read.
+    // Swallowed, the answer is `readable: false, periodExpired: true` and the
+    // tamper is reported as retention -- the one confusion the audit chain
+    // exists to prevent. The list is what keeps it loud.
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19TAMPERSWEEP" },
+      source: { ...src, ref: "op:r19:tampersweep" } });
+    await mar.obs.append(wire);
+    const nsId = (await mar.ns.find("wallet", "R19TAMPERSWEEP"))!.namespaceId;
+
+    const later = at("2027-05-01T00:00:00.000Z");
+    const priv = later.obs as unknown as { byIdempotencyKey: (k: string) => Promise<unknown> };
+    priv.byIdempotencyKey = async () => {
+      // The month expires while the payload is being opened, so the re-read
+      // WILL show a flag set and a swallowing catch has somewhere to hide.
+      await expireMonth(nsId, "2027-03-01", "2027-04-08T00:00:00.000Z");
+      throw new CiphertextRejected("the payload did not authenticate");
+    };
+    await expect(later.obs.append(wire)).rejects.toBeInstanceOf(CiphertextRejected);
+  });
+
+  it("gives a created result exactly two keys, and no readable flag", async () => {
+    // The union's discriminant is `created` first and `readable` second, and
+    // a JavaScript caller that reached for `readable` on a created result
+    // would read undefined and treat it as unreadable. Nothing pinned the
+    // created shape's key set: a mutant that added `readable: false` to it
+    // passed the whole suite.
+    const fresh = at("2027-06-05T00:00:00.000Z");
+    const r = await fresh.obs.append(anEvent({
+      namespace: { kind: "wallet", id: "R19KEYS" }, source: { ...src, ref: "op:r19:keys" },
+    }));
+    expect(Object.keys(r).sort()).toEqual(["created", "observation"]);
+  });
+
+  it("raises the refusal it caught rather than calling a healthy row unreadable", async () => {
+    // F4. The catch re-reads the state, and until review measured it the
+    // re-read could come back clean -- leaving `readable: false` with both
+    // flags clear, which is a row reported unreadable while the answer says
+    // nothing ails it. `answerStored`'s own docstring refuses that shape and
+    // enforced the refusal on one branch of two. Reachable on a real
+    // database when the §2c same-row restore lands between the failed read
+    // and the re-read; reached here by making the open throw with no state
+    // change at all, which is the same shape and cheaper to write.
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const wire = anEvent({ namespace: { kind: "wallet", id: "R19LIAR" },
+      source: { ...src, ref: "op:r19:liar" } });
+    await mar.obs.append(wire);
+
+    const lying = at("2027-03-06T00:00:00.000Z");
+    const priv = lying.obs as unknown as { byIdempotencyKey: (k: string) => Promise<unknown> };
+    priv.byIdempotencyKey = async () => {
+      throw new NamespaceShredded("a refusal with no state behind it");
+    };
+    await expect(lying.obs.append(wire)).rejects.toBeInstanceOf(NamespaceShredded);
+    await expect(lying.obs.append(wire)).rejects.toThrow(/no state behind it/);
+  });
+
   it("does not open the payload to decide, so an unreadable row still answers", async () => {
     const mar = at("2027-03-05T00:00:00.000Z");
     const wire = anEvent({ namespace: { kind: "wallet", id: "R19NODECRYPT" },

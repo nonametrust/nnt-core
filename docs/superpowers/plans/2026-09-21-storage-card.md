@@ -307,10 +307,35 @@ opens the payload, so for a namespace erased on request it raises
 counterparty -- a denial of service on our own pipeline, which is the failure
 R3 already says this card must not create.
 
-It is answered rather than thrown because the row already exists. Refusing
-protects nothing: the skeleton is what a shred deliberately leaves standing,
-and §2c records that `namespace.ns_id` stays plaintext through an erasure, so
-confirming the row adds no fact the caller could not already read.
+It is answered rather than thrown because the row already exists and the
+skeleton is what a shred deliberately leaves standing.
+
+**"Adds no fact the caller could not already read" was the justification, and
+it is false. Measured, at the API boundary.** Before R19, an `append` for an
+erased namespace threw `NamespaceShredded` whether or not that source
+reference had ever been observed -- the two were indistinguishable. After
+R19, a reference that WAS observed comes back with its `observationId` and
+`ingestedAt`, and one that was not still throws. So `append` is now a
+membership oracle: for any guessed `(producer, network, ref, channel,
+namespace)` -- every part public or a small dictionary, which is exactly the
+dictionary §2c already describes -- a caller learns whether this store
+observed that on-ledger operation about the erased wallet, and when it was
+ingested. §2c's version of this attack needed the `idempotency_key` column,
+i.e. database access; this one needs only the API.
+
+That is a real cost and it is accepted, not hidden, because the alternative
+is a permanently wedged retry loop for an erased counterparty and the caller
+here is our own indexer rather than the public. But two things follow. The
+sentence above is struck. And **the outward claim may no longer be "erasure
+means unreadable through the store's API" alone**: it is content unreadable,
+with per-source-reference existence and ingest instant still answerable. That
+belongs in §2c's list beside the idempotency-key finding, which is the same
+leak one layer down.
+
+Not zero before, for honesty: `NamespaceRepository.find` already returned an
+erased namespace's `shreddedAt` through the API, and `TagRepository.listLive`
+has no shred gate at all. What R19 adds is per-operation existence and an
+instant, on a guessable key.
 
 **The shape follows R18 rather than repeating its mistake.** The obvious
 design is a `reason: "period-expired" | "namespace-erased"`, and it is wrong
@@ -322,13 +347,43 @@ from whatever counts it feeds. So the third `AppendResult` shape carries
 state at the moment of the read.
 
 **The adjacent case is recorded and NOT changed.** A genuinely new observation
-for an erased namespace still throws `NamespaceShredded`, from `periodKey`'s
-refusal to mint under a dead outer key (`namespace.test.ts`, "refuses to mint
-under a shredded namespace"). That is M1's rule and it stays: a re-delivery is
-a retry of something already stored, while a new observation would be resuming
-collection on a counterparty who asked to be erased, and those deserve
-different answers. The distinction is the idempotency key, which is what the
-pre-read is for.
+for an erased namespace throws `NamespaceShredded`, from `periodKey`'s refusal
+to mint under a dead outer key. That is M1's rule and it stays: a re-delivery
+is a retry of something already stored, while a new observation would be
+resuming collection on a counterparty who asked to be erased. The distinction
+is drawn on the idempotency key -- which is coarser than that sentence
+suggests, since the key covers `(producer, network, ref, channel, namespace)`
+and not the observation's `kind`, so a "re-delivery" carrying a different kind
+is answered as already stored.
+
+**And the refusal has a window, which R19 first asserted without one.**
+Nothing spans `openPeriodKey` and the `insert`, so a shred committing between
+them leaves a NEW observation stored after the erasure: reproduced by
+committing a real shred inside that gap, and the table then held a row whose
+`ingested_at` is later than `namespace.key_shredded_at`. Its payload is
+unreadable through the API, because the outer key is gone -- but a row was
+written after the request, and **the M1 ledger's sentence is "a shredded
+counterparty can never be observed again", which that measurement refuses.**
+`periodKey`'s own docstring already admits the analogous window for the month
+key row; R19's first draft restated the guarantee without inheriting the
+qualification.
+
+**Owed: a gate, not a habit.** The property is enforced by nothing today, and
+this repository's rule is that such properties turn out false -- this one did,
+on the first push. The cheap form is a trigger on `observation` INSERT that
+refuses when the row's namespace has no `data_key_wrapped`, which makes it the
+database's refusal rather than an ordering the code happens to keep. It is a
+line in `0007` and belongs to whichever task next opens that file; it is not
+Task 8's cap and must not be smuggled in beside it.
+
+**The shape is silent about a third reason, and that is a decision.** A
+corrupted ciphertext, a truncated nonce or a rotated master key all still
+throw out of the retry path -- measured: `CiphertextRejected`,
+`CiphertextMalformed`, `CiphertextRejected`. So the retry loop still wedges
+forever for those, which is the same denial-of-service shape R19 was fixing,
+for a different cause. That is correct, because a tamper must be loud and must
+not be reported as retention; but it is a choice and the claim "the retry path
+stops throwing" is true only of the two erasures.
 
 Cost if wrong: answered when it should refuse, and an erased counterparty's
 pipeline quietly keeps flowing; thrown when it should answer, and one erasure

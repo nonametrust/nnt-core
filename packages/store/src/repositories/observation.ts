@@ -78,14 +78,21 @@ export class ObservationRepository {
     private readonly db: Db,
     private readonly namespaces: NamespaceRepository,
     private readonly clock: Clock,
-    // R16's sibling, and the reason it is required rather than defaulted.
-    // This repository caps on `producerWindowMs` and `producerMaxObservations`
-    // while the namespace repository expires on `graceDays`, and nothing
-    // compares the two policies: handed different objects, the store would
-    // expire under one number and cap under another with no error anywhere.
-    // The composition point passes ONE value to both. A default here is a
+    // R16's sibling. Required rather than defaulted because a default is a
     // policy that reaches production, which is the argument the key ring's
     // missing default master key already made.
+    //
+    // HONEST ABOUT WHAT IT DOES TODAY, because the first version of this
+    // comment was not and review measured the gap: nothing here READS it.
+    // The comment said "this repository caps on producerWindowMs and
+    // producerMaxObservations" -- it will, in the second half of this task,
+    // and it does not yet. All this parameter buys at this commit is that a
+    // malformed policy is refused at construction and that the composition
+    // point already has to hand one value to both repositories, so the cap
+    // arrives into a seam that exists rather than widening the constructor
+    // later. A required parameter nothing reads is a promise; this one is a
+    // promise with a date on it, and saying so beats a comment that claims
+    // the mechanism early.
     private readonly policy: RetentionPolicy,
   ) {
     // Asserted here for the reason NamespaceRepository asserts it: this is
@@ -162,9 +169,16 @@ export class ObservationRepository {
     //
     // The general condition is that the grace must exceed the skew between
     // the appending clock and the sweeping one; at the shipped ninety days it
-    // is unreachable outside a simulated clock. It is recorded in the plan's
-    // §2c rather than fixed here, because the fix is a shape for the result
-    // of `append` and that shape belongs to Task 8.
+    // is unreachable outside a simulated clock.
+    //
+    // There is a THIRD ordering this comment used to omit, and review
+    // reproduced it: if the sweep commits after `openPeriodKey` returns but
+    // before the insert, the append succeeds and reports `created: true`
+    // while the row it just wrote is already unreadable. Not dropped at write
+    // time, which is the rule -- written unreadable instead, which is worse
+    // to discover later and is the same mint-to-insert window that lets a new
+    // observation land under an erased namespace. Both want the one gate
+    // named in R19.
     //
     // Minted before the insert because the foreign key requires the row, and
     // the foreign key exists so that this ordering is a constraint rather
@@ -255,6 +269,15 @@ export class ObservationRepository {
       if (!(e instanceof NamespaceShredded || e instanceof PayloadExpired)) throw e;
       const fresh = await this.skeleton(key);
       if (!fresh) throw e;
+      // The docstring below refuses `readable: false` with both flags clear,
+      // and until review measured it that refusal was enforced on the NULL
+      // branch alone. Here it was reachable twice over: synthetically, and on
+      // a real database where the §2c same-row restore of a captured outer
+      // key lands between the failed read and this one -- a narrow window,
+      // and inside the threat model §2c states rather than outside it. If
+      // the re-read finds nothing wrong, the refusal we caught is the only
+      // true thing we know, so it is the thing to raise.
+      if (!fresh.periodExpired && !fresh.namespaceErased) throw e;
       return { created: false, readable: false, ...fresh };
     }
     if (!opened) {
