@@ -16,6 +16,7 @@
 --   3. observation: the producer column, and the payload layout that moved
 --   4. namespace_key: the month key, its guard, and what expiry may not do
 --   5. observation: the period it is keyed on, and the key row it requires
+--   6. observation: no counterparty is observed after its erasure
 
 -- Before anything else: this migration moves the byte layout of the payload
 -- envelope, and a stored payload is sealed under the layout that was in force
@@ -509,3 +510,66 @@ alter table observation
 -- than in the task that first reads it, so the column and its access path
 -- arrive together.
 create index observation_by_producer_ingested on observation (producer, ingested_at desc);
+
+
+-- === 6. observation: no counterparty is observed after its erasure (Task 8) ==
+--
+-- R19's owed gate, and it is owed because a sentence turned out to be false.
+-- The M1 ledger says "a shredded counterparty can never be observed again"
+-- and calls it a product consequence. Nothing enforced it. `append` reads the
+-- namespace key, mints or opens a month key, and only then inserts; nothing
+-- spans those steps, so an erasure request committing in between left a row
+-- whose `ingested_at` is LATER than `namespace.key_shredded_at`. Measured by
+-- an adversarial review on this branch, not imagined: the payload was
+-- unreadable, because the outer key was already gone, but the row existed and
+-- the erasure's own timestamp was no longer the last word about that
+-- counterparty.
+--
+-- The foreign key does not help. `observation.namespace_id` references
+-- `namespace`, and a shredded namespace is still a row, so the reference is
+-- satisfied. The append-only trigger does not help either: like every guard
+-- in this schema it is UPDATE and DELETE only, by design, because INSERT is
+-- the operation this table exists for.
+--
+-- WHY A TRIGGER RATHER THAN A CHECK. A check constraint sees only the row
+-- being written, and the fact that decides this lives in another table. A
+-- foreign key to a partial index of live namespaces would be the declarative
+-- form, and Postgres will not reference a partial index; it would also make
+-- the shred itself fail rather than the write, which is backwards -- an
+-- erasure request must never be refused because data exists.
+--
+-- WHY `for share`. Without it the trigger reads under the statement's own
+-- snapshot, which closes the window this section is about (the shred commits
+-- before the INSERT statement begins) and leaves a narrower one (the shred
+-- commits while it runs). The share lock makes the two serialise: an erasure
+-- in flight blocks until this insert commits and then sees it, or this insert
+-- waits and then reads the shred. Share locks do not conflict with each
+-- other, so concurrent appends to one namespace still do not queue; only a
+-- shred, which takes a row-exclusive lock, does -- and a shred is rare and
+-- may wait.
+--
+-- What this does NOT claim. It refuses new observations; it does not make an
+-- erasure retroactive, and §2c's limits on what a shred removes from the disk
+-- are untouched. It is the mechanism behind one sentence, not the sentence.
+create function observation_namespace_live() returns trigger language plpgsql as $$
+declare
+  erased boolean;
+begin
+  select data_key_wrapped is null into erased
+  from namespace where namespace_id = new.namespace_id for share;
+  -- `not found` is impossible under the foreign key and is left to it: a
+  -- null `erased` here would mean the reference is broken, which is the
+  -- foreign key's refusal to make and not this trigger's.
+  if erased then
+    raise exception using
+      errcode = 'NNT08',
+      message = 'namespace ' || new.namespace_id ||
+                ' was erased on request; no observation is written for it afterwards';
+  end if;
+  return new;
+end
+$$;
+
+create trigger observation_namespace_live_on_insert
+  before insert on observation
+  for each row execute function observation_namespace_live();

@@ -130,6 +130,7 @@ const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreErro
   NNT05: NamespaceAltered,
   NNT06: PeriodKeyAltered,
   NNT07: TagAltered,
+  NNT08: NamespaceShredded,
 };
 
 /**

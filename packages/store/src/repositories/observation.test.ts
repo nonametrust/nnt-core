@@ -2,14 +2,16 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { deriveIdempotencyKey, type WireObservation } from "@nonametrust/schema";
 import { sql } from "kysely";
-import type { Db } from "../db.js";
-import { withSchema, storedObservation } from "../testing/harness.js";
+import { openDb, type Db } from "../db.js";
+import {
+  requireTestUrl, storedObservation, urlForSchema, withSchema,
+} from "../testing/harness.js";
 import { keyRingFromEnv, newDataKey, payloadAad, seal } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import { RETENTION_V0, periodOf } from "../retention.js";
 import {
   CiphertextRejected, ConstraintViolation, IdempotencyKeyMismatch, NamespaceShredded,
-  ObservationNotFound, PayloadExpired, StoreError,
+  ObservationNotFound, PayloadExpired, StoreError, mapPgError,
 } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
@@ -1028,6 +1030,148 @@ describe("a re-delivery whose payload cannot be opened", () => {
   // retry of something already stored, a NEW observation would be resuming
   // collection on a counterparty who asked to be erased. The idempotency key
   // is what tells them apart, which is what the pre-read is for.
+  // R19's owed GATE. The refusal above holds only when the shred commits
+  // BEFORE the append reads the key: nothing spans `openPeriodKey` and the
+  // insert, so a shred landing in between let a new observation be stored
+  // with `ingested_at` later than `namespace.key_shredded_at`. Review
+  // reproduced it, and what it refutes is the M1 ledger's own sentence, "a
+  // shredded counterparty can never be observed again". A documented
+  // refusal with no mechanism is what this repository keeps finding to be
+  // false, so the mechanism is a trigger and these two tests are it.
+  it("refuses a raw INSERT for an erased namespace, by SQLSTATE and message", async () => {
+    const mar = at("2027-03-05T00:00:00.000Z");
+    await mar.obs.append(anEvent({ namespace: { kind: "wallet", id: "GATERAW" },
+      source: { ...src, ref: "op:gate:raw" } }));
+    const nsId = (await mar.ns.find("wallet", "GATERAW"))!.namespaceId;
+    await at("2027-03-10T00:00:00.000Z").ns.shred(nsId);
+
+    const planted = sql`
+      insert into observation (
+        observation_id, idempotency_key, namespace_id, channel, kind, evidence_kind,
+        dated_at, ingested_at, producer, period, payload_nonce, payload_tag, payload_ciphertext
+      ) values (
+        ${randomUUID()}, ${randomUUID()}, ${nsId}, 'protocol', 'raw', 'state',
+        null, ${new Date("2027-03-11T00:00:00.000Z")}, 'raw-writer', '2027-03-01'::date,
+        decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
+      )`.execute(db).then(() => null, (e: unknown) => e);
+    const failure = await planted;
+    expect(failure).not.toBeNull();
+    expect(mapPgError(failure)).toBeInstanceOf(NamespaceShredded);
+    await expect(Promise.reject(mapPgError(failure)))
+      .rejects.toThrow(/erased on request/);
+  });
+
+  it("refuses a NEW observation when the erasure lands between the key and the insert", async () => {
+    // The window itself. `openPeriodKey` returns a live key, a real shred
+    // commits, and the insert follows. Before the gate this stored a row
+    // dated after the erasure; the row's own foreign key is satisfied by a
+    // shredded namespace, so nothing else was going to stop it.
+    const mar = at("2027-03-05T00:00:00.000Z");
+    await mar.obs.append(anEvent({ namespace: { kind: "wallet", id: "GATERACE" },
+      source: { ...src, ref: "op:gate:race1" } }));
+    const nsId = (await mar.ns.find("wallet", "GATERACE"))!.namespaceId;
+
+    const racing = at("2027-03-11T00:00:00.000Z");
+    const priv = racing.ns as unknown as { openPeriodKey: (n: string, p: string) => Promise<Buffer> };
+    const real = priv.openPeriodKey.bind(racing.ns);
+    let once = true;
+    priv.openPeriodKey = async (n: string, p: string) => {
+      const key = await real(n, p);
+      if (once) { once = false; await racing.ns.shred(nsId); }
+      return key;
+    };
+    await expect(racing.obs.append(anEvent({
+      namespace: { kind: "wallet", id: "GATERACE" },
+      source: { ...src, ref: "op:gate:race2" },
+    }))).rejects.toBeInstanceOf(NamespaceShredded);
+
+    // And nothing was written: the erasure request's instant stays the last
+    // word on this counterparty.
+    const rows = await sql<{ n: string }>`
+      select count(*)::text as n from observation o
+      join namespace n on n.namespace_id = o.namespace_id
+      where o.namespace_id = ${nsId} and o.ingested_at > n.key_shredded_at`.execute(db);
+    expect(rows.rows[0]!.n).toBe("0");
+  });
+
+  // `for share` in the trigger, which mutation showed nothing held: removing
+  // it left the suite green, because both gate tests above have the shred
+  // committed BEFORE the insert statement begins. This one has it commit
+  // while the statement runs, which is the narrower window the lock exists
+  // for, and it is deterministic rather than timed: the erasing connection
+  // takes the row lock FIRST, so the insert must queue behind it.
+  //
+  // Without the lock the trigger reads the statement's own snapshot, does
+  // not see an erasure that has not committed yet, and admits the row --
+  // and the erasure then commits on top of it.
+  it("queues behind an erasure already in flight, and sees it when it lands", async () => {
+    const mar = at("2027-03-05T00:00:00.000Z");
+    await mar.obs.append(anEvent({ namespace: { kind: "wallet", id: "GATEINFLIGHT" },
+      source: { ...src, ref: "op:gate:inflight1" } }));
+    const nsId = (await mar.ns.find("wallet", "GATEINFLIGHT"))!.namespaceId;
+    // The month key has to exist before the race, or the append would mint
+    // one and the ordering under test would be a different one.
+    await at("2027-03-11T00:00:00.000Z").ns.periodKey(nsId, "2027-03-01");
+
+    const other = openDb(urlForSchema(requireTestUrl(), "obs_test"));
+    try {
+      // Two handshakes, because a fixed sleep made this flaky and a flaky
+      // test is worse than none: it failed once under a loaded run, and not
+      // for its own reason -- the append simply started before the erasing
+      // transaction had taken its lock, so nothing ever queued and the
+      // property under test was not exercised at all.
+      let lockHeld!: () => void;
+      const holding = new Promise<void>((r) => { lockHeld = r; });
+      let commitNow!: () => void;
+      const release = new Promise<void>((r) => { commitNow = r; });
+
+      const erasing = other.transaction().execute(async (trx) => {
+        await sql`select namespace_id from namespace
+                  where namespace_id = ${nsId} for update`.execute(trx);
+        lockHeld();
+        await release;
+        await sql`update namespace set data_key_wrapped = null,
+                    key_shredded_at = ${new Date("2027-03-11T00:00:00.000Z")}
+                  where namespace_id = ${nsId}`.execute(trx);
+      });
+
+      // Only launch the append once the row is genuinely locked.
+      await holding;
+      const appending = at("2027-03-12T00:00:00.000Z").obs.append(anEvent({
+        namespace: { kind: "wallet", id: "GATEINFLIGHT" },
+        source: { ...src, ref: "op:gate:inflight2" },
+      }));
+
+      // And wait for it to be BLOCKED rather than for a number of
+      // milliseconds. Scoped to this database: pg_locks and pg_stat_activity
+      // are cluster-wide, and a sibling suite on another database would
+      // otherwise satisfy this poll.
+      let blocked = false;
+      for (let i = 0; i < 100 && !blocked; i++) {
+        const waiting = await sql<{ n: string }>`
+          select count(*)::text as n from pg_stat_activity
+          where datname = current_database() and wait_event_type = 'Lock'
+            and query ilike '%insert into%observation%'`.execute(db);
+        blocked = waiting.rows[0]!.n !== "0";
+        if (!blocked) await new Promise((r) => setTimeout(r, 50));
+      }
+      // Non-vacuous: if the insert never queued, the rest proves nothing.
+      expect(blocked, "the insert never blocked, so nothing was serialised").toBe(true);
+
+      commitNow();
+      await erasing;
+
+      await expect(appending).rejects.toBeInstanceOf(NamespaceShredded);
+      const rows = await sql<{ n: string }>`
+        select count(*)::text as n from observation o
+        join namespace n on n.namespace_id = o.namespace_id
+        where o.namespace_id = ${nsId} and o.ingested_at > n.key_shredded_at`.execute(db);
+      expect(rows.rows[0]!.n).toBe("0");
+    } finally {
+      await other.destroy();
+    }
+  });
+
   it("still refuses a NEW observation for an erased namespace", async () => {
     const mar = at("2027-03-05T00:00:00.000Z");
     await mar.obs.append(anEvent({ namespace: { kind: "wallet", id: "R19NEW" },
