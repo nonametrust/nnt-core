@@ -9,7 +9,8 @@ import {
   TagAltered,
   TimestampAltered,
   mapPgError,
-} from "./errors.js";
+  NamespaceShredded,
+  Deadlocked,} from "./errors.js";
 
 // The shape pg gives a server error: a code, a message, and the fields a
 // trigger's RAISE fills that a caller needs when debugging. A constraint
@@ -32,6 +33,13 @@ describe("mapPgError", () => {
     ["NNT05", NamespaceAltered],
     ["NNT06", PeriodKeyAltered],
     ["NNT07", TagAltered],
+    ["NNT08", NamespaceShredded],
+    // Postgres's own, not one this schema allocated: two of this store's
+    // single-statement writes composed in opposite orders inside a caller's
+    // transaction deadlock, measured, and a caller's correct response to
+    // 40P01 is to retry -- which is the wrong response to almost every other
+    // code in this table, so it has to be tellable apart.
+    ["40P01", Deadlocked],
   ])("maps %s to the named class", (code, Ctor) => {
     const mapped = mapPgError(pgError(code));
     expect(mapped).toBeInstanceOf(Ctor);

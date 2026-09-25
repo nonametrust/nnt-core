@@ -10,14 +10,16 @@
 -- records (MigrationDrift), so the moment this file is applied anywhere it is
 -- frozen like every other.
 --
--- Sections, in the order they were grown:
---   1. baseline: the two shapes M2's arithmetic refuses
---   2. tag: the aspect it was always keyed on, retirement, and the guard
---   3. observation: the producer column, and the payload layout that moved
---   4. namespace_key: the month key, its guard, and what expiry may not do
---   5. observation: the period it is keyed on, and the key row it requires
---   6. observation: no counterparty is observed after its erasure
---   7. permanent_record: the payload a rescue keeps
+-- Sections, in the order they were grown, each naming the task that added
+-- it. Task 10's reviewer reads this file top to bottom as one migration, so
+-- every section says what it holds AND what it deliberately leaves open:
+--   1. baseline: the two shapes M2's arithmetic refuses (Task 1)
+--   2. tag: the aspect it was always keyed on, retirement, the guard (Task 2)
+--   3. observation: the producer column, the payload layout that moved (Task 4b)
+--   4. namespace_key: the month key, its guard, what expiry may not do (Task 5)
+--   5. observation: the period it is keyed on, the key row it needs (Task 6)
+--   6. observation: no counterparty is observed after its erasure (Task 8)
+--   7. permanent_record: the payload a rescue keeps (Task 9)
 
 -- Before anything else: this migration moves the byte layout of the payload
 -- envelope, and a stored payload is sealed under the layout that was in force
@@ -40,7 +42,7 @@ begin
   end if;
 end $$;
 
--- === 1. baseline: the two shapes M2's arithmetic refuses =====================
+-- === 1. baseline: the two shapes M2's arithmetic refuses (Task 1) ============
 --
 -- 0006 landed this table with its own comment saying that "whether m2 is zero
 -- when n is zero, and whether median and MAD arrive together, are properties
@@ -76,7 +78,7 @@ alter table baseline
   add constraint baseline_location_is_mean
   check (median_est is null or median_est = mean);
 
--- === 2. tag: the aspect it was always keyed on, and retirement ==============
+-- === 2. tag: the aspect it was always keyed on, and retirement (Task 2) =====
 --
 -- M2 keys the live tag on (namespace, channel, aspect) and tagReading takes
 -- one live tag or none for that triple. The table carried only the channel,
@@ -205,7 +207,7 @@ create trigger tag_guarded
   for each row execute function tag_guard();
 
 
--- === 3. observation: the producer column, and the payload layout that moved ==
+-- === 3. observation: the producer column and the payload layout (Task 4b) ===
 --
 -- `producer` is the bare name of the component that delivered the
 -- observation, and it is derived by `append` from the source the observation
@@ -243,7 +245,7 @@ alter table observation
   check (producer ~ '^[a-z0-9]+(-[a-z0-9]+)*$' and length(producer) <= 64);
 
 
--- === 4. namespace_key: the month key, its guard, and what expiry may not do ==
+-- === 4. namespace_key: the month key and its guard (Task 5) =================
 --
 -- Retention in this design is unreadability on a clock, not deletion. A
 -- payload is to be sealed under a key per (namespace, calendar month); that
@@ -454,7 +456,7 @@ create trigger namespace_key_guarded
   for each row execute function namespace_key_guard();
 
 
--- === 5. observation: the period it is keyed on, and the key row it requires ==
+-- === 5. observation: the period and the key row it requires (Task 6) =======
 -- (Task 6. Sections 1 and 2 were Task 1 and 2, section 3 Task 4b, section 4
 -- Task 5. `observation` is altered here a second time because this section
 -- needs `namespace_key` to exist and that arrives in section 4.)

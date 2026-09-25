@@ -55,6 +55,25 @@ injected clock and nowhere else, which is what lets
 day-twenty-one scenario, all four acceptance criteria on one database, in
 milliseconds.
 
+Retention is the store's own design rather than a policy applied to it, and
+it is not deletion. A payload is sealed under a key per (counterparty space,
+calendar month), and that month key is wrapped under the space's own key. A
+declared grace after the month closes, a sweep shreds the month key: the
+payload stops opening while the row, its foreign keys, the audit chain and
+every seal stay exactly where they are and stay verifiable. An erasure
+request shreds the outer key instead and takes the whole space with it. A
+promotion re-seals the rescued observation under that outer key, which is how
+a captured trace outlives its month and still dies with an erasure request.
+
+Two things about that are easy to overstate and are written down rather than
+implied. "Unreadable" means through this package's API: a shred is an UPDATE
+that nulls a column, so the bytes remain in the pre-vacuum heap and in WAL,
+and the defensible claim is unreadability rather than erasure from the disk.
+And the store answers a re-delivery for an erased space instead of refusing
+it, so the existence of an observation and the instant it was ingested stay
+answerable per source reference even when its content does not. The plan's
+§2c carries the measurements behind both.
+
 ### Running the store tests
 
 The store suite needs a PostgreSQL 17 database and fails rather than skips
@@ -148,6 +167,18 @@ true. The ones worth knowing before you add a file:
   them, so a field the arithmetic starts returning and the store does not
   know about is simply not written, the refresh appears to succeed, and the
   row is left half-updated with nothing raising anything.
+- **The store reads no wall clock outside `clock.ts`**
+  (`packages/store/src/clock-gate.test.ts`), the same lexical rule the
+  tagging package holds on itself. It matters more here than it reads:
+  retention is a simulated calendar, and every one of its properties --
+  expiry derived from the period and not from today, a sweep told `now`
+  rather than asking, a producer cap measured against the caller's instant
+  -- is provable in milliseconds only because the clock is an argument. One
+  `new Date()` in a repository and the test that would notice is the one
+  that no longer can, since it would be comparing the wall clock with
+  itself. Test files are skipped, as the tagging gate skips them, because a
+  fixture constructs instants on purpose; the exempt set is pinned by name
+  so it cannot widen quietly.
 - **The schema version is checked exactly** on every observation
   (`packages/schema/src/payloads.test.ts`), and the golden fixtures must all
   validate (`packages/schema/src/fixtures.test.ts`).
