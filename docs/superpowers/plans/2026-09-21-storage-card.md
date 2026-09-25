@@ -389,6 +389,60 @@ Cost if wrong: answered when it should refuse, and an erased counterparty's
 pipeline quietly keeps flowing; thrown when it should answer, and one erasure
 request wedges the indexer's retry loop permanently.
 
+**R20. The store's composition contract is undecided, and Task 8b turned that
+from a gap into a hazard.** Task 9 was already owed a composition answer. The
+cap's transaction makes it urgent, because `append` now takes two locks in
+order — the producer's advisory key, then a `FOR SHARE` on the namespace row
+through the insert trigger — while `AuditChain.append` takes its own advisory
+key. Measured by review on real connections:
+
+- **`append` on a repository built on a Transaction throws a bare `Error`**,
+  not a `StoreError`: Kysely refuses `Transaction.transaction()`. It throws
+  AFTER `ensure` and `periodKey` have written into the outer transaction. Five
+  places in the tree build an `ObservationRepository` on a `trx`; all five call
+  `get` only, so the suite never meets it.
+- **The lock-ordering cycle is real and fires in about a second.** `{shred;
+  journal}` against `{journal; append}` deadlocked with 40P01 at 1004 ms. The
+  acceptance story writes an audit row beside every operation, so "erase and
+  journal it atomically" is exactly the composition a caller reaches for.
+- **It is unreachable today only by accident** — the bare throw above is what
+  prevents it — and nothing says so.
+- **Pinning a connection instead silently loses atomicity**: `db.connection()`
+  with a raw `begin`, then two repository calls, then `rollback`, left both
+  rows committed. Each repository's inner BEGIN/COMMIT commits the caller's
+  unit of work.
+
+No pool-level deadlock was reproducible through the API after genuinely
+trying every pairing — append against shred, against `expirePeriods`, against
+`promote`, two producers on one namespace — because every store write is its
+own short transaction. The hazard is entirely in composition.
+
+**Task 9 decides this, and it is now a choice between two, not an open
+question.** Either the write paths become savepoint-aware when handed a
+`Transaction`, in which case the lock order must be fixed once and for all
+(the chain key before the producer key, and never hold a namespace row lock
+while waiting on the chain key); or a `Transaction` is refused at the write
+with a named `StoreError` and a test, so the accident becomes a contract. The
+second is smaller and loses the atomic "erase and journal" the audit design
+wants; the first is the one the design implies and costs a lock-order rule
+nobody can break by accident.
+
+**Two operational facts recorded here rather than fixed.** One busy producer
+holding its lock stalls every operation on the pool once its in-flight appends
+reach `pool.max` — measured: a different producer's append and a plain
+`find` both waited 1.5 s behind a held lock. The indexer is one producer and
+will routinely exceed ten in flight, so ingest wants its own pool or a bound
+on in-flight appends; that is a deployment shape, not a schema one. And a
+refused append leaves behind the `namespace` row and the `namespace_key` row
+it minted before the cap was checked, because the mint is outside the
+transaction: the refusal says "no observation was written", which is true,
+and two rows were.
+
+**One mutant survives the cap's round and is equivalent in outcome.**
+Removing the `limit` from the bounded count changes no answer; it changes the
+work from O(rows in the window) to O(cap). Nothing in a suite can see that,
+and the gate would be an assertion on the query plan rather than on a result.
+
 ## 2c. Limits of crypto-shredding, recorded rather than fixed
 
 Two things a security review measured that no schema change can close. They

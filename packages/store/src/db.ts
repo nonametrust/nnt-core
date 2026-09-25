@@ -193,7 +193,28 @@ export function openDb(url: string): Db {
   });
 }
 
-const ISO_DATES = "-c datestyle=ISO";
+// Two settings this package pins per connection rather than inheriting, for
+// the same reason and by the same mechanism.
+//
+// DateStyle, because under any non-ISO style node-pg cannot parse the
+// timestamptz text the server sends and every timestamp column arrives null.
+//
+// READ COMMITTED, because this store's correctness rests on statements seeing
+// what committed before them. Measured under a session defaulting to
+// REPEATABLE READ: the producer cap admitted fourteen rows against a cap of
+// five -- the snapshot is taken at a transaction's first statement, which is
+// the lock acquisition, so queued appenders all count against a view that
+// predates the holder's commit -- and `ensure` and `periodKey`, whose
+// `on conflict do nothing` is the normal path when two deliveries touch one
+// namespace, raise 40001 instead of converging. Neither is a defect the store
+// can fix downstream: the isolation level has to be right before the
+// statement runs.
+//
+// A server-wide setting, an `alter role ... set default_transaction_isolation`,
+// a `PGOPTIONS`, or a connection pooler is enough to set either from outside.
+// `options` on the connection string is per session and beats all of them, so
+// this is the one place either can be settled.
+const ISO_DATES = "-c datestyle=ISO -c default_transaction_isolation=read\\ committed";
 
 export function withIsoDates(url: string): string {
   const parsed = new URL(url);

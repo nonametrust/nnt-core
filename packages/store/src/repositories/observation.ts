@@ -227,24 +227,64 @@ export class ObservationRepository {
       // slot. Charged, a producer at its cap could not retry anything, which
       // is R3's denial of service on ourselves arriving through the one path
       // that exists to prevent it.
-      await this.db.transaction().execute(async (trx) => {
-        await sql`select pg_advisory_xact_lock(hashtext(${stored.source.producer}))`
-          .execute(trx);
-        const since = new Date(ingestedAt.getTime() - this.policy.producerWindowMs);
-        const counted = await sql<{ n: string }>`
-          select count(*)::text as n from observation
-          where producer = ${stored.source.producer} and ingested_at > ${since}`
-          .execute(trx);
-        const n = Number(counted.rows[0]!.n);
-        if (n >= this.policy.producerMaxObservations) {
-          throw new SourceRateExceeded(
-            `producer ${stored.source.producer} has ${n} observations in the last ` +
-              `${this.policy.producerWindowMs} ms, which is its cap of ` +
-              `${this.policy.producerMaxObservations} under policy ${this.policy.version}; ` +
-              `nothing was written`,
-          );
-        }
-        await trx
+      // READ COMMITTED is what this transaction needs, and it is pinned on
+      // the CONNECTION in db.ts rather than here. Under REPEATABLE READ the
+      // snapshot is taken at the first statement -- the lock acquisition,
+      // before the lock is granted -- so every queued appender counts
+      // against a view predating the holder's commit: measured at cap 5,
+      // fourteen rows stored.
+      //
+      // It was pinned in both places for one round. Mutation showed the
+      // transaction-level call held nothing, because the connection pin
+      // reaches it first, and it covers strictly less: `ensure` and
+      // `periodKey` run outside any transaction and raise 40001 under
+      // REPEATABLE READ, which no isolation level set HERE could have
+      // helped. One mechanism, in the place that covers all of them, beats
+      // two where the second is untestable -- and this package already
+      // depends on db.ts's pins for correctness, since losing the DateStyle
+      // one breaks every read.
+      const raced = await this.db.transaction()
+        .execute(async (trx) => {
+          await sql`select pg_advisory_xact_lock(hashtext(${stored.source.producer}))`
+            .execute(trx);
+
+          // The key, re-read UNDER the lock. A concurrent delivery of this
+          // same event may have stored it while this call queued, and then
+          // counting would refuse a RETRY as a rate violation -- measured,
+          // four rounds in five. The retry does not consume a slot, but
+          // without this it gets refused by one, which is R3's denial of
+          // service on ourselves arriving through the path that exists to
+          // prevent it. Found, it is answered from outside this
+          // transaction, so no count is taken and nothing is inserted.
+          const already = await this.skeleton(key, trx);
+          if (already) return already;
+
+          const since = new Date(ingestedAt.getTime() - this.policy.producerWindowMs);
+          // Bounded by the cap: the decision only needs to know whether the
+          // window holds AT LEAST that many, and an exact count is O(rows in
+          // the window) under the lock. At the shipped ten million a day
+          // that is most of the table on every append, measured at roughly a
+          // second once the window is full -- one producer's own throughput
+          // ceiling collapsing exactly when it is busiest. The LIMIT stops
+          // at the cap, so the number below is "at least", and the message
+          // says so rather than reporting a total it did not compute.
+          const counted = await sql<{ n: string }>`
+            select count(*)::text as n from (
+              select 1 from observation
+              where producer = ${stored.source.producer} and ingested_at > ${since}
+              limit ${this.policy.producerMaxObservations}
+            ) bounded`
+            .execute(trx);
+          const n = Number(counted.rows[0]!.n);
+          if (n >= this.policy.producerMaxObservations) {
+            throw new SourceRateExceeded(
+              `producer ${stored.source.producer} has reached its cap of ` +
+                `${this.policy.producerMaxObservations} observations in the last ` +
+                `${this.policy.producerWindowMs} ms under policy ${this.policy.version}; ` +
+                `no observation was written`,
+            );
+          }
+          await trx
           .insertInto("observation")
           .values({
             observation_id: observationId,
@@ -261,8 +301,10 @@ export class ObservationRepository {
             payload_tag: sealed.tag,
             payload_ciphertext: sealed.ciphertext,
           })
-          .execute();
-      });
+            .execute();
+          return null;
+        });
+      if (raced) return this.answerStored(key, raced);
     } catch (e) {
       // The cap's own refusal is this repository's, not the driver's, and
       // mapPgError would hand it back as null and rethrow it unchanged
@@ -346,7 +388,13 @@ export class ObservationRepository {
    * `observation.period` references `namespace_key` since Task 6 -- so this
    * cannot drop a row or multiply one.
    */
-  private async skeleton(idempotencyKey: string): Promise<Skeleton | null> {
+  private async skeleton(
+    idempotencyKey: string,
+    // The connection to ask. Defaults to the repository's, and the cap
+    // passes its own transaction so the re-read under the lock sees
+    // what that transaction sees.
+    on: Db = this.db,
+  ): Promise<Skeleton | null> {
     const found = await sql<{
       observation_id: string; ingested_at: Date;
       period_expired: boolean; ns_erased: boolean;
@@ -358,7 +406,7 @@ export class ObservationRepository {
       join namespace n on n.namespace_id = o.namespace_id
       join namespace_key k
         on k.namespace_id = o.namespace_id and k.period = o.period
-      where o.idempotency_key = ${idempotencyKey}`.execute(this.db);
+      where o.idempotency_key = ${idempotencyKey}`.execute(on);
     const row = found.rows[0];
     return row
       ? {

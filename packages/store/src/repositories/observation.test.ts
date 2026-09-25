@@ -275,10 +275,16 @@ describe("idempotency", () => {
     // to `if (true)` passed the whole suite at the commit that moved the
     // pre-read, and failed at its parent, which is this test doing its job
     // right up until the line it depends on moved out from under it.
-    let blind = true;
+    // Blind for the pre-read AND for the re-read the cap takes under its
+    // lock, so the insert is actually attempted and fails on the foreign
+    // key. Blind only once, the under-lock re-read hands back the stand-in
+    // and `append` answers "already stored" without ever inserting -- which
+    // is correct behaviour for a real concurrent writer and useless as a
+    // fixture for a FAILED insert.
+    let blind = 2;
     const priv = broken as unknown as { skeleton: (k: string) => Promise<unknown> };
     priv.skeleton = async () => {
-      if (blind) { blind = false; return null; }
+      if (blind > 0) { blind -= 1; return null; }
       return {
         observationId: standIn.observationId!,
         ingestedAt: new Date(standIn.ingestedAt!),
@@ -1495,11 +1501,16 @@ describe("the producer cap", () => {
     expect(await storedFor("cap-exact")).toBe(CAP);
   });
 
-  it("names the producer, the window and the count in the refusal", async () => {
+  it("names the producer, the window and the cap in the refusal", async () => {
     // A class-only assertion passes when a later guard throws the same class
     // for a different reason, which is how two tests on this branch were
     // hollow. The refusal has to say what an operator must act on: whose
-    // cap, over what window, and how many.
+    // cap, and over what window.
+    //
+    // It reports the CAP and not a count, because the count is bounded by
+    // the cap -- an exact total would be O(rows in the window) under the
+    // lock -- so a number called "observations in the window" would be a
+    // figure the code did not compute.
     const t = at("2028-02-05T00:00:00.000Z");
     for (let i = 0; i < CAP; i++) await t.obs.append(from("cap-message", `op:msg:${i}`));
     const refused = t.obs.append(from("cap-message", "op:msg:over"));
@@ -1568,6 +1579,55 @@ describe("the producer cap", () => {
     expect((await t2.obs.append(from("cap-msunit", "op:ms:3"))).created).toBe(true);
   });
 
+  it("holds the cap even when the connection defaults to REPEATABLE READ", async () => {
+    // The lock serialises the writers; it does not serialise what they SEE.
+    // Under REPEATABLE READ the snapshot is taken at the first statement of
+    // the transaction -- which is the lock acquisition itself, before the
+    // lock is granted -- so every queued appender counts against a snapshot
+    // that predates the previous holder's commit and they all pass.
+    // Measured before the fix: cap 5, fourteen rows stored.
+    //
+    // Nothing in the suite could see this, because nothing sets an isolation
+    // level. A role default, a PGOPTIONS, or a pooler is enough, and this
+    // package already pins DateStyle per connection for exactly that class
+    // of reason -- a setting no migration controls, arriving from outside.
+    const isolated = new URL(urlForSchema(requireTestUrl(), "obs_test"));
+    const options = isolated.searchParams.get("options") ?? "";
+    isolated.searchParams.set(
+      "options", `${options} -c default_transaction_isolation=repeatable\\ read`.trim(),
+    );
+    const rr = openDb(isolated.toString());
+    try {
+      // The URL asks for REPEATABLE READ and the store's own pin, appended
+      // after it, wins -- the same mechanism and the same precedence as the
+      // DateStyle pin beside it. Asserted rather than assumed: if the pin
+      // stopped being appended, the rest of this test would be measuring a
+      // hazard the store had stopped defending against and still passing.
+      const pinned = await sql<{ s: string }>`
+        select current_setting('default_transaction_isolation') as s`.execute(rr);
+      expect(pinned.rows[0]!.s).toBe("read committed");
+
+      const fives = { ...RETENTION_V0, producerMaxObservations: 5, producerWindowMs: 60_000 };
+      const c = fixedClock(new Date("2028-09-05T00:00:00.000Z"));
+      const ns = new NamespaceRepository(rr, ring, c, fives);
+      const obs = new ObservationRepository(rr, ns, c, fives);
+      const outcomes = await Promise.all(
+        Array.from({ length: 20 }, (_, i) =>
+          obs.append(from("cap-isolation", `op:iso:${i}`)).then(
+            () => "created" as const,
+            (e: unknown) => (e instanceof SourceRateExceeded
+              ? "refused"
+              : `other: ${(e as Error).constructor.name}: ${(e as Error).message.slice(0, 120)}`),
+          )),
+      );
+      expect(outcomes.filter((o) => o.startsWith("other"))).toEqual([]);
+      expect(outcomes.filter((o) => o === "created")).toHaveLength(5);
+      expect(await storedFor("cap-isolation")).toBe(5);
+    } finally {
+      await rr.destroy();
+    }
+  }, 20_000);
+
   it("locks per producer, so a busy producer never queues a quiet one", async () => {
     // The lock's KEY, which nothing held: `pg_advisory_xact_lock(1)` -- one
     // lock for the whole store -- passed every test above, because none of
@@ -1601,6 +1661,48 @@ describe("the producer cap", () => {
       await other.destroy();
     }
   }, 10_000);
+
+  it("never refuses a re-delivery that raced a fresh append at the boundary", async () => {
+    // The cap counted before the insert's duplicate path could answer, so
+    // two concurrent deliveries of the SAME event with one slot left made
+    // the loser a rate violation for a row that WAS stored -- measured, four
+    // rounds in five, with an error saying nothing was written about an
+    // event that had just been written. The retry consumed no slot and was
+    // refused by one, which is R3's denial of service on ourselves arriving
+    // through the path that exists to prevent it.
+    //
+    // The key is re-read under the lock now, so a racer finds the row and is
+    // answered rather than counted.
+    const t = at("2028-10-05T00:00:00.000Z");
+    for (let i = 0; i < CAP - 1; i++) await t.obs.append(from("cap-racer", `op:race:${i}`));
+    const same = from("cap-racer", "op:race:same");
+    const outcomes = await Promise.all(Array.from({ length: 6 }, () =>
+      t.obs.append(same).then(
+        (r) => (r.created ? "created" : "answered"),
+        (e: unknown) => (e instanceof SourceRateExceeded
+          ? "REFUSED A RETRY"
+          : `other: ${(e as Error).message.slice(0, 80)}`),
+      )));
+    expect(outcomes.filter((o) => o === "created")).toHaveLength(1);
+    expect(outcomes.filter((o) => o === "answered")).toHaveLength(5);
+    expect(await storedFor("cap-racer")).toBe(CAP);
+  });
+
+  it("puts the window's own edge outside it, so the boundary is not a guess", async () => {
+    // `ingested_at > since` and not `>=`, which nothing held: no test put a
+    // row at exactly `now - window`. The convention is the half-open window
+    // (now - w, now], and it is a convention rather than a deduction, so it
+    // is written down here rather than left to whoever next reads the SQL.
+    const edge = { ...RETENTION_V0, producerMaxObservations: 1, producerWindowMs: 1_000 };
+    const t0 = at("2028-11-05T00:00:00.000Z", edge);
+    expect((await t0.obs.append(from("cap-edge", "op:edge:1"))).created).toBe(true);
+    // One millisecond inside the window: the first row still counts.
+    await expect(at("2028-11-05T00:00:00.999Z", edge).obs.append(from("cap-edge", "op:edge:2")))
+      .rejects.toBeInstanceOf(SourceRateExceeded);
+    // Exactly one window later, the first row sits ON the edge and is out.
+    expect((await at("2028-11-05T00:00:01.000Z", edge).obs.append(from("cap-edge", "op:edge:3"))).created)
+      .toBe(true);
+  });
 
   it("stores exactly the cap under twenty concurrent appends", async () => {
     // The only test that sees a missing lock. Count-then-insert without one
