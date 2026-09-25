@@ -11,7 +11,7 @@ import { fixedClock } from "../clock.js";
 import { RETENTION_V0, periodOf } from "../retention.js";
 import {
   CiphertextRejected, ConstraintViolation, IdempotencyKeyMismatch, NamespaceShredded,
-  ObservationNotFound, PayloadExpired, StoreError, mapPgError,
+  ObservationNotFound, PayloadExpired, StoreError, mapPgError, SourceRateExceeded,
 } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
@@ -1443,5 +1443,180 @@ describe("a re-delivery whose payload cannot be opened", () => {
       .rejects.toBeInstanceOf(PayloadExpired);
     const again = await at("2027-05-01T00:00:00.000Z").obs.append(wire);
     expect(again.created).toBe(false);
+  });
+});
+
+
+// Task 8b, G12's first half. The producer cap.
+//
+// R3 says plainly what this is NOT: a defence against an attacker. The
+// producer name is free text until signatures are enforced, so anyone who
+// wanted around it would rotate names. Its real job is catching our own
+// indexer in a loop, which is why too LOW is the dangerous direction -- it
+// refuses a legitimate delivery and becomes the denial of service on
+// ourselves that §6 exists to prevent.
+//
+// Every number here is overridden and none of them collides with another
+// field of the policy, which is the habit the M2 ledger asks for: under the
+// shipped values (90, 86_400_000, 10_000_000) a cap read from the wrong
+// field would agree with itself.
+describe("the producer cap", () => {
+  const CAP = 3;
+  const WINDOW = 1_000;
+  const capped = { ...RETENTION_V0, producerMaxObservations: CAP, producerWindowMs: WINDOW };
+
+  function at(iso: string, policy = capped) {
+    const c = fixedClock(new Date(iso));
+    const ns = new NamespaceRepository(db, ring, c, policy);
+    return { ns, obs: new ObservationRepository(db, ns, c, policy) };
+  }
+
+  const from = (producer: string, ref: string, wallet = "CAPWALLET") => anEvent({
+    namespace: { kind: "wallet", id: wallet },
+    source: { ...src, producer, ref },
+  });
+
+  async function storedFor(producer: string): Promise<number> {
+    const r = await sql<{ n: string }>`
+      select count(*)::text as n from observation where producer = ${producer}`.execute(db);
+    return Number(r.rows[0]!.n);
+  }
+
+  it("admits the cap and refuses the one after it, writing nothing", async () => {
+    const t = at("2028-01-05T00:00:00.000Z");
+    for (let i = 0; i < CAP; i++) {
+      expect((await t.obs.append(from("cap-exact", `op:cap:${i}`))).created).toBe(true);
+    }
+    expect(await storedFor("cap-exact")).toBe(CAP);
+    await expect(t.obs.append(from("cap-exact", "op:cap:over")))
+      .rejects.toBeInstanceOf(SourceRateExceeded);
+    // Refused means refused: the row is not written and the next window does
+    // not inherit it.
+    expect(await storedFor("cap-exact")).toBe(CAP);
+  });
+
+  it("names the producer, the window and the count in the refusal", async () => {
+    // A class-only assertion passes when a later guard throws the same class
+    // for a different reason, which is how two tests on this branch were
+    // hollow. The refusal has to say what an operator must act on: whose
+    // cap, over what window, and how many.
+    const t = at("2028-02-05T00:00:00.000Z");
+    for (let i = 0; i < CAP; i++) await t.obs.append(from("cap-message", `op:msg:${i}`));
+    const refused = t.obs.append(from("cap-message", "op:msg:over"));
+    await expect(refused).rejects.toThrow(/cap-message/);
+    await expect(refused).rejects.toThrow(new RegExp(String(WINDOW)));
+    await expect(refused).rejects.toThrow(new RegExp(`\\b${CAP}\\b`));
+  });
+
+  it("leaves another producer alone, because the cap is per producer", async () => {
+    const t = at("2028-03-05T00:00:00.000Z");
+    for (let i = 0; i < CAP; i++) await t.obs.append(from("cap-noisy", `op:noisy:${i}`));
+    await expect(t.obs.append(from("cap-noisy", "op:noisy:over")))
+      .rejects.toBeInstanceOf(SourceRateExceeded);
+    // A second producer at the same instant is unaffected.
+    expect((await t.obs.append(from("cap-quiet", "op:quiet:1"))).created).toBe(true);
+  });
+
+  it("admits one more once the window has passed", async () => {
+    const t0 = at("2028-04-05T00:00:00.000Z");
+    for (let i = 0; i < CAP; i++) await t0.obs.append(from("cap-window", `op:win:${i}`));
+    await expect(t0.obs.append(from("cap-window", "op:win:over")))
+      .rejects.toBeInstanceOf(SourceRateExceeded);
+    // The window is a SLIDING one on ingest time, so two seconds later the
+    // three above have left it. A cap counted over all history would still
+    // refuse here.
+    const t1 = at("2028-04-05T00:00:02.000Z");
+    expect((await t1.obs.append(from("cap-window", "op:win:after"))).created).toBe(true);
+  });
+
+  it("does not charge a re-delivery against the cap", async () => {
+    // The pre-read is OUTSIDE the lock and outside the count, so the
+    // indexer's normal retry never consumes a slot. Charged, a producer at
+    // its cap could not retry anything, which is the denial of service on
+    // ourselves R3 warns about, arriving through the retry path.
+    const t = at("2028-05-05T00:00:00.000Z");
+    const first = from("cap-retry", "op:retry:1");
+    await t.obs.append(first);
+    for (let i = 1; i < CAP; i++) await t.obs.append(from("cap-retry", `op:retry:${i + 1}`));
+    expect(await storedFor("cap-retry")).toBe(CAP);
+    // At the cap. A fresh one is refused; the re-delivery is not.
+    await expect(t.obs.append(from("cap-retry", "op:retry:fresh")))
+      .rejects.toBeInstanceOf(SourceRateExceeded);
+    expect(await t.obs.append(first)).toMatchObject({ created: false, readable: true });
+  });
+
+  it("measures the window in milliseconds, not in whichever number is to hand", async () => {
+    // Every other test here appends at ONE fixed instant, so the window's
+    // LENGTH never bites: `ingested_at > now - w` admits a row stamped `now`
+    // for any positive w. Reading the window from `producerMaxObservations`
+    // instead of `producerWindowMs` therefore passed the whole suite --
+    // measured, and it is the policy-override habit's own failure mode, one
+    // level up: the fields differ, but the fixture never asked them to.
+    //
+    // Cap one, window one second, two appends half a second apart. Under the
+    // window that is declared, the second sees the first. Under a window of
+    // one millisecond -- which is what the cap's own value would give -- it
+    // does not.
+    const narrow = { ...RETENTION_V0, producerMaxObservations: 1, producerWindowMs: 1_000 };
+    const t0 = at("2028-07-05T00:00:00.000Z", narrow);
+    expect((await t0.obs.append(from("cap-msunit", "op:ms:1"))).created).toBe(true);
+    const t1 = at("2028-07-05T00:00:00.500Z", narrow);
+    await expect(t1.obs.append(from("cap-msunit", "op:ms:2")))
+      .rejects.toBeInstanceOf(SourceRateExceeded);
+    // And just past the second, it is admitted again.
+    const t2 = at("2028-07-05T00:00:01.100Z", narrow);
+    expect((await t2.obs.append(from("cap-msunit", "op:ms:3"))).created).toBe(true);
+  });
+
+  it("locks per producer, so a busy producer never queues a quiet one", async () => {
+    // The lock's KEY, which nothing held: `pg_advisory_xact_lock(1)` -- one
+    // lock for the whole store -- passed every test above, because none of
+    // them has two producers in flight at once. A global lock is not a wrong
+    // answer, it is every append in the system queueing behind every other,
+    // which is the kind of defect that is invisible until it is the only
+    // thing anyone can see.
+    //
+    // Deterministic rather than timed: another connection holds advisory
+    // lock 1, the number the mutant would take. Under the shipped key the
+    // append takes hashtext(producer), does not meet it, and finishes. Under
+    // the mutant it waits for a lock this test never releases, and the test
+    // fails by timing out rather than by being slow.
+    const other = openDb(urlForSchema(requireTestUrl(), "obs_test"));
+    try {
+      let unlock!: () => void;
+      const held = new Promise<void>((r) => { unlock = r; });
+      let taken!: () => void;
+      const ready = new Promise<void>((r) => { taken = r; });
+      const holder = other.transaction().execute(async (trx) => {
+        await sql`select pg_advisory_xact_lock(1)`.execute(trx);
+        taken();
+        await held;
+      });
+      await ready;
+      const t = at("2028-08-05T00:00:00.000Z");
+      expect((await t.obs.append(from("cap-unblocked", "op:unblocked:1"))).created).toBe(true);
+      unlock();
+      await holder;
+    } finally {
+      await other.destroy();
+    }
+  }, 10_000);
+
+  it("stores exactly the cap under twenty concurrent appends", async () => {
+    // The only test that sees a missing lock. Count-then-insert without one
+    // admits the pool's width over the cap -- measured as "a cap that is not
+    // a cap" in the plan's risk list -- and every sequential test above
+    // passes without it.
+    const fives = { ...RETENTION_V0, producerMaxObservations: 5, producerWindowMs: 60_000 };
+    const t = at("2028-06-05T00:00:00.000Z", fives);
+    const attempts = Array.from({ length: 20 }, (_, i) =>
+      t.obs.append(from("cap-concurrent", `op:conc:${i}`)).then(
+        () => "created" as const,
+        (e: unknown) => (e instanceof SourceRateExceeded ? "refused" as const : Promise.reject(e)),
+      ));
+    const outcomes = await Promise.all(attempts);
+    expect(outcomes.filter((o) => o === "created")).toHaveLength(5);
+    expect(outcomes.filter((o) => o === "refused")).toHaveLength(15);
+    expect(await storedFor("cap-concurrent")).toBe(5);
   });
 });

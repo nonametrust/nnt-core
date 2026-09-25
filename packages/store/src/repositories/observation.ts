@@ -10,7 +10,7 @@ import { open, payloadAad, seal } from "../crypto.js";
 import { assertRetentionPolicy, periodOf, type RetentionPolicy } from "../retention.js";
 import {
   CiphertextRejected, IdempotencyKeyMismatch, NamespaceShredded, ObservationNotFound,
-  PayloadExpired, mapPgError,
+  PayloadExpired, mapPgError, SourceRateExceeded,
 } from "../errors.js";
 import { PERIOD_TEXT, type NamespaceRepository } from "./namespace.js";
 
@@ -82,17 +82,16 @@ export class ObservationRepository {
     // policy that reaches production, which is the argument the key ring's
     // missing default master key already made.
     //
-    // HONEST ABOUT WHAT IT DOES TODAY, because the first version of this
-    // comment was not and review measured the gap: nothing here READS it.
-    // The comment said "this repository caps on producerWindowMs and
-    // producerMaxObservations" -- it will, in the second half of this task,
-    // and it does not yet. All this parameter buys at this commit is that a
-    // malformed policy is refused at construction and that the composition
-    // point already has to hand one value to both repositories, so the cap
-    // arrives into a seam that exists rather than widening the constructor
-    // later. A required parameter nothing reads is a promise; this one is a
-    // promise with a date on it, and saying so beats a comment that claims
-    // the mechanism early.
+    // `append` reads `producerWindowMs` and `producerMaxObservations` for the
+    // cap, while the namespace repository expires on `graceDays`, and nothing
+    // compares the two policies -- so handed different objects the store
+    // would cap under one number and expire under another with no error
+    // anywhere. The composition point passes ONE value to both.
+    //
+    // For one commit this comment claimed that and the code did not do it:
+    // the parameter was asserted, stored and never read, and review measured
+    // the gap. It is read now. The note stays because "the comment described
+    // a mechanism that arrived later" is the failure mode, not the delay.
     private readonly policy: RetentionPolicy,
   ) {
     // Asserted here for the reason NamespaceRepository asserts it: this is
@@ -203,25 +202,72 @@ export class ObservationRepository {
     }));
 
     try {
-      await this.db
-        .insertInto("observation")
-        .values({
-          observation_id: observationId,
-          idempotency_key: key,
-          namespace_id: ns.namespaceId,
-          channel: stored.channel,
-          kind: stored.kind,
-          evidence_kind: stored.evidenceKind,
-          dated_at: datedColumn,
-          ingested_at: ingestedAt,
-          producer: stored.source.producer,
-          period,
-          payload_nonce: sealed.nonce,
-          payload_tag: sealed.tag,
-          payload_ciphertext: sealed.ciphertext,
-        })
-        .execute();
+      // The cap, and the insert, in one transaction.
+      //
+      // The lock is per PRODUCER and transaction-scoped, the shape
+      // `0005:84` and `chain.ts:275` already use: it is released by the
+      // commit or the rollback, so there is no unlock that could land on
+      // another pooled connection and no lock that can outlive the work it
+      // guards (M1 ledger 189-194).
+      //
+      // Count-then-insert without it is the failure the plan names "a cap
+      // that is not a cap": every concurrent appender reads the same count
+      // and they all pass, so the cap is exceeded by roughly the pool's
+      // width once per window. Sequential tests cannot see it; the
+      // twenty-concurrent one is the only thing that can.
+      //
+      // `hashtext` rather than the producer string, because the advisory
+      // lock space is bigint. Two producers can collide there and the cost
+      // of a collision is that two producers queue behind each other for the
+      // length of one insert -- not a wrong count, because the count itself
+      // filters on the producer column.
+      //
+      // The pre-read is deliberately OUTSIDE this transaction: a re-delivery
+      // has already returned by now, so the indexer's retry never consumes a
+      // slot. Charged, a producer at its cap could not retry anything, which
+      // is R3's denial of service on ourselves arriving through the one path
+      // that exists to prevent it.
+      await this.db.transaction().execute(async (trx) => {
+        await sql`select pg_advisory_xact_lock(hashtext(${stored.source.producer}))`
+          .execute(trx);
+        const since = new Date(ingestedAt.getTime() - this.policy.producerWindowMs);
+        const counted = await sql<{ n: string }>`
+          select count(*)::text as n from observation
+          where producer = ${stored.source.producer} and ingested_at > ${since}`
+          .execute(trx);
+        const n = Number(counted.rows[0]!.n);
+        if (n >= this.policy.producerMaxObservations) {
+          throw new SourceRateExceeded(
+            `producer ${stored.source.producer} has ${n} observations in the last ` +
+              `${this.policy.producerWindowMs} ms, which is its cap of ` +
+              `${this.policy.producerMaxObservations} under policy ${this.policy.version}; ` +
+              `nothing was written`,
+          );
+        }
+        await trx
+          .insertInto("observation")
+          .values({
+            observation_id: observationId,
+            idempotency_key: key,
+            namespace_id: ns.namespaceId,
+            channel: stored.channel,
+            kind: stored.kind,
+            evidence_kind: stored.evidenceKind,
+            dated_at: datedColumn,
+            ingested_at: ingestedAt,
+            producer: stored.source.producer,
+            period,
+            payload_nonce: sealed.nonce,
+            payload_tag: sealed.tag,
+            payload_ciphertext: sealed.ciphertext,
+          })
+          .execute();
+      });
     } catch (e) {
+      // The cap's own refusal is this repository's, not the driver's, and
+      // mapPgError would hand it back as null and rethrow it unchanged
+      // anyway. Named here so a reader does not have to work that out.
+      if (e instanceof SourceRateExceeded) throw e;
       // A concurrent writer may have inserted the same key between the read
       // above and this insert. That is a duplicate, not a failure, and it is
       // the only failure that is one. Re-reading after any other error would

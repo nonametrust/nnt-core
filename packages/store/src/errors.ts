@@ -38,6 +38,15 @@ export class TagAltered extends StoreError {}
 // the row. The cure is to read the live tag again and decide again, which is
 // a different instruction from "this tag does not exist".
 export class TagRefreshStale extends StoreError {}
+
+// Raised in TypeScript, so it carries no SQLSTATE: the database refused
+// nothing, this repository counted and declined. It names the producer, the
+// window and the count because an operator's next move depends on all three
+// -- R3 rules that this cap is not a defence against an attacker (the
+// producer name is free text until signatures are enforced) but a tripwire
+// for our own indexer in a loop, and a tripwire that does not say what it
+// counted is a tripwire nobody can act on.
+export class SourceRateExceeded extends StoreError {}
 // Raised in TypeScript, like NamespaceShredded, so it carries no SQLSTATE. It
 // exists because an erasure request naming a subject that has no row must not
 // resolve as success: nothing was examined, and "the data is gone" would be
