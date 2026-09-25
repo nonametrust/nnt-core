@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { open, permanentAad, seal, type KeyRing } from "../crypto.js";
+import { assertRetentionPolicy, type RetentionPolicy } from "../retention.js";
+import { NamespaceRepository } from "./namespace.js";
+import { ObservationRepository } from "./observation.js";
+import { observationSchema, type Observation } from "@nonametrust/schema";
 import type { Clock } from "../clock.js";
 import { refuseWriteInsideTransaction, type Db, type Schema } from "../db.js";
 import {
@@ -34,6 +39,12 @@ const COLUMNS = [
   "promoted_at", "rescued_by", "confidence",
 ] as const;
 
+// The payload columns are kept OUT of COLUMNS on purpose. That list is the
+// metadata surface: `get` selects it and returns it to callers, and a
+// shredded namespace's record must stay listable. The ciphertext is read
+// only by `read`, which opens it.
+const PAYLOAD_COLUMNS = ["payload_nonce", "payload_tag", "payload_ciphertext"] as const;
+
 /**
  * The permanent record repository. Its prototype carries `promote` and `get`
  * and nothing that updates or deletes, and the table refuses both from any
@@ -43,8 +54,17 @@ const COLUMNS = [
 export class PermanentRecordRepository {
   constructor(
     private readonly db: Db,
+    // The ring and the policy are here so `promote` can build repositories
+    // bound to its OWN transaction and read through them (R21). Reads
+    // compose on a transaction; that is the half of R21 this repository
+    // depends on, and it is why "inside the same transaction" in Task 9's
+    // text is true rather than aspirational.
+    private readonly ring: KeyRing,
     private readonly clock: Clock,
-  ) {}
+    private readonly policy: RetentionPolicy,
+  ) {
+    assertRetentionPolicy(policy);
+  }
 
   /**
    * Promotes an observation. The instant is copied from the observation row
@@ -107,6 +127,38 @@ export class PermanentRecordRepository {
             `observation ${input.observationId} is a state, and a state has no instant to preserve`,
           );
         }
+        // The rescue itself (Task 9). Repositories bound to THIS transaction,
+        // which R21 makes legitimate: reads compose on a transaction even
+        // though writes do not, so Task 9's "inside the same transaction" is
+        // literal. `get` opens the payload under the month key and therefore
+        // raises NamespaceShredded or PayloadExpired here -- before any row
+        // is written -- which is the refusal a promotion after expiry owes
+        // its caller. Until this existed `promote` never opened the
+        // observation at all and an expired promotion succeeded while
+        // rescuing nothing.
+        const txNamespaces = new NamespaceRepository(trx, this.ring, this.clock, this.policy);
+        const observation = await new ObservationRepository(
+          trx, txNamespaces, this.clock, this.policy,
+        ).get(input.observationId);
+
+        // Re-sealed under the NAMESPACE key and not the month key, which is
+        // the whole point: the month key dies on the retention clock and
+        // this must outlive it, while an erasure of the counterparty space
+        // still takes it. Copying the month-sealed ciphertext across would
+        // produce a record that expires with the thing it was meant to
+        // rescue.
+        const sealed = seal(
+          await txNamespaces.dataKey(input.namespaceId),
+          JSON.stringify(observation),
+          permanentAad({
+            recordId,
+            observationId: input.observationId,
+            namespaceId: input.namespaceId,
+            originalDatedAt: source.dated_at,
+            promotedAt,
+          }),
+        );
+
         // An insert from a select is positional: the aliases below are for
         // the reader, and it is the order that binds each value to its
         // column, so the select list is in COLUMNS' order. The parameters
@@ -114,7 +166,7 @@ export class PermanentRecordRepository {
         // verified on 17.7 through pg_prepared_statements.
         const row = await trx
           .insertInto("permanent_record")
-          .columns(COLUMNS)
+          .columns([...COLUMNS, ...PAYLOAD_COLUMNS])
           .expression((eb) =>
             eb
               .selectFrom("observation")
@@ -126,6 +178,9 @@ export class PermanentRecordRepository {
                 eb.val(promotedAt).as("promoted_at"),
                 eb.val(input.rescuedBy).as("rescued_by"),
                 eb.val(input.confidence).as("confidence"),
+                eb.val(sealed.nonce).as("payload_nonce"),
+                eb.val(sealed.tag).as("payload_tag"),
+                eb.val(sealed.ciphertext).as("payload_ciphertext"),
               ])
               .where("observation_id", "=", input.observationId),
           )
@@ -136,6 +191,41 @@ export class PermanentRecordRepository {
     } catch (e) {
       throw mapPgError(e) ?? e;
     }
+  }
+
+  /**
+   * The rescued observation itself, opened under the NAMESPACE key.
+   *
+   * The binding is rebuilt from the row's own columns, so a record whose
+   * identity, observation, namespace or either instant has been moved does
+   * not open -- the same rule the observation read follows, and the reason a
+   * ciphertext lifted from another record cannot be attributed here.
+   *
+   * Re-parsed through the schema rather than returned as JSON, so what comes
+   * back is the observation the schema admits and not whatever bytes the
+   * column held. `get` stays metadata-only and keeps working for a shredded
+   * namespace; this is the call that refuses.
+   */
+  async read(recordId: string): Promise<Observation> {
+    const row = await this.db
+      .selectFrom("permanent_record")
+      .select([...COLUMNS, ...PAYLOAD_COLUMNS])
+      .where("record_id", "=", recordId)
+      .executeTakeFirst();
+    if (!row) throw new PermanentRecordNotFound(`no permanent record ${recordId}`);
+    const namespaces = new NamespaceRepository(this.db, this.ring, this.clock, this.policy);
+    const plain = open(
+      await namespaces.dataKey(row.namespace_id),
+      { nonce: row.payload_nonce, tag: row.payload_tag, ciphertext: row.payload_ciphertext },
+      permanentAad({
+        recordId: row.record_id,
+        observationId: row.observation_id,
+        namespaceId: row.namespace_id,
+        originalDatedAt: row.original_dated_at,
+        promotedAt: row.promoted_at,
+      }),
+    );
+    return observationSchema.parse(JSON.parse(plain)) as Observation;
   }
 
   async get(recordId: string): Promise<StoredPermanentRecord> {
@@ -149,7 +239,13 @@ export class PermanentRecordRepository {
   }
 }
 
-function toStored(row: Schema["permanent_record"]): StoredPermanentRecord {
+// Takes only the METADATA columns, which is what `get` selects and what a
+// shredded namespace's record must still yield. Typed as a Pick rather
+// than the whole row so that adding a payload column to the table cannot
+// quietly oblige every caller of this to carry a ciphertext.
+function toStored(
+  row: Pick<Schema["permanent_record"], (typeof COLUMNS)[number]>,
+): StoredPermanentRecord {
   return {
     recordId: row.record_id,
     observationId: row.observation_id,

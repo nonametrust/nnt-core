@@ -235,7 +235,7 @@ beforeAll(async () => {
   observations = new ObservationRepository(db, namespaces, clock, RETENTION_V0);
   tags = new TagRepository(db, clock);
   triggers = new TriggerEventRepository(db, clock);
-  records = new PermanentRecordRepository(db, clock);
+  records = new PermanentRecordRepository(db, ring, clock, RETENTION_V0);
   chain = new AuditChain(db, clock, ring);
   provider = (await namespaces.ensure(PROVIDER)).namespaceId;
 });

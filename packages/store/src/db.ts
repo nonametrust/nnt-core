@@ -89,6 +89,12 @@ export interface Schema {
     promoted_at: Date;
     rescued_by: string | null;
     confidence: number;
+    // The rescued observation, re-sealed under the NAMESPACE key (Task 9).
+    // Not in the metadata surface `get` returns: a shredded namespace's
+    // record stays listable and only `read` refuses.
+    payload_nonce: Buffer;
+    payload_tag: Buffer;
+    payload_ciphertext: Buffer;
   };
   // `seq` is a string throughout. bigint arrives from the driver as a string
   // unless a type parser is configured, and none is: a chain sequence is an

@@ -17,6 +17,7 @@
 --   4. namespace_key: the month key, its guard, and what expiry may not do
 --   5. observation: the period it is keyed on, and the key row it requires
 --   6. observation: no counterparty is observed after its erasure
+--   7. permanent_record: the payload a rescue keeps
 
 -- Before anything else: this migration moves the byte layout of the payload
 -- envelope, and a stored payload is sealed under the layout that was in force
@@ -587,3 +588,32 @@ $$;
 create trigger observation_namespace_live_on_insert
   before insert on observation
   for each row execute function observation_namespace_live();
+
+
+-- === 7. permanent_record: the payload a rescue keeps (Task 9) =================
+--
+-- The card's whole sentence is that a captured trace outlives its month. Until
+-- this section `promote` copied metadata and never opened the observation, so a
+-- promotion after a month expired SUCCEEDED and rescued nothing: the
+-- retroactive-rescue mechanism quietly producing an empty rescue, with no error
+-- anywhere and a record that looks complete. §1 of the plan found it by reading
+-- the shipped code rather than the design.
+--
+-- The three columns hold the observation re-sealed under the NAMESPACE key,
+-- not the month key. That is the point: the month key dies on the retention
+-- clock and the namespace key does not, so a rescue survives its month and
+-- still dies with an erasure request. Copying the month-sealed ciphertext
+-- instead would produce a record that expires with the thing it was meant to
+-- outlive -- the fourth path in the plan's risk list, and the one an
+-- implementer reaches for because it looks like less work.
+--
+-- NOT NULL, because a record without a payload is the empty rescue this
+-- section exists to make impossible. The table is empty here; over rows this
+-- would fail, which is the same refusal the preamble makes for the whole file.
+--
+-- The append-only trigger from 0004 stays and now covers these too: a record
+-- is written once, and the payload bound into it cannot be swapped afterwards
+-- without the trigger being disabled.
+alter table permanent_record add column payload_nonce bytea not null;
+alter table permanent_record add column payload_tag bytea not null;
+alter table permanent_record add column payload_ciphertext bytea not null;

@@ -1869,7 +1869,7 @@ describe("composing on a transaction", () => {
       const ns = new NamespaceRepository(trx, ring, clock, RETENTION_V0);
       const obs = new ObservationRepository(trx, ns, clock, RETENTION_V0);
       const chain = new AuditChain(trx, clock, ring);
-      const records = new PermanentRecordRepository(trx, clock);
+      const records = new PermanentRecordRepository(trx, ring, clock, RETENTION_V0);
       for (const [name, run] of [
         ["append", () => obs.append(anEvent({ source: { ...src, ref: "op:r21:1" } }))],
         ["AuditChain.append", () => chain.append({

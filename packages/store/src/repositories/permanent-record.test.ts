@@ -2,14 +2,16 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { WireObservation } from "@nonametrust/schema";
 import { sql } from "kysely";
-import type { Db } from "../db.js";
-import { withSchema, storedObservation } from "../testing/harness.js";
-import { keyRingFromEnv } from "../crypto.js";
+import { withIsoDates, type Db, type Schema } from "../db.js";
+import { Kysely, PostgresDialect } from "kysely";
+import pg from "pg";
+import { requireTestUrl, storedObservation, urlForSchema, withSchema } from "../testing/harness.js";
+import { keyRingFromEnv, permanentAad, seal } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import { RETENTION_V0 } from "../retention.js";
 import {
   AppendOnlyViolation, ConstraintViolation, NamespaceShredded, ObservationNotFound,
-  PermanentRecordNotFound, StateNotPromotable, StoreError, mapPgError,
+  PermanentRecordNotFound, StateNotPromotable, StoreError, mapPgError, PayloadExpired, CiphertextRejected,
 } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
@@ -67,7 +69,7 @@ beforeAll(async () => {
   ({ db, done } = await withSchema("permrec_test"));
   namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
   observations = new ObservationRepository(db, namespaces, clock, RETENTION_V0);
-  records = new PermanentRecordRepository(db, clock);
+  records = new PermanentRecordRepository(db, ring, clock, RETENTION_V0);
   ns = (await namespaces.ensure({ kind: "wallet", id: "GOLDADDRESS" })).namespaceId;
 });
 afterAll(async () => { await done(); });
@@ -297,5 +299,236 @@ describe("what the repository refuses before writing", () => {
     await expect(records.promote({
       observationId: randomUUID(), namespaceId: ns, rescuedBy: null, confidence: 0.5,
     })).rejects.toBeInstanceOf(ObservationNotFound);
+  });
+});
+
+
+// Task 9, G11. The whole card exists for one sentence -- a captured trace
+// outlives its month -- and until now `promote` copied metadata and never
+// opened the observation at all, so a promotion after expiry succeeded while
+// rescuing nothing. §1 found it; this is where it closes.
+describe("the permanent copy outlives its month", () => {
+  const grace7 = { ...RETENTION_V0, graceDays: 7 };
+
+  function at(iso: string) {
+    const c = fixedClock(new Date(iso));
+    const nsRepo = new NamespaceRepository(db, ring, c, grace7);
+    return {
+      ns: nsRepo,
+      obs: new ObservationRepository(db, nsRepo, c, grace7),
+      rec: new PermanentRecordRepository(db, ring, c, grace7),
+    };
+  }
+
+  const anEventFor = (wallet: string, ref: string) => ({
+    schemaVersion: "0.1.0",
+    namespace: { kind: "wallet", id: wallet },
+    channel: "volume", evidenceKind: "event", kind: "payment",
+    observedAt: "2027-03-12T09:00:00.000Z",
+    source: { ...src, ref },
+    payload: { amount: "500.0000000" },
+    salienceHints: { amount: "500.0000000" },
+  }) as WireObservation;
+
+  async function promoted(wallet: string, ref: string) {
+    const march = at("2027-03-15T00:00:00.000Z");
+    const o = storedObservation(await march.obs.append(anEventFor(wallet, ref)));
+    const nsId = (await march.ns.find("wallet", wallet))!.namespaceId;
+    const record = await march.rec.promote({
+      observationId: o.observationId!, namespaceId: nsId,
+      rescuedBy: null, confidence: 0.9,
+    });
+    return { o, nsId, record };
+  }
+
+  async function expireMarch(nsId: string) {
+    await sql`update namespace_key set key_wrapped = null,
+                shredded_at = ${new Date("2027-04-08T00:00:00.000Z")}
+              where namespace_id = ${nsId} and period = '2027-03-01'::date`.execute(db);
+  }
+
+  it("reads the rescued observation back after its month is gone", async () => {
+    const { o, nsId, record } = await promoted("PERM1", "op:perm:1");
+    await expireMarch(nsId);
+    const after = at("2027-05-01T00:00:00.000Z");
+
+    // The source is unreadable; the rescue is not. That pair IS the card.
+    await expect(after.obs.get(o.observationId!)).rejects.toBeInstanceOf(PayloadExpired);
+    const rescued = await after.rec.read(record.recordId);
+    expect(rescued).toEqual(o);
+  });
+
+  it("refuses a promotion after the month expired, and writes no row", async () => {
+    const march = at("2027-03-15T00:00:00.000Z");
+    const o = storedObservation(await march.obs.append(anEventFor("PERM2", "op:perm:2")));
+    const nsId = (await march.ns.find("wallet", "PERM2"))!.namespaceId;
+    await expireMarch(nsId);
+
+    const after = at("2027-05-01T00:00:00.000Z");
+    await expect(after.rec.promote({
+      observationId: o.observationId!, namespaceId: nsId,
+      rescuedBy: null, confidence: 0.5,
+    })).rejects.toBeInstanceOf(PayloadExpired);
+    const rows = await sql<{ n: string }>`
+      select count(*)::text as n from permanent_record where observation_id = ${o.observationId!}`
+      .execute(db);
+    expect(rows.rows[0]!.n).toBe("0");
+  });
+
+  it("makes the rescue unreadable when the counterparty space is erased", async () => {
+    // The other half of retention: a month key's death is survivable, the
+    // namespace key's is not. This is the sentence the whitepaper makes
+    // about erasing a whole counterparty space, and it has to be true of the
+    // permanent copy or the copy is a way around an erasure request.
+    const { nsId, record } = await promoted("PERM3", "op:perm:3");
+    const after = at("2027-05-01T00:00:00.000Z");
+    expect(await after.rec.read(record.recordId)).toBeDefined();
+    await after.ns.shred(nsId);
+    await expect(after.rec.read(record.recordId)).rejects.toBeInstanceOf(NamespaceShredded);
+    // Metadata stays listable, so a shredded namespace's records can still
+    // be counted and audited.
+    expect((await after.rec.get(record.recordId)).recordId).toBe(record.recordId);
+  });
+
+  it("refuses the read when any bound column is moved", async () => {
+    // The payload is bound to the record's own identity. Without that a
+    // ciphertext lifted from another record opens here, and the permanent
+    // store becomes a way to attribute one counterparty's evidence to
+    // another. Planted with the append-only trigger off, inside a
+    // transaction that is rolled back.
+    const { record, nsId } = await promoted("PERM4", "op:perm:4");
+    const after = at("2027-05-01T00:00:00.000Z");
+    // A real sibling in the SAME namespace, so the composite foreign key is
+    // satisfied and the move is the one that matters: a record re-pointed at
+    // another observation of the same counterparty. A random id would be
+    // refused by the key before the binding was ever consulted.
+    const sibling = storedObservation(
+      await at("2027-03-15T00:00:00.000Z").obs.append(anEventFor("PERM4", "op:perm:4b")),
+    );
+    expect(nsId).toBeDefined();
+    const moves = {
+      observation_id: sql`observation_id = ${sibling.observationId!}`,
+      original_dated_at: sql`original_dated_at = original_dated_at + interval '1 day'`,
+      promoted_at: sql`promoted_at = promoted_at + interval '1 day'`,
+    };
+    for (const [column, move] of Object.entries(moves)) {
+      const ROLLBACK = Symbol("rollback");
+      let refused: unknown;
+      await db.transaction().execute(async (trx) => {
+        // Both guards off: one refuses any UPDATE, the other refuses a move
+        // of the preserved instant, and this plants exactly those moves.
+        await sql`alter table permanent_record disable trigger permanent_record_append_only`
+          .execute(trx);
+        await sql`alter table permanent_record disable trigger permanent_record_date_preserved`
+          .execute(trx);
+        await sql`update permanent_record set ${move} where record_id = ${record.recordId}`
+          .execute(trx);
+        const inside = new PermanentRecordRepository(
+          trx, ring, fixedClock(new Date("2027-05-01T00:00:00.000Z")), grace7,
+        );
+        refused = await inside.read(record.recordId).then(() => null, (e: unknown) => e);
+        throw ROLLBACK;
+      }).catch((e: unknown) => { if (e !== ROLLBACK) throw e; });
+      expect(refused, column).toBeInstanceOf(CiphertextRejected);
+    }
+    // And the row is untouched afterwards, so the loop measured refusals
+    // rather than destroying the fixture.
+    expect(await after.rec.read(record.recordId)).toBeDefined();
+  });
+
+  it("refuses a payload that opens but is not an observation", async () => {
+    // The re-parse through the schema, which nothing held: dropping it left
+    // `read` handing back whatever JSON the column contained. The key and
+    // the binding are both correct here -- this is a record sealed by
+    // someone with the namespace key, which is the whole threat model one
+    // level down -- so only the parse stands between the caller and a shape
+    // the rest of the engine will throw on somewhere far from here.
+    const { record, nsId } = await promoted("PERM5", "op:perm:5");
+    const after = at("2027-05-01T00:00:00.000Z");
+    const row = await after.rec.get(record.recordId);
+    const forged = seal(
+      await after.ns.dataKey(nsId),
+      JSON.stringify({ notAnObservation: true }),
+      permanentAad({
+        recordId: row.recordId, observationId: row.observationId,
+        namespaceId: row.namespaceId, originalDatedAt: row.originalDatedAt,
+        promotedAt: row.promotedAt,
+      }),
+    );
+    const ROLLBACK = Symbol("rollback");
+    let refused: unknown;
+    await db.transaction().execute(async (trx) => {
+      await sql`alter table permanent_record disable trigger permanent_record_append_only`
+        .execute(trx);
+      await sql`update permanent_record set payload_nonce = ${forged.nonce},
+                  payload_tag = ${forged.tag}, payload_ciphertext = ${forged.ciphertext}
+                where record_id = ${record.recordId}`.execute(trx);
+      const inside = new PermanentRecordRepository(
+        trx, ring, fixedClock(new Date("2027-05-01T00:00:00.000Z")), grace7,
+      );
+      refused = await inside.read(record.recordId).then(() => null, (e: unknown) => e);
+      throw ROLLBACK;
+    }).catch((e: unknown) => { if (e !== ROLLBACK) throw e; });
+    expect(refused).toBeInstanceOf(Error);
+    expect((refused as Error).constructor.name).toBe("ZodError");
+  });
+
+  it("reads the observation on its OWN transaction, not on the pool", async () => {
+    // R21's point, and the only thing that can see it. Under READ COMMITTED
+    // a pool read returns the same committed rows, so swapping `trx` for the
+    // pool changes no answer -- and deadlocks the pool the moment there is
+    // contention, because `promote` is already holding a connection while it
+    // asks for another. A pool of one makes that deterministic: on the
+    // transaction it completes, on the pool it waits for a connection only
+    // it could release.
+    const narrow = new Kysely<Schema>({
+      dialect: new PostgresDialect({
+        pool: new pg.Pool({ connectionString: withIsoDates(urlForSchema(requireTestUrl(), "permrec_test")), max: 1 }),
+      }),
+    });
+    try {
+      const c = fixedClock(new Date("2027-03-15T00:00:00.000Z"));
+      const nsRepo = new NamespaceRepository(db, ring, c, grace7);
+      const obs = new ObservationRepository(db, nsRepo, c, grace7);
+      const o = storedObservation(await obs.append(anEventFor("PERM6", "op:perm:6")));
+      const nsId = (await nsRepo.find("wallet", "PERM6"))!.namespaceId;
+      const record = await new PermanentRecordRepository(narrow, ring, c, grace7).promote({
+        observationId: o.observationId!, namespaceId: nsId,
+        rescuedBy: null, confidence: 0.7,
+      });
+      expect(record.observationId).toBe(o.observationId);
+    } finally {
+      await narrow.destroy();
+    }
+  }, 15_000);
+
+  it("refuses a record with no payload at all", async () => {
+    // NOT NULL on the three columns, which nothing held: made nullable, the
+    // suite stayed green, and a record with no payload is exactly the empty
+    // rescue this section exists to make impossible.
+    const { record } = await promoted("PERM7", "op:perm:7");
+    const ROLLBACK = Symbol("rollback");
+    let refused: unknown;
+    await db.transaction().execute(async (trx) => {
+      await sql`alter table permanent_record disable trigger permanent_record_append_only`
+        .execute(trx);
+      refused = await sql`update permanent_record set payload_ciphertext = null
+                          where record_id = ${record.recordId}`.execute(trx)
+        .then(() => null, (e: unknown) => e);
+      throw ROLLBACK;
+    }).catch((e: unknown) => { if (e !== ROLLBACK) throw e; });
+    expect((refused as { code?: string }).code).toBe("23502");
+  });
+
+  it("pins the permanent_record column catalogue", async () => {
+    const cols = await sql<{ column_name: string }>`
+      select column_name from information_schema.columns
+      where table_schema = current_schema() and table_name = 'permanent_record'
+      order by column_name`.execute(db);
+    expect(cols.rows.map((c) => c.column_name)).toEqual([
+      "confidence", "namespace_id", "observation_id", "original_dated_at",
+      "payload_ciphertext", "payload_nonce", "payload_tag",
+      "promoted_at", "record_id", "rescued_by",
+    ]);
   });
 });
