@@ -16,8 +16,10 @@
  * every path the store offers; and the sweep itself,
  * `NamespaceRepository.expirePeriods` (Task 7), so retention is now a clock
  * rather than something that happens when an operator writes a shred by hand.
- * What is NOT shipped: the permanent copy that lets a promoted trace outlive
- * its month (Task 9), so `permanent_record` still holds no payload.
+ * And the permanent copy (Task 9): `permanent_record` now carries the
+ * rescued observation re-sealed under the NAMESPACE key, so a promotion
+ * outlives the month it was captured in and still dies with an erasure
+ * request. Nothing on this card is unshipped any more.
  *
  * The sweep is the whole table's and the CALLER runs it: the store writes no
  * audit row for it and returns what it shredded so that the caller can. It

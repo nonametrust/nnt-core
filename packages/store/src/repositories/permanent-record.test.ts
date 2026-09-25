@@ -402,11 +402,17 @@ describe("the permanent copy outlives its month", () => {
     // satisfied and the move is the one that matters: a record re-pointed at
     // another observation of the same counterparty. A random id would be
     // refused by the key before the binding was ever consulted.
+    const movedRecordId = randomUUID();
     const sibling = storedObservation(
       await at("2027-03-15T00:00:00.000Z").obs.append(anEventFor("PERM4", "op:perm:4b")),
     );
     expect(nsId).toBeDefined();
     const moves = {
+      // record_id is part of the binding and was the one part nothing moved:
+      // the pair mutant that dropped it from BOTH sides died only by
+      // accident, through the forgery test's incidental pin on the AAD's
+      // shape. Moved here, and the read is asked for the NEW id.
+      record_id: sql`record_id = ${movedRecordId}`,
       observation_id: sql`observation_id = ${sibling.observationId!}`,
       original_dated_at: sql`original_dated_at = original_dated_at + interval '1 day'`,
       promoted_at: sql`promoted_at = promoted_at + interval '1 day'`,
@@ -426,7 +432,8 @@ describe("the permanent copy outlives its month", () => {
         const inside = new PermanentRecordRepository(
           trx, ring, fixedClock(new Date("2027-05-01T00:00:00.000Z")), grace7,
         );
-        refused = await inside.read(record.recordId).then(() => null, (e: unknown) => e);
+        const asked = column === "record_id" ? movedRecordId : record.recordId;
+        refused = await inside.read(asked).then(() => null, (e: unknown) => e);
         throw ROLLBACK;
       }).catch((e: unknown) => { if (e !== ROLLBACK) throw e; });
       expect(refused, column).toBeInstanceOf(CiphertextRejected);
@@ -506,18 +513,56 @@ describe("the permanent copy outlives its month", () => {
     // NOT NULL on the three columns, which nothing held: made nullable, the
     // suite stayed green, and a record with no payload is exactly the empty
     // rescue this section exists to make impossible.
+    // All THREE columns. The first version planted only the ciphertext, and
+    // review found the other two undefended: a raw writer could store a
+    // record with a null nonce or tag, and `read` then threw a bare
+    // TypeError on `sealed.nonce.length` instead of a named refusal.
     const { record } = await promoted("PERM7", "op:perm:7");
-    const ROLLBACK = Symbol("rollback");
-    let refused: unknown;
-    await db.transaction().execute(async (trx) => {
-      await sql`alter table permanent_record disable trigger permanent_record_append_only`
-        .execute(trx);
-      refused = await sql`update permanent_record set payload_ciphertext = null
-                          where record_id = ${record.recordId}`.execute(trx)
-        .then(() => null, (e: unknown) => e);
-      throw ROLLBACK;
-    }).catch((e: unknown) => { if (e !== ROLLBACK) throw e; });
-    expect((refused as { code?: string }).code).toBe("23502");
+    for (const column of ["payload_nonce", "payload_tag", "payload_ciphertext"] as const) {
+      const ROLLBACK = Symbol("rollback");
+      let refused: unknown;
+      await db.transaction().execute(async (trx) => {
+        await sql`alter table permanent_record disable trigger permanent_record_append_only`
+          .execute(trx);
+        refused = await sql`update permanent_record set ${sql.ref(column)} = null
+                            where record_id = ${record.recordId}`.execute(trx)
+          .then(() => null, (e: unknown) => e);
+        throw ROLLBACK;
+      }).catch((e: unknown) => { if (e !== ROLLBACK) throw e; });
+      expect((refused as { code?: string }).code, column).toBe("23502");
+    }
+  });
+
+  it("seals under the spellings the database stores, not the caller's", async () => {
+    // The empty rescue, reopened one column over. `promote` sealed with the
+    // uuid STRINGS the caller passed while `read` rebuilt the binding from
+    // the canonical lowercase the database hands back -- so a caller who
+    // spelled an id in uppercase, or in brace form, got a promotion that
+    // SUCCEEDED, wrote a complete-looking row, and produced a payload that
+    // never opens. Worse than the bug this task closed, because the failure
+    // is CiphertextRejected and reads as a tamper.
+    //
+    // The rule was already written down one file over: the wrap's associated
+    // data is bytes, and the bytes it was bound to are the canonical form
+    // the database reports. `promote` broke it.
+    const march = at("2027-03-15T00:00:00.000Z");
+    const nsId = (await march.ns.ensure({ kind: "wallet", id: "PERM8" })).namespaceId;
+    // One observation per shape: a record is promoted once per observation
+    // (permanent_record_once), so re-promoting the same one would fail on
+    // the unique key rather than on the binding this test is about.
+    const shapes = [
+      ["upper namespace", (n: string) => n.toUpperCase(), (o: string) => o],
+      ["upper observation", (n: string) => n, (o: string) => o.toUpperCase()],
+      ["braced namespace", (n: string) => `{${n}}`, (o: string) => o],
+    ] as const;
+    for (const [shape, spellNs, spellObs] of shapes) {
+      const o = storedObservation(await march.obs.append(anEventFor("PERM8", `op:perm:8:${shape}`)));
+      const record = await march.rec.promote({
+        observationId: spellObs(o.observationId!), namespaceId: spellNs(nsId),
+        rescuedBy: null, confidence: 0.4,
+      });
+      expect(await march.rec.read(record.recordId), shape).toEqual(o);
+    }
   });
 
   it("pins the permanent_record column catalogue", async () => {

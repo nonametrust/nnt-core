@@ -11,7 +11,7 @@ import { fixedClock } from "../clock.js";
 import { RETENTION_V0, periodOf } from "../retention.js";
 import {
   CiphertextRejected, ConstraintViolation, IdempotencyKeyMismatch, NamespaceShredded,
-  ObservationNotFound, PayloadExpired, StoreError, mapPgError, SourceRateExceeded, WriteInsideTransaction,
+  ObservationNotFound, PayloadExpired, StoreError, mapPgError, SourceRateExceeded, WriteInsideTransaction, Deadlocked,
 } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
@@ -1912,6 +1912,45 @@ describe("composing on a transaction", () => {
     }).catch((e: unknown) => { if (e !== ROLLBACK) throw e; });
     expect(namespacesInside).toBe(0);
   });
+
+  it("does not refuse a repository built on the pool, which is the normal case", async () => {
+    // The other side of the guard, and nothing named it: every mutant that
+    // made the check fire always was killed by eighty-odd tests failing,
+    // which is collateral rather than a statement of the rule. This says it.
+    const r = await observations.append(anEvent({ source: { ...src, ref: "op:r21:pool" } }));
+    expect(r.created).toBe(true);
+  });
+
+  it("deadlocks when two single-statement writes compose in opposite orders", async () => {
+    // R21 refuses the three writes that open a transaction of their own, and
+    // that is NOT enough to keep the lock cycle out of reach. `shred` is a
+    // single statement: it composes inside a caller's transaction with no
+    // refusal, and two of them in opposite orders deadlock in about a
+    // second. Measured through the store's own API, not through raw SQL.
+    //
+    // Asserted rather than fixed, and named rather than left as a driver
+    // error, because the caller's correct response to 40P01 is to retry --
+    // which is the wrong response to almost everything else this store
+    // raises, so it has to be tellable apart.
+    const nsRepo = new NamespaceRepository(db, ring, clock, RETENTION_V0);
+    const a = (await nsRepo.ensure({ kind: "wallet", id: "DEADLOCKA" })).namespaceId;
+    const b = (await nsRepo.ensure({ kind: "wallet", id: "DEADLOCKB" })).namespaceId;
+    let sigA!: () => void, sigB!: () => void;
+    const gotA = new Promise<void>((r) => { sigA = r; });
+    const gotB = new Promise<void>((r) => { sigB = r; });
+    const race = (first: string, second: string, signal: () => void, wait: Promise<void>) =>
+      db.transaction().execute(async (trx) => {
+        const r = new NamespaceRepository(trx, ring, clock, RETENTION_V0);
+        await r.shred(first);
+        signal();
+        await wait;
+        await r.shred(second);
+      }).then(() => null, (e: unknown) => e);
+    const [x, y] = await Promise.all([race(a, b, sigA, gotB), race(b, a, sigB, gotA)]);
+    const failures = [x, y].filter((e): e is Error => e !== null);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toBeInstanceOf(Deadlocked);
+  }, 20_000);
 
   it("still lets reads compose, which is what promote needs", async () => {
     // The other half of R21, and the reason it is not simply "repositories

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { sql } from "kysely";
 import { open, permanentAad, seal, type KeyRing } from "../crypto.js";
 import { assertRetentionPolicy, type RetentionPolicy } from "../retention.js";
 import { NamespaceRepository } from "./namespace.js";
@@ -71,7 +72,17 @@ export class PermanentRecordRepository {
    * to the record by the insert itself, as `insert ... select dated_at from
    * observation`, so it never leaves the database: a copy that round-tripped
    * through a JavaScript Date would be exact only while the writer of that
-   * column happened to write whole milliseconds. The pre-read that precedes
+   * column happened to write whole milliseconds.
+   *
+   * That argument is still right about the COLUMN and is now only half
+   * true of this method: the binding below renders both instants
+   * through a JavaScript Date, so it is exact to the millisecond and
+   * blind below it. A sub-millisecond move of `promoted_at` opens --
+   * measured -- and nothing but this note stands against it, because
+   * `permanent_record_date_preserved` guards the other instant only
+   * and the store's own writer never produces one. Recorded rather
+   * than fixed: a microsecond-exact rendering is a change to
+   * `crypto.ts`'s instant part and to every envelope that uses it. The pre-read that precedes
    * it is for the refusals named below, and both statements run inside one
    * transaction on one connection, so they are a single unit. What makes
    * the copied value stable is that observation accepts no UPDATE; what
@@ -113,7 +124,19 @@ export class PermanentRecordRepository {
         const source = await trx
           .selectFrom("observation")
           .innerJoin("namespace", "namespace.namespace_id", "observation.namespace_id")
-          .select(["observation.dated_at", "namespace.key_shredded_at"])
+          .select([
+            "observation.dated_at", "namespace.key_shredded_at",
+            // Canonical spellings, because the seal below binds BYTES. A
+            // uuid column accepts any case and brace form and stores the
+            // canonical lowercase, so a caller's own string and the string
+            // `read` rebuilds from the row are not always the same bytes --
+            // and a promotion sealed under the caller's spelling wrote a
+            // complete-looking record whose payload never opened. Measured.
+            // The same rule NamespaceRepository states for its own wraps:
+            // bind to what the database reports, never to what was passed.
+            sql<string>`observation.observation_id::text`.as("canonical_observation_id"),
+            sql<string>`${input.namespaceId}::uuid::text`.as("canonical_namespace_id"),
+          ])
           .where("observation.observation_id", "=", input.observationId)
           .executeTakeFirst();
         if (!source) throw new ObservationNotFound(`no observation ${input.observationId} to promote`);
@@ -148,12 +171,12 @@ export class PermanentRecordRepository {
         // produce a record that expires with the thing it was meant to
         // rescue.
         const sealed = seal(
-          await txNamespaces.dataKey(input.namespaceId),
+          await txNamespaces.dataKey(source.canonical_namespace_id),
           JSON.stringify(observation),
           permanentAad({
             recordId,
-            observationId: input.observationId,
-            namespaceId: input.namespaceId,
+            observationId: source.canonical_observation_id,
+            namespaceId: source.canonical_namespace_id,
             originalDatedAt: source.dated_at,
             promotedAt,
           }),
@@ -173,7 +196,7 @@ export class PermanentRecordRepository {
               .select([
                 eb.val(recordId).as("record_id"),
                 "observation_id",
-                eb.val(input.namespaceId).as("namespace_id"),
+                eb.val(source.canonical_namespace_id).as("namespace_id"),
                 "dated_at as original_dated_at",
                 eb.val(promotedAt).as("promoted_at"),
                 eb.val(input.rescuedBy).as("rescued_by"),

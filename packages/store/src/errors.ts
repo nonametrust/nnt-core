@@ -56,6 +56,19 @@ export class SourceRateExceeded extends StoreError {}
 // fastidiousness: composing two of this store's writes in one transaction
 // produces a lock-ordering cycle that deadlocks in about a second, measured.
 export class WriteInsideTransaction extends StoreError {}
+
+// 40P01, Postgres's own deadlock detector firing about a second after two
+// transactions have taken this store's row locks in opposite orders.
+//
+// R21 refuses the three writes that open a transaction of their own, and
+// review then measured that it is NOT enough: `{shred A; shred B}` against
+// `{shred B; shred A}` deadlocks, and so does a shred against
+// `expirePeriods`. Those are single statements, they compose in a caller's
+// transaction, and nothing refuses them. Naming the failure is not a fix and
+// does not pretend to be one -- it is so a caller can tell a deadlock from a
+// constraint and retry, which is the correct response to 40P01 and the
+// wrong one to almost everything else this store raises.
+export class Deadlocked extends StoreError {}
 // Raised in TypeScript, like NamespaceShredded, so it carries no SQLSTATE. It
 // exists because an erasure request naming a subject that has no row must not
 // resolve as success: nothing was examined, and "the data is gone" would be
@@ -149,6 +162,8 @@ const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreErro
   NNT06: PeriodKeyAltered,
   NNT07: TagAltered,
   NNT08: NamespaceShredded,
+  // Postgres's own, not one this schema allocated.
+  "40P01": Deadlocked,
 };
 
 /**

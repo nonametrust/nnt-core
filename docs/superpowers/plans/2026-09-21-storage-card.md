@@ -475,15 +475,50 @@ Today those three throw a bare Kysely `Error` after partial writes; the
 refusal moves it to the front and gives it a name.
 
 **Why not the savepoint route.** It would make the lock-ordering cycle R20
-measured reachable, and then the only thing standing between this store and a
-one-second deadlock would be a convention about which advisory key is taken
-first -- a rule with no mechanism, in a repository whose own history is that
-such rules turn out false. Refusing is one gate.
+measured reachable through the paths that take an advisory lock, and the only
+thing standing between this store and a one-second deadlock would be a
+convention about which key is taken first -- a rule with no mechanism.
 
-**What it costs, stated rather than hidden:** a caller cannot erase a
-counterparty and journal the erasure in one atomic unit. That composition is
-the one the audit design will eventually want, so it goes on M4's card with
-this ruling named, and it is a deliberate deferral rather than an oversight.
+**And the first version of this ruling then overstated what the refusal
+buys. Three sentences of it did not survive review.**
+
+"Writes do not compose" is true of THREE write methods. The guard catches the
+ones that open a transaction of their own -- `append`, `AuditChain.append`,
+`promote` -- and the other eleven writers in this package are single
+statements that compose inside a caller's transaction with nothing refusing
+them. The mechanism enforces "a nested transaction is refused", which is
+narrower than the sentence.
+
+"Refusing is one gate" on the deadlock is FALSE, and this is the one that
+matters. Measured through the store's own API, no raw SQL: `{shred A; shred
+B}` against `{shred B; shred A}` deadlocks at about a second; so does
+`{shred; expirePeriods}` against its reverse; and so does a shred against a
+chain row written from the parts `index.ts` already exports. Reproduced here
+before it was accepted. The cycle is reachable and the refusal narrows it
+rather than closing it.
+
+"A caller cannot erase a counterparty and journal it atomically" is false as
+stated: `shred` composes, and the chain's own pieces (`CHAIN_LOCK_KEY`,
+`GENESIS_SHA256`, `canonicalForm`, `entrySha256`) are exported, so the pair
+can be written by hand and commits atomically. What the guard closes is that
+composition through `AuditChain.append`, not the composition.
+
+**So the ruling stands and its sentence shrinks to what the mechanism does:**
+a write that opens its own transaction refuses a `Transaction`, by name and
+before it writes; single-statement writes compose, and two of them in
+opposite orders can deadlock. 40P01 is mapped to `Deadlocked` so a caller can
+tell it from a constraint and retry, which is the right response to a
+deadlock and the wrong one to almost everything else here. Whether to guard
+every writer is left open deliberately: three existing tests compose
+`sealDay` and `expirePeriods` on a transaction legitimately, and breaking
+them to enforce a sentence would be the tail wagging the dog. It belongs with
+the decision about whether the chain's internals should be exported at all.
+
+**`isTransaction` also does not see a pinned connection with a raw `BEGIN`**
+-- `db.connection()` with `begin`/`rollback` passes the guard and commits
+both writes anyway, which is R20's atomicity finding surviving R21 untouched.
+`migrate.ts` is the in-tree model for that pattern, so it is reachable by
+imitation.
 
 ## 2c. Limits of crypto-shredding, recorded rather than fixed
 
@@ -666,6 +701,22 @@ section 6 is the erasure gate, so **Task 9's permanent columns are section
 7**, not 5 as Task 9's own text says and not 6 as the §2d note above says.
 The SQLSTATE table gains `NNT08 → NamespaceShredded`.
 
+**Task 9 shipped, and R21 is its composition answer.** The constructor takes
+`(db, ring, clock, policy)` and builds both repositories on its own `trx`, so
+the read really is inside the transaction. What review then measured is that
+the transaction buys ONE thing -- it keeps `promote` off a second pooled
+connection, which a pool of one turns into a deadlock -- and that a pre-read
+outside it would answer identically under READ COMMITTED. So the sentence is
+true of the code and has no other observable consequence; said here so the
+next reader does not look for one.
+
+Two gates Task 9 left, both closed by its review: `payload_nonce` and
+`payload_tag` were NOT NULL in the migration and tested on neither, and
+`record_id` was in the binding and moved by no test. G11's "each
+`permanentAad` column moved" now means four of five; `namespace_id` is
+genuinely redundant with the key choice and is recorded as such rather than
+tested.
+
 **Task 9's composition answer is R20's, not the one written below.** The two
 options in the next paragraph were framed before review measured what
 actually happens: a repository built on a `Transaction` throws a bare `Error`
@@ -834,7 +885,7 @@ Eleven, a fresh implementer each, a review after each, a whole-branch review at 
 
 ### Task 9: The permanent copy
 
-**Does:** `0007` section 5: `alter table permanent_record add column payload_nonce bytea not null, payload_tag bytea not null, payload_ciphertext bytea not null` (append-only stays; `0004:102-112`). `PermanentRecordRepository` takes `ObservationRepository` and `NamespaceRepository`; `promote` keeps its three named refusals (`permanent-record.ts:98-107`), then `observations.get(id)` inside the same transaction (which raises `NamespaceShredded` or `PayloadExpired` before anything is written), re-seals `JSON.stringify(observation)` under `namespaces.dataKey(namespaceId)` with `permanentAad`, and includes the three columns in the insert-from-select (:114-132, the `dated_at` copy stays inside the database). `read(recordId): Promise<Observation>` opens under the namespace key, rebuilding the AAD from the row's own columns, and re-parses through `observationSchema` as `read` does at `observation.ts:177`. `get` stays metadata-only so a shredded namespace's record is still listable. `acceptance.test.ts:234` and the promote steps follow the new constructor. The `permanent_record` column catalogue pinned.
+**Does:** `0007` section 7: `alter table permanent_record add column payload_nonce bytea not null, payload_tag bytea not null, payload_ciphertext bytea not null` (append-only stays; `0004:102-112`). `PermanentRecordRepository` takes `(db, ring, clock, policy)` and builds both repositories on its own `trx` (R21); `promote` keeps its three named refusals (`permanent-record.ts:98-107`), then `observations.get(id)` inside the same transaction (which raises `NamespaceShredded` or `PayloadExpired` before anything is written), re-seals `JSON.stringify(observation)` under `namespaces.dataKey(namespaceId)` with `permanentAad`, and includes the three columns in the insert-from-select (:114-132, the `dated_at` copy stays inside the database). `read(recordId): Promise<Observation>` opens under the namespace key, rebuilding the AAD from the row's own columns, and re-parses through `observationSchema` as `read` does at `observation.ts:177`. `get` stays metadata-only so a shredded namespace's record is still listable. `acceptance.test.ts:234` and the promote steps follow the new constructor. The `permanent_record` column catalogue pinned.
 
 **Acceptance:** G11. Promote in September; expire September (Task 7's clock); `records.read` returns the day-twelve observation byte for byte while `observations.get` on its source is `PayloadExpired`; promoting after expiry is `PayloadExpired` and writes no row; promoting into a shredded namespace stays `NamespaceShredded` (existing test :280-292); each `permanentAad` column moved with the triggers off refuses the read (`observation.test.ts:297` pattern); a namespace shred makes `read` `NamespaceShredded`, which is the whitepaper's "a whole counterparty space is erased by destroying that key".
 **Cost if wrong:** a captured trace does not outlive its month, which is the one sentence the card exists for; or the permanent copy is readable under a payload moved from another record.
@@ -935,6 +986,6 @@ One outward-facing item is not a question but must not be forgotten: after this 
 ## Notes for the executor
 
 1. Cluster up from Task 1, every task; the M2 constraint does not apply and its absence is not an excuse.
-2. `0007` is one file grown in five named sections; Task 10's reviewer reads it whole. Never split it into `0008`.
+2. `0007` is one file grown in seven named sections; Task 10's reviewer reads it whole. Never split it into `0008`.
 3. Two board updates during execution, not after: after Task 3 (the refresh and `open` findings, F1 and F2, with the acceptance numbers) and after Task 9 (the retention gate results), and the M3 card's list "carried from M2" gets the F2 line, because M3's engine must pass the decision's `taggedAt` to `open`.
 4. The ledger for this card records R1-R8 with their costs, the eleven findings, and whatever the implementers find that this plan did not; M2's ledger found seven hollow plan tests in eleven tasks and this plan expects the same.

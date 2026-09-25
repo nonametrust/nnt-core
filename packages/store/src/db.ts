@@ -91,7 +91,8 @@ export interface Schema {
     confidence: number;
     // The rescued observation, re-sealed under the NAMESPACE key (Task 9).
     // Not in the metadata surface `get` returns: a shredded namespace's
-    // record stays listable and only `read` refuses.
+    // record can still be fetched by id and only `read` refuses. "Listable"
+    // would overstate it -- this repository has no list method.
     payload_nonce: Buffer;
     payload_tag: Buffer;
     payload_ciphertext: Buffer;

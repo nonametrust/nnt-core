@@ -5,7 +5,7 @@ import type { Clock } from "../clock.js";
 import type { Db } from "../db.js";
 import { newDataKey, periodKeyAad, unwrapUnder, wrapUnder, type KeyRing } from "../crypto.js";
 import {
-  NamespaceNotFound, NamespaceShredded, PayloadExpired, PeriodKeyAltered,
+  NamespaceNotFound, NamespaceShredded, PayloadExpired, PeriodKeyAltered, mapPgError,
 } from "../errors.js";
 import { assertRetentionPolicy, expiresAt, type RetentionPolicy } from "../retention.js";
 
@@ -201,6 +201,11 @@ export class NamespaceRepository {
    * missing row apart from the repeat.
    */
   async shred(namespaceId: string): Promise<void> {
+    // Mapped, because two shreds composed in opposite orders inside a
+    // caller's transaction deadlock -- measured, 40P01 after a second -- and
+    // an unmapped driver error tells the caller nothing about whether to
+    // retry. R21 refuses the writes that open their own transaction; this is
+    // one that does not, so it can take part in the cycle.
     const result = await this.db
       .updateTable("namespace")
       .set({
@@ -208,7 +213,8 @@ export class NamespaceRepository {
         key_shredded_at: sql<Date>`coalesce(key_shredded_at, ${this.clock.now()})`,
       })
       .where("namespace_id", "=", namespaceId)
-      .executeTakeFirst();
+      .executeTakeFirst()
+      .catch((e: unknown) => { throw mapPgError(e) ?? e; });
     if (result.numUpdatedRows === 0n) {
       throw new NamespaceNotFound(`no namespace ${namespaceId} to shred`);
     }
