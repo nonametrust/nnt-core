@@ -98,6 +98,22 @@ export class ObservationRepository {
     // where a policy enters, so this is where a malformed one is refused, by
     // field and by name.
     assertRetentionPolicy(policy);
+    // And §2d's rule made a mechanism rather than a habit. It says every
+    // repository touching one namespace is built from the SAME policy
+    // object; it was true at all six construction sites and enforced by
+    // nothing, so review handed these two different policies and the store
+    // capped under one while expiring under the other, silently, with no
+    // error anywhere. Identity and not equality: two equal objects are the
+    // same policy, but the composition point is meant to pass ONE value, and
+    // a copy is how the two drift apart later.
+    if (policy !== namespaces.policy) {
+      throw new RangeError(
+        `this repository was built on policy ${policy.version} and its namespace ` +
+          `repository on ${namespaces.policy.version}: the cap would count under one ` +
+          `and retention expire under the other, and nothing downstream compares them. ` +
+          `Pass one policy object to both.`,
+      );
+    }
   }
 
   /**
@@ -390,9 +406,16 @@ export class ObservationRepository {
    */
   private async skeleton(
     idempotencyKey: string,
-    // The connection to ask. Defaults to the repository's, and the cap
-    // passes its own transaction so the re-read under the lock sees
-    // what that transaction sees.
+    // The connection to ask. Defaults to the repository's; the cap passes
+    // its own transaction.
+    //
+    // Not an optimisation and not about visibility -- under READ COMMITTED a
+    // pool read would see the same committed rows. It is about the POOL: any
+    // query issued from inside the cap's transaction must go to `trx`,
+    // because every queued appender is holding a pooled connection while it
+    // waits on the producer lock, so the holder asking the pool for an extra
+    // one deadlocks all of them. Measured: the concurrency tests stop
+    // failing and start hanging.
     on: Db = this.db,
   ): Promise<Skeleton | null> {
     const found = await sql<{

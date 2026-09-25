@@ -368,13 +368,23 @@ counterparty can never be observed again", which that measurement refuses.**
 key row; R19's first draft restated the guarantee without inheriting the
 qualification.
 
-**Owed: a gate, not a habit.** The property is enforced by nothing today, and
-this repository's rule is that such properties turn out false -- this one did,
-on the first push. The cheap form is a trigger on `observation` INSERT that
-refuses when the row's namespace has no `data_key_wrapped`, which makes it the
-database's refusal rather than an ordering the code happens to keep. It is a
-line in `0007` and belongs to whichever task next opens that file; it is not
-Task 8's cap and must not be smuggled in beside it.
+**The gate SHIPPED, in Task 8, as `0007` section 6.** It was recorded here as
+owed and as not belonging beside the cap; it got its own commit (`9416d0f`)
+rather than being smuggled into one. A BEFORE INSERT trigger on `observation`
+refuses when the row's namespace has no `data_key_wrapped`, raises `NNT08`,
+and takes `for share` on the namespace row so an erasure in flight and an
+insert serialise -- `for share` and not `for key share`, because a real
+`shred` is a plain UPDATE of non-key columns and `for key share` would not
+conflict with it.
+
+**And the sentence it enforces is narrower than the one it was written for.**
+The gate orders COMMITS, not instants: `shred` reads its instant in the
+application before its UPDATE is sent, and that UPDATE can wait, so an append
+committing during the wait can carry a later `ingested_at` than the recorded
+`key_shredded_at` -- measured. Taking the instant server-side would close it
+and is refused, because this store reads no wall clock outside `clock.ts`.
+The defensible sentence is "no observation commits after the erasure
+commits".
 
 **The shape is silent about a third reason, and that is a decision.** A
 corrupted ciphertext, a truncated nonce or a rotated master key all still
@@ -615,6 +625,23 @@ version of this; the namespace version has existed since M1 and is not
 written down. Either give the third `AppendResult` shape a reason field
 covering both, or record that the M1 ruling makes the throw intended.
 
+**Task 8 shipped, in two halves and three review rounds.** 8a: the skeleton
+pre-read and the three `AppendResult` shapes (R19). 8b: the producer cap.
+Between and after them: `0007` section 6 (the erasure gate, `NNT08`), the
+READ COMMITTED pin in `db.ts`, and the same-policy-object rule turned from a
+convention into a constructor refusal. **Section numbers moved**: `0007`
+section 6 is the erasure gate, so **Task 9's permanent columns are section
+7**, not 5 as Task 9's own text says and not 6 as the §2d note above says.
+The SQLSTATE table gains `NNT08 → NamespaceShredded`.
+
+**Task 9's composition answer is R20's, not the one written below.** The two
+options in the next paragraph were framed before review measured what
+actually happens: a repository built on a `Transaction` throws a bare `Error`
+from `append`, after partial writes. Read R20 in §2b first; it reframes this
+as savepoint-aware writes with a fixed lock order versus refusing a
+`Transaction` with a named `StoreError`. `get` on a transaction-bound
+repository works and is unaffected.
+
 **Task 9 owes a composition answer.** Its text says `observations.get(id)`
 runs "inside the same transaction", but repositories are bound to a `Db` at
 construction and `promote` creates its own `trx`. Either the constructor takes
@@ -654,6 +681,7 @@ type the driver does not return.
 |---|---|---|
 | `NNT06` | `PeriodKeyAltered` | the `namespace_key` guard |
 | `NNT07` | `TagAltered` | the `tag` guard |
+| `NNT08` | `NamespaceShredded` | the `observation` insert gate (Task 8) |
 
 Raised in TypeScript, no SQLSTATE: `PayloadExpired`, `SourceRateExceeded`, `TagRefreshStale`.
 

@@ -548,9 +548,23 @@ create index observation_by_producer_ingested on observation (producer, ingested
 -- shred, which takes a row-exclusive lock, does -- and a shred is rare and
 -- may wait.
 --
--- What this does NOT claim. It refuses new observations; it does not make an
--- erasure retroactive, and §2c's limits on what a shred removes from the disk
--- are untouched. It is the mechanism behind one sentence, not the sentence.
+-- What this does NOT claim, and the boundary is narrower than the sentence it
+-- enforces. It orders COMMITS, not instants. `shred` reads its instant in the
+-- application before its UPDATE is sent, and that UPDATE can wait -- on the
+-- pool, or on this very trigger's FOR SHARE held by an insert already in
+-- flight -- so an append committing during that wait can carry an
+-- `ingested_at` later than the recorded `key_shredded_at`. Review measured
+-- exactly that. Taking the instant server-side would fix it and is refused:
+-- this store reads no wall clock outside clock.ts, and that rule is worth
+-- more than the ordering of two timestamps nobody compares.
+--
+-- So the enforceable sentence is "no observation commits after the erasure
+-- commits", and the M1 ledger's "can never be observed again" is true in that
+-- sense and not in the stronger one its words suggest.
+--
+-- It also does not make an erasure retroactive, and §2c's limits on what a
+-- shred removes from the disk are untouched. It is the mechanism behind one
+-- sentence, not the sentence.
 create function observation_namespace_live() returns trigger language plpgsql as $$
 declare
   erased boolean;

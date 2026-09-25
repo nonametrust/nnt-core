@@ -264,6 +264,10 @@ describe("idempotency", () => {
       dataKey: async () => newDataKey(),
       periodKey: async () => undefined,
       openPeriodKey: async () => newDataKey(),
+      // The stand-in carries the policy too, because the repository now
+      // refuses a namespace repository built on a different one -- a stub
+      // without it is a composition this store would reject in production.
+      policy: RETENTION_V0,
     } as unknown as NamespaceRepository;
     const broken = new ObservationRepository(db, orphan, clock, RETENTION_V0);
     const standIn = storedObservation(await observations.append(anEvent({ source: { ...src, ref: "op:orphan:standin" } })));
@@ -1131,6 +1135,14 @@ describe("a re-delivery whose payload cannot be opened", () => {
       let commitNow!: () => void;
       const release = new Promise<void>((r) => { commitNow = r; });
 
+      // `select ... for update` and not the shred's own UPDATE, deliberately.
+      // Holding the UPDATE makes `ensure`'s `on conflict do nothing` wait on
+      // the uncommitted index entry, so `append` never reaches the trigger
+      // and this test would be measuring the wrong mechanism entirely --
+      // measured, it hangs. FOR UPDATE takes the row lock without writing a
+      // new version, so the append runs all the way to the insert and the
+      // trigger is what queues. The production lock mode is covered by the
+      // test below instead.
       const erasing = other.transaction().execute(async (trx) => {
         await sql`select namespace_id from namespace
                   where namespace_id = ${nsId} for update`.execute(trx);
@@ -1152,22 +1164,39 @@ describe("a re-delivery whose payload cannot be opened", () => {
       // milliseconds. Scoped to this database: pg_locks and pg_stat_activity
       // are cluster-wide, and a sibling suite on another database would
       // otherwise satisfy this poll.
+      // Sixty polls of fifty milliseconds is three seconds, inside this
+      // test's own timeout. At a hundred the budget EQUALLED the default
+      // timeout, so a poll that never matched killed the test by timing out
+      // rather than by its named assertion -- and the erasing transaction,
+      // never released, then wedged afterAll's schema drop behind it.
+      // Measured, by breaking the pattern on purpose.
       let blocked = false;
-      for (let i = 0; i < 100 && !blocked; i++) {
-        const waiting = await sql<{ n: string }>`
-          select count(*)::text as n from pg_stat_activity
-          where datname = current_database() and wait_event_type = 'Lock'
-            and query ilike '%insert into%observation%'`.execute(db);
-        blocked = waiting.rows[0]!.n !== "0";
-        if (!blocked) await new Promise((r) => setTimeout(r, 50));
+      try {
+        for (let i = 0; i < 60 && !blocked; i++) {
+          const waiting = await sql<{ n: string }>`
+            select count(*)::text as n from pg_stat_activity
+            where datname = current_database() and wait_event_type = 'Lock'
+              and query ilike '%insert into%observation%'`.execute(db);
+          blocked = waiting.rows[0]!.n !== "0";
+          if (!blocked) await new Promise((r) => setTimeout(r, 50));
+        }
+      } finally {
+        // Released whatever happened above, so a failed handshake fails this
+        // test and nothing after it.
+        commitNow();
       }
       // Non-vacuous: if the insert never queued, the rest proves nothing.
       expect(blocked, "the insert never blocked, so nothing was serialised").toBe(true);
-
-      commitNow();
       await erasing;
 
       await expect(appending).rejects.toBeInstanceOf(NamespaceShredded);
+      // True of THESE instants and not in general: `shred` reads the clock
+      // in JavaScript before its UPDATE is sent, and that UPDATE can wait,
+      // so an append committing during the wait can carry a later
+      // `ingested_at` than the recorded `key_shredded_at`. Review measured
+      // it. What the gate enforces is the ordering of COMMITS, not of
+      // instants; the fixtures here choose instants far apart, and the
+      // general claim is narrowed where it is made.
       const rows = await sql<{ n: string }>`
         select count(*)::text as n from observation o
         join namespace n on n.namespace_id = o.namespace_id
@@ -1176,7 +1205,69 @@ describe("a re-delivery whose payload cannot be opened", () => {
     } finally {
       await other.destroy();
     }
-  });
+  }, 15_000);
+
+  it("serialises against the lock mode a real erasure takes, not a stronger one", async () => {
+    // What the test above cannot say. Its erasing side holds FOR UPDATE,
+    // which conflicts with almost everything -- so the trigger weakened to
+    // `for key share` would still have queued there and the test stayed
+    // green. `shred` is a plain UPDATE of non-key columns, which takes FOR
+    // NO KEY UPDATE, and FOR KEY SHARE does NOT conflict with that: a row
+    // would slip through under a weakened trigger against the only erasure
+    // this store actually performs.
+    //
+    // A raw INSERT rather than `append`, because with a real shred held open
+    // `ensure` waits on the uncommitted index entry and the trigger is never
+    // reached. Here the trigger is the only thing in the way.
+    const mar = at("2027-03-05T00:00:00.000Z");
+    await mar.obs.append(anEvent({ namespace: { kind: "wallet", id: "GATEMODE" },
+      source: { ...src, ref: "op:gate:mode1" } }));
+    const nsId = (await mar.ns.find("wallet", "GATEMODE"))!.namespaceId;
+
+    const other = openDb(urlForSchema(requireTestUrl(), "obs_test"));
+    try {
+      let held!: () => void;
+      const holding = new Promise<void>((r) => { held = r; });
+      let go!: () => void;
+      const release = new Promise<void>((r) => { go = r; });
+      const erasing = other.transaction().execute(async (trx) => {
+        // Exactly what `shred` does, held open: FOR NO KEY UPDATE.
+        await sql`update namespace set data_key_wrapped = null,
+                    key_shredded_at = ${new Date("2027-03-11T00:00:00.000Z")}
+                  where namespace_id = ${nsId}`.execute(trx);
+        held();
+        await release;
+      });
+      await holding;
+
+      const planted = sql`
+        insert into observation (
+          observation_id, idempotency_key, namespace_id, channel, kind, evidence_kind,
+          dated_at, ingested_at, producer, period, payload_nonce, payload_tag, payload_ciphertext
+        ) values (
+          ${randomUUID()}, ${randomUUID()}, ${nsId}, 'protocol', 'raw', 'state',
+          null, ${new Date("2027-03-12T00:00:00.000Z")}, 'raw-writer', '2027-03-01'::date,
+          decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
+        )`.execute(db).then(() => null, (e: unknown) => e);
+
+      let blocked = false;
+      for (let i = 0; i < 100 && !blocked; i++) {
+        const waiting = await sql<{ n: string }>`
+          select count(*)::text as n from pg_stat_activity
+          where datname = current_database() and wait_event_type = 'Lock'
+            and query ilike '%insert into observation%'`.execute(db);
+        blocked = waiting.rows[0]!.n !== "0";
+        if (!blocked) await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(blocked, "the insert never queued behind the erasure's own lock mode").toBe(true);
+
+      go();
+      await erasing;
+      expect(mapPgError(await planted)).toBeInstanceOf(NamespaceShredded);
+    } finally {
+      await other.destroy();
+    }
+  }, 20_000);
 
   it("still refuses a NEW observation for an erased namespace", async () => {
     const mar = at("2027-03-05T00:00:00.000Z");
@@ -1249,6 +1340,30 @@ describe("a re-delivery whose payload cannot be opened", () => {
     priv.byIdempotencyKey = async () => null;
     await expect(blind.obs.append(wire)).rejects.toBeInstanceOf(ObservationNotFound);
     await expect(blind.obs.append(wire)).rejects.toThrow(/append-only/);
+  });
+
+  it("reads the key row of the observation's OWN namespace, not another's", async () => {
+    // The join's other half. Dropping it is killed today only as collateral
+    // -- the planner hands back some other namespace's row for the same
+    // month and the flag tests disagree -- so which test goes red depends on
+    // row order, and no test says the rule. Two namespaces, the same month,
+    // one of them expired: a re-delivery from the LIVE one must stay
+    // readable however the rows are ordered.
+    const mar = at("2027-03-05T00:00:00.000Z");
+    const live = anEvent({ namespace: { kind: "wallet", id: "R19NSLIVE" },
+      source: { ...src, ref: "op:r19:nslive" } });
+    const dead = anEvent({ namespace: { kind: "wallet", id: "R19NSDEAD" },
+      source: { ...src, ref: "op:r19:nsdead" } });
+    await mar.obs.append(live);
+    await mar.obs.append(dead);
+    const deadNs = (await mar.ns.find("wallet", "R19NSDEAD"))!.namespaceId;
+    await expireMonth(deadNs, "2027-03-01", "2027-04-08T00:00:00.000Z");
+
+    const now = at("2027-04-20T00:00:00.000Z");
+    expect(await now.obs.append(live)).toMatchObject({ created: false, readable: true });
+    expect(await now.obs.append(dead)).toMatchObject({
+      created: false, readable: false, periodExpired: true,
+    });
   });
 
   it("reads the key row of the observation's OWN month, not any month it has", async () => {
@@ -1591,10 +1706,17 @@ describe("the producer cap", () => {
     // level. A role default, a PGOPTIONS, or a pooler is enough, and this
     // package already pins DateStyle per connection for exactly that class
     // of reason -- a setting no migration controls, arriving from outside.
+    // The URL carries a DateStyle of its own AS WELL as the hostile
+    // isolation, which is the shape that defeated the first fix: the pin
+    // returned early whenever `options` mentioned datestyle at all, so a
+    // connection string an operator had already tuned got no isolation pin
+    // and the cap stored fourteen rows against five. Without that fragment
+    // here this test passes against the broken version.
     const isolated = new URL(urlForSchema(requireTestUrl(), "obs_test"));
     const options = isolated.searchParams.get("options") ?? "";
     isolated.searchParams.set(
-      "options", `${options} -c default_transaction_isolation=repeatable\\ read`.trim(),
+      "options",
+      `${options} -c datestyle=ISO -c default_transaction_isolation=repeatable\\ read`.trim(),
     );
     const rr = openDb(isolated.toString());
     try {
@@ -1711,8 +1833,14 @@ describe("the producer cap", () => {
     // passes without it.
     const fives = { ...RETENTION_V0, producerMaxObservations: 5, producerWindowMs: 60_000 };
     const t = at("2028-06-05T00:00:00.000Z", fives);
+    // Twenty DIFFERENT wallets, which is the production shape and not a
+    // detail: with one wallet a lock keyed on the NAMESPACE serialises this
+    // exactly as well as one keyed on the producer, so the rule "the lock is
+    // per producer" would be held by nothing. The indexer writes to many
+    // counterparties at once, and that is precisely when a namespace-keyed
+    // lock lets count-then-insert race.
     const attempts = Array.from({ length: 20 }, (_, i) =>
-      t.obs.append(from("cap-concurrent", `op:conc:${i}`)).then(
+      t.obs.append(from("cap-concurrent", `op:conc:${i}`, `CAPWALLET${i}`)).then(
         () => "created" as const,
         (e: unknown) => (e instanceof SourceRateExceeded ? "refused" as const : Promise.reject(e)),
       ));

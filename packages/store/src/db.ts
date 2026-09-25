@@ -214,12 +214,34 @@ export function openDb(url: string): Db {
 // a `PGOPTIONS`, or a connection pooler is enough to set either from outside.
 // `options` on the connection string is per session and beats all of them, so
 // this is the one place either can be settled.
-const ISO_DATES = "-c datestyle=ISO -c default_transaction_isolation=read\\ committed";
+const PINS = [
+  "-c datestyle=ISO",
+  "-c default_transaction_isolation=read\\ committed",
+] as const;
 
 export function withIsoDates(url: string): string {
   const parsed = new URL(url);
-  const existing = parsed.searchParams.get("options");
-  if (existing?.includes("datestyle=")) return url;
-  parsed.searchParams.set("options", existing ? `${existing} ${ISO_DATES}` : ISO_DATES);
+  const existing = parsed.searchParams.get("options") ?? "";
+  // Idempotent PER PIN, and matched on this package's own fragment rather
+  // than on the setting's name.
+  //
+  // It used to return early whenever `options` mentioned `datestyle=` at
+  // all. That was written when DateStyle was the only pin and it survived
+  // the commit that added the isolation one, so a URL already carrying a
+  // DateStyle -- an operator following the older advice, or a pooler adding
+  // it -- got NO isolation pin at all. Review reproduced the whole defect
+  // through that hole: twenty concurrent appends under a cap of five stored
+  // fourteen rows, which is the exact number the fix was written against.
+  //
+  // Matching the fragment also settles what happens to a caller who asks for
+  // something else: ours is appended after theirs and the last `-c` wins.
+  // Neither of these is negotiable -- a non-ISO DateStyle makes every
+  // timestamp column arrive null, and REPEATABLE READ makes the producer cap
+  // count against a stale snapshot -- so honouring a contrary choice would
+  // mean handing back a store that is silently wrong rather than one that
+  // refuses.
+  const missing = PINS.filter((pin) => !existing.includes(pin));
+  if (missing.length === 0) return url;
+  parsed.searchParams.set("options", [existing, ...missing].filter(Boolean).join(" "));
   return parsed.toString();
 }

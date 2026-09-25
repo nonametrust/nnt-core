@@ -94,7 +94,9 @@ export class NamespaceRepository {
     // the period and the policy in force (R2). Required rather than
     // defaulted, for the reason the key ring has no default master key -- a
     // fallback policy is a policy that reaches production.
-    private readonly policy: RetentionPolicy,
+    // Readable so the observation repository can refuse a mismatch rather
+    // than trust a convention; see its constructor.
+    readonly policy: RetentionPolicy,
   ) {
     // The docstring on assertRetentionPolicy said "the composition point calls
     // this once, and every arithmetic trusts it". There was no composition
