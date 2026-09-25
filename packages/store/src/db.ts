@@ -1,4 +1,5 @@
 import { Kysely, PostgresDialect, type ColumnType, type Generated } from "kysely";
+import { WriteInsideTransaction } from "./errors.js";
 import pg from "pg";
 
 // The store owns its own schema type. Each task adds its tables here.
@@ -244,4 +245,30 @@ export function withIsoDates(url: string): string {
   if (missing.length === 0) return url;
   parsed.searchParams.set("options", [existing, ...missing].filter(Boolean).join(" "));
   return parsed.toString();
+}
+
+/**
+ * Refuses a write path that was handed a repository built on a Transaction
+ * (R21).
+ *
+ * Reads compose: `get`, `find`, `dataKey` and the rest work perfectly well on
+ * a `trx`, and `promote` depends on that to read an observation inside its
+ * own transaction. Writes do not, for two reasons that point the same way.
+ * Kysely refuses a nested transaction with a bare `Error`, and by then the
+ * earlier steps of the write have already written into the caller's
+ * transaction -- so without this the failure arrives late, unnamed, and
+ * half-applied. And composing two of this store's writes in one transaction
+ * makes the lock-ordering cycle reachable: `{shred; journal}` against
+ * `{journal; append}` deadlocks in about a second, measured.
+ *
+ * Called at the FRONT of each write that opens a transaction of its own.
+ */
+export function refuseWriteInsideTransaction(db: Db, operation: string): void {
+  if (db.isTransaction) {
+    throw new WriteInsideTransaction(
+      `${operation} opens a transaction of its own and was handed one already open. ` +
+        `Reads compose on a transaction and writes do not (R21): build this repository ` +
+        `on the pool, or do the write outside the transaction.`,
+    );
+  }
 }

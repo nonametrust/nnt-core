@@ -453,6 +453,38 @@ Removing the `limit` from the bounded count changes no answer; it changes the
 work from O(rows in the window) to O(cap). Nothing in a suite can see that,
 and the gate would be an assertion on the query plan rather than on a result.
 
+**R21. Reads compose, writes do not, and the refusal is named.** R20 left
+Task 9 a choice between savepoint-aware writes with a fixed lock order and
+refusing a `Transaction` at the write. This takes the second, and the reason
+is that the first buys something nothing needs while costing a rule nobody
+can enforce.
+
+What `promote` actually wants is a READ inside its own transaction --
+`observations.get(id)`, so a shredded namespace or an expired month refuses
+before anything is written. Review measured that `get` on a
+transaction-bound repository works; only the write paths, which open a
+transaction of their own, throw. So `PermanentRecordRepository` takes
+`(db, ring, clock, policy)` and builds repositories bound to its `trx` for
+the reads it needs, and Task 9's "inside the same transaction" becomes true
+rather than aspirational.
+
+Every write entry point that opens its own transaction -- `append`,
+`AuditChain.append`, `promote` -- refuses a `Db` that is already a
+`Transaction`, by `isTransaction`, with a named `StoreError` and a test each.
+Today those three throw a bare Kysely `Error` after partial writes; the
+refusal moves it to the front and gives it a name.
+
+**Why not the savepoint route.** It would make the lock-ordering cycle R20
+measured reachable, and then the only thing standing between this store and a
+one-second deadlock would be a convention about which advisory key is taken
+first -- a rule with no mechanism, in a repository whose own history is that
+such rules turn out false. Refusing is one gate.
+
+**What it costs, stated rather than hidden:** a caller cannot erase a
+counterparty and journal the erasure in one atomic unit. That composition is
+the one the audit design will eventually want, so it goes on M4's card with
+this ruling named, and it is a deliberate deferral rather than an oversight.
+
 ## 2c. Limits of crypto-shredding, recorded rather than fixed
 
 Two things a security review measured that no schema change can close. They

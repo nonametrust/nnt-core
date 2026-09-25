@@ -47,6 +47,15 @@ export class TagRefreshStale extends StoreError {}
 // for our own indexer in a loop, and a tripwire that does not say what it
 // counted is a tripwire nobody can act on.
 export class SourceRateExceeded extends StoreError {}
+
+// Raised in TypeScript when a write path is handed a repository built on a
+// Transaction. R21: reads compose and writes do not. Kysely refuses a nested
+// transaction with a bare Error, and it does so AFTER the earlier steps of
+// the write have already written into the caller's transaction, so this
+// moves the refusal to the front and gives it a name. The rule is not
+// fastidiousness: composing two of this store's writes in one transaction
+// produces a lock-ordering cycle that deadlocks in about a second, measured.
+export class WriteInsideTransaction extends StoreError {}
 // Raised in TypeScript, like NamespaceShredded, so it carries no SQLSTATE. It
 // exists because an erasure request naming a subject that has no row must not
 // resolve as success: nothing was examined, and "the data is gone" would be

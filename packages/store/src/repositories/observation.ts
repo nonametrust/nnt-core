@@ -4,7 +4,7 @@ import {
   type Observation, type WireObservation,
 } from "@nonametrust/schema";
 import type { Clock } from "../clock.js";
-import type { Db } from "../db.js";
+import { refuseWriteInsideTransaction, type Db } from "../db.js";
 import { sql } from "kysely";
 import { open, payloadAad, seal } from "../crypto.js";
 import { assertRetentionPolicy, periodOf, type RetentionPolicy } from "../retention.js";
@@ -131,6 +131,7 @@ export class ObservationRepository {
    * or not the observation happens to be stored already.
    */
   async append(wire: WireObservation): Promise<AppendResult> {
+    refuseWriteInsideTransaction(this.db, "append");
     const parsed = observationSchema.parse(wire) as Observation;
     const key = deriveIdempotencyKey(parsed.source, parsed.channel, parsed.namespace);
     if (parsed.idempotencyKey !== undefined && parsed.idempotencyKey !== key) {

@@ -11,10 +11,12 @@ import { fixedClock } from "../clock.js";
 import { RETENTION_V0, periodOf } from "../retention.js";
 import {
   CiphertextRejected, ConstraintViolation, IdempotencyKeyMismatch, NamespaceShredded,
-  ObservationNotFound, PayloadExpired, StoreError, mapPgError, SourceRateExceeded,
+  ObservationNotFound, PayloadExpired, StoreError, mapPgError, SourceRateExceeded, WriteInsideTransaction,
 } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
+import { PermanentRecordRepository } from "./permanent-record.js";
+import { AuditChain } from "../audit/chain.js";
 
 let db: Db;
 let done: () => Promise<void>;
@@ -1848,5 +1850,82 @@ describe("the producer cap", () => {
     expect(outcomes.filter((o) => o === "created")).toHaveLength(5);
     expect(outcomes.filter((o) => o === "refused")).toHaveLength(15);
     expect(await storedFor("cap-concurrent")).toBe(5);
+  });
+});
+
+
+// R21. Reads compose on a transaction, writes do not, and the refusal has a
+// name. Before this, all three write paths threw Kysely's bare "calling the
+// transaction method for a Transaction is not supported" -- and threw it
+// LATE, after their earlier steps had already written into the caller's
+// transaction. Review found that the only thing keeping the store's
+// lock-ordering cycle unreachable was that accident, and that nothing said
+// so.
+describe("composing on a transaction", () => {
+  it("refuses each write that opens a transaction of its own, by name", async () => {
+    const ROLLBACK = Symbol("rollback");
+    const seen: string[] = [];
+    await db.transaction().execute(async (trx) => {
+      const ns = new NamespaceRepository(trx, ring, clock, RETENTION_V0);
+      const obs = new ObservationRepository(trx, ns, clock, RETENTION_V0);
+      const chain = new AuditChain(trx, clock, ring);
+      const records = new PermanentRecordRepository(trx, clock);
+      for (const [name, run] of [
+        ["append", () => obs.append(anEvent({ source: { ...src, ref: "op:r21:1" } }))],
+        ["AuditChain.append", () => chain.append({
+          policyVersion: "v", kind: "observation.appended", body: {},
+        })],
+        ["promote", () => records.promote({
+          observationId: randomUUID(), namespaceId: randomUUID(),
+          rescuedBy: randomUUID(), confidence: 0.5,
+        })],
+      ] as const) {
+        await expect(run(), name).rejects.toBeInstanceOf(WriteInsideTransaction);
+        await expect(run(), name).rejects.toThrow(new RegExp(name.replace(".", "\\.")));
+        seen.push(name);
+      }
+      throw ROLLBACK;
+    }).catch((e: unknown) => { if (e !== ROLLBACK) throw e; });
+    // Non-vacuous: all three were reached, not one that happened to throw.
+    expect(seen).toEqual(["append", "AuditChain.append", "promote"]);
+  });
+
+  it("refuses before writing anything, which is what the bare error did not", async () => {
+    // Kysely's own refusal arrives from `this.db.transaction()`, which in
+    // `append` is AFTER `ensure` has inserted the namespace into the
+    // caller's transaction. The named refusal comes first, so a rolled-back
+    // caller is not left wondering which half happened.
+    const ROLLBACK = Symbol("rollback");
+    let namespacesInside = -1;
+    await db.transaction().execute(async (trx) => {
+      const ns = new NamespaceRepository(trx, ring, clock, RETENTION_V0);
+      const obs = new ObservationRepository(trx, ns, clock, RETENTION_V0);
+      const wire = anEvent({
+        namespace: { kind: "wallet", id: "R21NOWRITE" },
+        source: { ...src, ref: "op:r21:nowrite" },
+      });
+      await expect(obs.append(wire)).rejects.toBeInstanceOf(WriteInsideTransaction);
+      const r = await sql<{ n: string }>`
+        select count(*)::text as n from namespace where ns_id = 'R21NOWRITE'`.execute(trx);
+      namespacesInside = Number(r.rows[0]!.n);
+      throw ROLLBACK;
+    }).catch((e: unknown) => { if (e !== ROLLBACK) throw e; });
+    expect(namespacesInside).toBe(0);
+  });
+
+  it("still lets reads compose, which is what promote needs", async () => {
+    // The other half of R21, and the reason it is not simply "repositories
+    // may not be built on a transaction": `promote` reads an observation
+    // inside its own transaction so that a shredded namespace or an expired
+    // month refuses before anything is written.
+    const stored = storedObservation(
+      await observations.append(anEvent({ source: { ...src, ref: "op:r21:read" } })),
+    );
+    await db.transaction().execute(async (trx) => {
+      const ns = new NamespaceRepository(trx, ring, clock, RETENTION_V0);
+      const obs = new ObservationRepository(trx, ns, clock, RETENTION_V0);
+      expect((await obs.get(stored.observationId!)).channel).toBe("volume");
+      expect(await ns.find("wallet", "GOLDADDRESS")).not.toBeNull();
+    });
   });
 });

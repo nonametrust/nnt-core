@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Clock } from "../clock.js";
-import type { Db, Schema } from "../db.js";
+import { refuseWriteInsideTransaction, type Db, type Schema } from "../db.js";
 import {
   NamespaceShredded, ObservationNotFound, PermanentRecordNotFound, StateNotPromotable, mapPgError,
 } from "../errors.js";
@@ -85,6 +85,7 @@ export class PermanentRecordRepository {
    * stored and not what was meant to be.
    */
   async promote(input: PromoteInput): Promise<StoredPermanentRecord> {
+    refuseWriteInsideTransaction(this.db, "promote");
     const recordId = randomUUID();
     const promotedAt = this.clock.now();
     try {
