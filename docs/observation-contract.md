@@ -226,8 +226,9 @@ gözlem üret**; karşı taraf takipte değilse o tarafın gözlemi yoktur.
 ### `protocol`: hangi kayıt, hangi aralık, `event`'te ne var
 
 `payload.event` **bizim sözlüğümüzden** bir ad taşır, kaynağın kendi adını
-değil. Aşağıdaki tablo bugün Horizon effect adlarını gösteriyor ve o adlar
-eşlemenin girdisi, çıktısı değil.
+değil. Aşağıdaki tablonun **sol** sütunu bugün Horizon effect adlarını
+gösteriyor ve o adlar eşlemenin girdisi; sağ sütundaki `event` değerleri
+çıktısı, yani bizim adlarımız.
 
 Sebebi motorun tarafında: etiketleme, taban çizgisini `(namespace, kanal,
 aspect)` üçlüsü üzerine kuruyor ve `protocol` kanalında aspect'i `event`
@@ -247,11 +248,11 @@ tekrar daralacağı için bugün konmuyor.
 
 | Horizon kaydı | Gözlem |
 |---|---|
-| `change_trust` op, `limit` sıfırdan büyük ve o hesap için bu varlıkta daha önce trustline yok (effect `trustline_created`) | **state**, `kind: "trustline_open"`, `validFrom: created_at`, `validUntil` yazılmaz, `ref: "op:<id>"`, namespace `trustor`. Payload: `event: "trustline_created"`, `assetCode`, `assetIssuer`, `issuerKnown`. `protocol.json` bu. |
-| `change_trust` op, `limit: "0.0000000"` (effect `trustline_removed`) | **event**, `kind: "trustline_closed"`, `observedAt: created_at`, `ref` kapatan op, namespace `trustor`. Payload: `event: "trustline_removed"`, aynı varlık alanları. State'e dokunma (bölüm 4). |
+| `change_trust` op, `limit` sıfırdan büyük ve o hesap için bu varlıkta daha önce trustline yok (effect `trustline_created`) | **state**, `kind: "trustline_open"`, `validFrom: created_at`, `validUntil` yazılmaz, `ref: "op:<id>"`, namespace `trustor`. Payload: `event: "trustline_open"`, `assetCode`, `assetIssuer`, `issuerKnown`. `protocol.json` bu. |
+| `change_trust` op, `limit: "0.0000000"` (effect `trustline_removed`) | **event**, `kind: "trustline_closed"`, `observedAt: created_at`, `ref` kapatan op, namespace `trustor`. Payload: `event: "trustline_closed"`, aynı varlık alanları. State'e dokunma (bölüm 4). |
 | `change_trust` op, `limit` değişti ama sıfır değil (effect `trustline_updated`) | v0'da gözlem **yok**. Limit değişimi bir kabul ya da ret değil. |
-| `create_claimable_balance` op'un her claimant'ı (effect `claimable_balance_claimant_created`, effect'teki `account`) | **event**, `kind: "claimable_balance_offered"`, `observedAt: created_at`, `ref: "op:<id>"`, namespace claimant. Payload: `event: "claimable_balance_claimant_created"`, `assetCode`, `assetIssuer`, `issuerKnown`. Bilinmeyen bir issuer'ın varlığını kapına bırakması airdrop tuzağının ilk adımı; `issuerKnown: false` o yüzden burada. Aynı op birden çok claimant'a giderse her biri ayrı namespace, ayrı anahtar. |
-| `set_options` op, `set_flags_s` ya da `clear_flags_s` dolu (effect `account_flags_updated`) | **event**, `kind: "account_flags_changed"`, `observedAt: created_at`, `ref: "op:<id>"`, namespace `source_account`. Payload: `event: "account_flags_updated"`, varlık alanları yok. Hangi bayrağın değiştiğini taşıyacak alan payload'da **yok**; bölüm 14. |
+| `create_claimable_balance` op'un her claimant'ı (effect `claimable_balance_claimant_created`, effect'teki `account`) | **event**, `kind: "claimable_balance_offered"`, `observedAt: created_at`, `ref: "op:<id>"`, namespace claimant. Payload: `event: "claimable_balance_offered"`, `assetCode`, `assetIssuer`, `issuerKnown`. Bilinmeyen bir issuer'ın varlığını kapına bırakması airdrop tuzağının ilk adımı; `issuerKnown: false` o yüzden burada. Aynı op birden çok claimant'a giderse her biri ayrı namespace, ayrı anahtar. |
+| `set_options` op, `set_flags_s` ya da `clear_flags_s` dolu (effect `account_flags_updated`) | **event**, `kind: "account_flags_changed"`, `observedAt: created_at`, `ref: "op:<id>"`, namespace `source_account`. Payload: `event: "account_flags_changed"`, varlık alanları yok. Hangi bayrağın değiştiğini taşıyacak alan payload'da **yok**; bölüm 14. |
 
 `issuerKnown`: issuer senin bilinen-issuer listende var mı. Liste v0'da senin
 elinde, kısa olacak (USDC issuer ve birkaç tane); listeyi repoya yaz, kartın

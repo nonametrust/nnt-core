@@ -12,3 +12,13 @@ packages/store/.pgdata.log
 # without this line a `git add -A` on any branch sweeps four megabytes of
 # generated PDFs and HTML into a commit. It happened once.
 docs/whitepaper/build/
+
+# The indexer's run artefacts: account lists, resume state, the page cache and
+# what a run writes. All reproducible from a run, and none of it small.
+packages/indexer/accounts*.txt
+packages/indexer/state*.json
+packages/indexer/cache/
+packages/indexer/out/
+packages/indexer/*.txt
+packages/indexer/*.log
+packages/indexer/out*/

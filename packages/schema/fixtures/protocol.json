@@ -14,7 +14,7 @@
     "fetchedAt": "2026-09-01T07:55:00.000Z"
   },
   "payload": {
-    "event": "trustline_created",
+    "event": "trustline_open",
     "assetCode": "USDC",
     "assetIssuer": "GISSUERADDRESS",
     "issuerKnown": true

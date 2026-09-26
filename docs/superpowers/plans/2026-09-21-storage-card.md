@@ -1065,17 +1065,28 @@ Each named, what it refuses, how it is proven to fail on a planted violation, wh
 
 Existing gates untouched and still required green: no Stellar address, single date reader, baseline shape, no test file in `dist`.
 
-*That sentence is wrong about two of its four, and the `gates/` directory grew
-134 lines on this branch that no review lens cited.* The baseline-shape gate
-was not untouched: its extractor was lifted into `gates/interface-fields.ts`
-and parameterised so the new tag-refresh gate could share it, which is a
-change to the gate that holds the older claim. And "no test file in `dist`" is
-a build-output gate whose subject this branch does not produce, so calling it
-"still required green" says less than it sounds like. The two that ARE
-untouched and still green are the Stellar-address gate and the single-date-
-reader gate. Named here rather than left as a closing flourish, because a list
-of four gates that is right about two is the shape of claim this whole card
-kept finding in other people's comments.
+*That sentence is wrong about all four, and it took two passes to find out how
+wrong.* First pass: the baseline-shape gate was not untouched -- its extractor
+was lifted into `gates/interface-fields.ts` and parameterised so the new
+tag-refresh gate could share it, which is a change to the gate that carries the
+older claim. And no gate named "no test file in `dist`" exists in this
+repository at all: nothing under `gates/` and no `*.test.ts` anywhere names it,
+and the nearest things are the packages' own boundary gates. So one of the four
+was changed and one was never there.
+
+Second pass, at merge: the other two were changed as well, by the indexer work
+that landed on `main` while this card was being written. `no-stellar-address`
+now refuses a contract id as an identifier of a real counterparty, and
+`single-date-reader` exempts the indexer's mappers as constructors. Both diffs
+are on `main`, not on this branch, which is exactly why "untouched" was never
+this plan's fact to state: it is a claim about a file two branches share.
+
+So: `gates/` holds six files and twenty tests at the merge, and every one of
+the four this sentence named has moved. Written out rather than left as a
+closing flourish, because a list of four gates that is right about none of them
+is the shape of claim this card kept finding in other people's comments, and
+the second pass is the reminder that a claim can be re-broken after it is
+fixed.
 
 ---
 

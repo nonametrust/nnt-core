@@ -301,7 +301,7 @@ describe("policy", () => {
     it("refuses a key on a categorical channel, which has no scale to floor", () => {
       refused("content/field/memo");
       refused("address_integrity/transition");
-      refused("protocol/event/trustline_created");
+      refused("protocol/event/trustline_open");
     });
 
     it("admits every aspect the four continuous channels declare", () => {

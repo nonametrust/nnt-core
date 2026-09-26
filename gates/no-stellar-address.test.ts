@@ -11,9 +11,13 @@ import { describe, it, expect } from "vitest";
 // gate sits at the root and covers every tracked file rather than one package:
 // a second package or a root document is scanned the day it is added.
 //
-// The gate rejects anything shaped like a StrKey account (G + 55) or muxed
-// account (M + 68) over the base32 alphabet, checksum-valid or not, so a
-// synthetic identifier has to be obviously synthetic: short, like GOLDADDRESS.
+// The gate rejects anything shaped like a StrKey account (G + 55), muxed
+// account (M + 68) or contract (C + 55) over the base32 alphabet,
+// checksum-valid or not, so a synthetic identifier has to be obviously
+// synthetic: short, like GOLDADDRESS. A contract id is here because the
+// indexer maps the other side of a Soroban transfer, which is routinely a
+// contract: it identifies a counterparty of a real wallet as surely as an
+// account id does, and it is the same thirty-six bytes of base32 to a reader.
 // A test that needs a real-shaped key generates one at run time and never
 // writes it to a file.
 //
@@ -33,7 +37,7 @@ import { describe, it, expect } from "vitest";
 // lowercased; see the M0 final fix report.
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const strkey = /G[A-Z2-7]{55}|M[A-Z2-7]{68}|g[a-z2-7]{55}|m[a-z2-7]{68}/;
+const strkey = /G[A-Z2-7]{55}|M[A-Z2-7]{68}|C[A-Z2-7]{55}|g[a-z2-7]{55}|m[a-z2-7]{68}|c[a-z2-7]{55}/;
 
 // Paths come from the index, content from the working tree. So a staged file
 // is scanned before it is committed and nothing gitignored is ever listed, but
@@ -56,7 +60,7 @@ describe("tracked files", () => {
       .toContain(self);
   });
 
-  it("contain no Stellar-shaped account id", () => {
+  it("contain no Stellar-shaped account, muxed or contract id", () => {
     const offenders: string[] = [];
     for (const rel of trackedFiles()) {
       const file = join(root, rel);
@@ -68,7 +72,7 @@ describe("tracked files", () => {
         if (strkey.test(line)) offenders.push(`${rel}:${i + 1}: ${line.trim()}`);
       });
     }
-    expect(offenders, "these lines contain a Stellar-shaped address:\n" + offenders.join("\n"))
+    expect(offenders, "these lines contain a Stellar-shaped account, muxed or contract id:\n" + offenders.join("\n"))
       .toEqual([]);
   });
 });

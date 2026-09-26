@@ -1,0 +1,29 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  // Every extension the compiler admits and both suffixes vitest collects, so
+  // a test file cannot reach dist by renaming. CI proves the property after
+  // each build: no dist file matches *.test.* or *.spec.*. src/testing is
+  // excluded for the same reason: it builds real-shaped keys for tests and
+  // nothing in production imports it, so it has no business in the published
+  // dist. horizon/fixtures.ts goes with it, since it is the one non-test
+  // file that imports src/testing (it builds Horizon responses for the
+  // reader's tests) and an import would drag src/testing back into the
+  // build. tsconfig.test.json resets this list to typecheck the tests.
+  "exclude": [
+    "src/testing/**",
+    "src/horizon/fixtures.ts",
+    "src/**/*.test.ts",
+    "src/**/*.test.mts",
+    "src/**/*.test.cts",
+    "src/**/*.test.tsx",
+    "src/**/*.spec.ts",
+    "src/**/*.spec.mts",
+    "src/**/*.spec.cts",
+    "src/**/*.spec.tsx"
+  ]
+}
