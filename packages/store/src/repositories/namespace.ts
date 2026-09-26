@@ -142,7 +142,8 @@ export class NamespaceRepository {
         created_at: this.clock.now(),
       })
       .onConflict((oc) => oc.constraint("namespace_identity").doNothing())
-      .execute();
+      .execute()
+      .catch((e: unknown) => { throw mapPgError(e) ?? e; });
     const found = await this.find(ref.kind, ref.id);
     if (!found) throw new Error(`namespace ${ref.kind} disappeared after insert`);
     return found;
@@ -266,7 +267,8 @@ export class NamespaceRepository {
         created_at: this.clock.now(),
       })
       .onConflict((oc) => oc.columns(["namespace_id", "period"]).doNothing())
-      .execute();
+      .execute()
+      .catch((e: unknown) => { throw mapPgError(e) ?? e; });
 
     // On conflict this wrote nothing, which is what keeps an expired month
     // expired -- and also what would let a row planted before the mint stand
@@ -441,7 +443,9 @@ export class NamespaceRepository {
          and k.expires_at <= ${now}
       returning k.namespace_id::text as namespace_id,
                 ${PERIOD_TEXT(sql`k.period`)} as period,
-                (n.data_key_wrapped is null) as erased`.execute(this.db);
+                (n.data_key_wrapped is null) as erased`
+      .execute(this.db)
+      .catch((e: unknown) => { throw mapPgError(e) ?? e; });
     return {
       shredded: swept.rows
         .map((row) => ({

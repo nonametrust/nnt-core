@@ -9,8 +9,8 @@ import { urlForSchema, withSchema, storedObservation } from "../testing/harness.
 import { keyRingFromEnv, newDataKey, periodKeyAad, unwrapUnder } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import {
-  CiphertextRejected, NamespaceAltered, NamespaceNotFound, NamespaceShredded, PayloadExpired,
-  PeriodKeyAltered, StoreError, mapPgError,
+  CiphertextRejected, ConstraintViolation, Deadlocked, NamespaceAltered, NamespaceNotFound, NamespaceShredded,
+  PayloadExpired, PeriodKeyAltered, StoreError, mapPgError,
 } from "../errors.js";
 import { RETENTION_V0, expiresAt, type RetentionPolicy } from "../retention.js";
 import { NamespaceRepository } from "./namespace.js";
@@ -734,6 +734,40 @@ describe("what the namespace_key table refuses to hold", () => {
     ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_period_is_month" });
   });
 
+  // `infinity` is a date, and every check on this table was written as if it
+  // were not. `date_trunc('month', 'infinity')` is infinity, so the month
+  // check passes; both halves of the range check compare infinity with
+  // infinity, so they pass too. The row is then live for ever: the sweep
+  // selects on `expires_at <= now`, and nothing is ever `<= now` again. A
+  // month key that no retention policy can reach is the one row this table
+  // exists to make impossible, and review planted it.
+  // Every write in this repository maps driver errors through `mapPgError`
+  // -- except that until the branch review, exactly one of them did. `shred`
+  // had the catch; `periodKey`'s mint, `ensure`'s insert and the sweep did
+  // not, so a constraint the table refuses arrived at the caller as a raw
+  // node-pg DatabaseError with `instanceof StoreError === false`. The class
+  // is the contract: a caller tells a deadlock from a constraint by it.
+  //
+  // `graceDays: 3650` puts `expires_at` past `period + 10 years`, which is
+  // the one refusal a caller can provoke through this path without raw SQL.
+  it("maps the mint's own constraint refusal to a class, like every other write here", async () => {
+    const far = new NamespaceRepository(db, ring, clock, { ...RETENTION_V0, graceDays: 3650 });
+    const ns = (await far.ensure({ kind: "wallet", id: "MAPMINT" })).namespaceId;
+    const raised = await far.periodKey(ns, "2026-09-01").then(() => null, (e: unknown) => e);
+    expect(raised).toBeInstanceOf(StoreError);
+    expect(raised).toBeInstanceOf(ConstraintViolation);
+    expect((raised as ConstraintViolation).constraint).toBe("namespace_key_expires_in_range");
+  });
+
+  it("refuses an infinite period, which every other check on this table admits", async () => {
+    const ns = (await repo.ensure({ kind: "wallet", id: "RAWPERIODINF" })).namespaceId;
+    await expect(
+      sql`insert into namespace_key (namespace_id, period, key_wrapped, expires_at, shredded_at, created_at)
+          values (${ns}, 'infinity'::date, ${Buffer.alloc(61)}, 'infinity'::timestamptz, null, ${clock.now()})`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "namespace_key_period_finite" });
+  });
+
   // The constraint pins its UTC conversion instead of inheriting the
   // session's, and nothing held that: the naive form
   // `expires_at >= period + interval '1 month'` passes this whole suite,
@@ -1294,6 +1328,48 @@ describe("expirePeriods: expiry is unreadability and nothing else", () => {
   // touches `namespace_key` alone. What this test actually pins is that the
   // sweep leaves the audit table untouched while shredding something, which
   // is worth pinning and is not what the old name promised.
+  // The pair `errors.ts` names on the Deadlocked class itself, measured here
+  // rather than asserted there. The sweep alone cannot deadlock against a
+  // shred: `shred` locks the parent `namespace` row and the sweep locks child
+  // `namespace_key` rows, and those never overlap. The cycle needs both to
+  // COMPOSE in a caller's transaction, which R21 permits because each is a
+  // single statement -- one side takes the parent then wants the children,
+  // the other takes the children then wants the parent.
+  //
+  // Written because the sweep's statement was the one write in this
+  // repository with no `mapPgError`, so a caller told to retry on
+  // `Deadlocked` got a bare driver error instead and did not retry. Removing
+  // that catch turned no test red until this one existed.
+  it("names the deadlock the sweep can lose, so a caller can tell it from a constraint", async () => {
+    const ns = (await at("2027-02-01T00:00:00.000Z").namespaces.ensure(
+      { kind: "wallet", id: "DLSWEEP" },
+    )).namespaceId;
+    // A month of its own, past its grace at the instant both sides run, so
+    // the sweep has a row to lock rather than deadlocking over nothing.
+    await at("2027-02-01T00:00:00.000Z").observations.append(anEvent("DLSWEEP", "op:dl:sweep"));
+    let sigA!: () => void, sigB!: () => void;
+    const gotA = new Promise<void>((r) => { sigA = r; });
+    const gotB = new Promise<void>((r) => { sigB = r; });
+    const NOW = "2027-08-01T00:00:00.000Z";
+    const shredFirst = sdb.transaction().execute(async (trx) => {
+      const r = new NamespaceRepository(trx, ring, fixedClock(new Date(NOW)), grace7);
+      await r.shred(ns);
+      sigA();
+      await gotB;
+      await r.expirePeriods();
+    }).then(() => null, (e: unknown) => e);
+    const sweepFirst = sdb.transaction().execute(async (trx) => {
+      const r = new NamespaceRepository(trx, ring, fixedClock(new Date(NOW)), grace7);
+      await r.expirePeriods();
+      sigB();
+      await gotA;
+      await r.shred(ns);
+    }).then(() => null, (e: unknown) => e);
+    const failures = [await shredFirst, await sweepFirst].filter((e): e is Error => e !== null);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toBeInstanceOf(Deadlocked);
+  }, 20_000);
+
   it("shreds while leaving every audit entry and the chain's seals alone", async () => {
     const chain = new AuditChain(sdb, fixedClock(new Date("2027-08-08T00:00:00.000Z")), ring);
     await chain.append({ policyVersion: "retention-v0", kind: "observation.appended", body: { n: 1 } });

@@ -412,6 +412,20 @@ create table namespace_key (
        and expires_at <= timezone('UTC', (period + interval '10 years')::timestamp)),
   constraint namespace_key_period_is_month
     check (period = date_trunc('month', period::timestamp)::date),
+  -- `infinity` is a date, and every check above was written as though it were
+  -- not: date_trunc leaves it alone so the month check passes, and both
+  -- halves of the range check compare infinity with itself so they pass too.
+  -- The row is then live for ever, because the sweep selects `expires_at <=
+  -- now` and infinity never is -- a month key that no retention policy can
+  -- ever reach, which is the one row this table exists to make impossible.
+  -- Planted by review; the same shape as the 2999 plant two constraints up,
+  -- arriving through a value rather than through a number.
+  --
+  -- One constraint closes it and the second is not needed: with `period`
+  -- finite, an infinite `expires_at` already fails the range check's upper
+  -- bound. `observation.period` is a foreign key into this table, so an
+  -- infinite month cannot appear there either.
+  constraint namespace_key_period_finite check (isfinite(period)),
   -- R2's guard. Expiry is not early, measured against the row's own value.
   --
   -- `>=` and not `>`: expirePeriods sweeps where `expires_at <= now` and sets
