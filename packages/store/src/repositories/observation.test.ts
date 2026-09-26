@@ -1296,6 +1296,109 @@ describe("a re-delivery whose payload cannot be opened", () => {
     )).rejects.toBeInstanceOf(NamespaceShredded);
   });
 
+  // The gate above refuses a write into an ERASED counterparty space. It did
+  // not refuse a write into an EXPIRED MONTH of a live one, and nothing else
+  // did either: the composite foreign key `observation_period_key` is
+  // satisfied by a swept `namespace_key` row exactly as well as by a live
+  // one, so a raw insert naming a month whose key is gone committed with no
+  // error at all -- a row the store can never serve, sitting under a key that
+  // no longer exists. Review planted it and it committed.
+  //
+  // It also closed a window in the store's own path: `append` reads the month
+  // key and then inserts, and a sweep committing between the two made the
+  // append resolve `{created: true}` for a row whose very next `get` raised
+  // PayloadExpired. The trigger takes `for share` on the month key row, so a
+  // sweep in flight and an insert in flight serialise, exactly as the
+  // namespace half does.
+  //
+  // A separate SQLSTATE, not NNT08. An expired month is not an erasure
+  // request: the counterparty space is intact and its other months still
+  // read, and an operator told "erased on request" would go looking for a
+  // request that never happened. That distinction is already the reason
+  // `PayloadExpired` exists beside `NamespaceShredded`, and it now has a
+  // SQLSTATE as well as a class.
+  it("refuses a raw observation written under a month whose key was shredded", async () => {
+    const feb = at("2027-02-04T00:00:00.000Z");
+    await feb.obs.append(anEvent({ namespace: { kind: "wallet", id: "MONTHGATE" },
+      source: { ...src, ref: "op:monthgate:1" } }));
+    const nsId = (await feb.ns.find("wallet", "MONTHGATE"))!.namespaceId;
+    // Shredded one row at a time rather than through `expirePeriods`, which
+    // is table-wide: a sweep here expires every month this file has minted
+    // and breaks its siblings. This is the sweep's own UPDATE, scoped -- the
+    // guard admits it because the instant is past the row's expiry, which is
+    // the rule R2 holds.
+    const swept = await sql<{ n: string }>`
+      update namespace_key set key_wrapped = null, shredded_at = ${new Date("2027-06-01T00:00:00.000Z")}
+       where namespace_id = ${nsId} and period = '2027-02-01'::date and key_wrapped is not null
+      returning 1 as n`.execute(db);
+    expect(swept.rows).toHaveLength(1);
+
+    const planted = await sql`
+      insert into observation (
+        observation_id, idempotency_key, namespace_id, channel, kind, evidence_kind,
+        dated_at, ingested_at, producer, period, payload_nonce, payload_tag, payload_ciphertext
+      ) values (
+        ${randomUUID()}, ${randomUUID()}, ${nsId}, 'protocol', 'raw', 'state',
+        null, ${new Date("2027-02-20T00:00:00.000Z")}, 'raw-writer', '2027-02-01'::date,
+        decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
+      )`.execute(db).then(() => null, (e: unknown) => e);
+    expect(mapPgError(planted)).toBeInstanceOf(PayloadExpired);
+    // And not the erasure's class, which would send an operator looking for
+    // a request nobody made.
+    expect(mapPgError(planted)).not.toBeInstanceOf(NamespaceShredded);
+    const rows = await sql<{ n: string }>`
+      select count(*)::text as n from observation
+      where namespace_id = ${nsId} and producer = 'raw-writer'`.execute(db);
+    expect(rows.rows[0]!.n).toBe("0");
+  });
+
+  // Both at once, which is the ordering the trigger states. A namespace
+  // erased on request whose months the sweep then took is reported as
+  // ERASED, because that is the fact an operator needs: the retention clock
+  // is not why this counterparty's evidence is gone. Without a test the
+  // order of the two checks is a comment, and swapping them passes.
+  it("reports an erased namespace as erased even when its month is also gone", async () => {
+    const apr = at("2027-04-03T00:00:00.000Z");
+    await apr.obs.append(anEvent({ namespace: { kind: "wallet", id: "BOTHGONE" },
+      source: { ...src, ref: "op:bothgone:1" } }));
+    const nsId = (await apr.ns.find("wallet", "BOTHGONE"))!.namespaceId;
+    const swept = await sql<{ n: string }>`
+      update namespace_key set key_wrapped = null, shredded_at = ${new Date("2027-08-01T00:00:00.000Z")}
+       where namespace_id = ${nsId} and period = '2027-04-01'::date and key_wrapped is not null
+      returning 1 as n`.execute(db);
+    expect(swept.rows).toHaveLength(1);
+    await at("2027-08-02T00:00:00.000Z").ns.shred(nsId);
+
+    const planted = await sql`
+      insert into observation (
+        observation_id, idempotency_key, namespace_id, channel, kind, evidence_kind,
+        dated_at, ingested_at, producer, period, payload_nonce, payload_tag, payload_ciphertext
+      ) values (
+        ${randomUUID()}, ${randomUUID()}, ${nsId}, 'protocol', 'raw', 'state',
+        null, ${new Date("2027-04-20T00:00:00.000Z")}, 'raw-both', '2027-04-01'::date,
+        decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
+      )`.execute(db).then(() => null, (e: unknown) => e);
+    expect(mapPgError(planted)).toBeInstanceOf(NamespaceShredded);
+  });
+
+  // A live month of a live namespace is untouched by the gate: the rule is
+  // "not under a shredded key", not "not at all".
+  it("still writes a raw observation under a month whose key is live", async () => {
+    const mar = at("2027-03-02T00:00:00.000Z");
+    await mar.obs.append(anEvent({ namespace: { kind: "wallet", id: "MONTHGATEOK" },
+      source: { ...src, ref: "op:monthgate:ok" } }));
+    const nsId = (await mar.ns.find("wallet", "MONTHGATEOK"))!.namespaceId;
+    await expect(sql`
+      insert into observation (
+        observation_id, idempotency_key, namespace_id, channel, kind, evidence_kind,
+        dated_at, ingested_at, producer, period, payload_nonce, payload_tag, payload_ciphertext
+      ) values (
+        ${randomUUID()}, ${randomUUID()}, ${nsId}, 'protocol', 'raw', 'state',
+        null, ${new Date("2027-03-20T00:00:00.000Z")}, 'raw-live', '2027-03-01'::date,
+        decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
+      )`.execute(db)).resolves.toBeDefined();
+  });
+
   // Five rules below were each a surviving mutant in this task's first
   // mutation round: the constructor's policy assertion, the mid-read race,
   // the null-read invariant, the period half of the skeleton's join, and the

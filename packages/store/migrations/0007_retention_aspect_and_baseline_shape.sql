@@ -621,9 +621,34 @@ create index observation_by_producer_ingested on observation (producer, ingested
 -- It also does not make an erasure retroactive, and §2c's limits on what a
 -- shred removes from the disk are untouched. It is the mechanism behind one
 -- sentence, not the sentence.
-create function observation_namespace_live() returns trigger language plpgsql as $$
+-- The month half, added by the branch review. The gate above refuses a write
+-- into an ERASED counterparty space and refused nothing about an EXPIRED
+-- MONTH of a live one -- and neither did anything else. `observation_period_key`
+-- is satisfied by a SWEPT `namespace_key` row exactly as well as by a live
+-- one, because a foreign key asks whether the row exists and not what is in
+-- it. A raw insert naming a month whose key was shredded committed with no
+-- error: a row the store can never serve, filed under a key that no longer
+-- exists. Planted by review; it committed.
+--
+-- It closes a window in the repository's own path too. `append` reads the
+-- month key and then inserts, and a sweep committing between the two let the
+-- append resolve `{created: true}` for a row whose very next `get` raised
+-- PayloadExpired. The `for share` below makes the sweep's UPDATE and this
+-- insert serialise, on exactly the argument the namespace half makes.
+--
+-- A SEPARATE SQLSTATE, and that is the point rather than an accident. An
+-- expired month is not an erasure request: the counterparty space is intact
+-- and its other months still read. An operator told "erased on request"
+-- about a month the retention clock took would go looking for a request
+-- nobody made. It is the same distinction that makes `PayloadExpired` a
+-- different class from `NamespaceShredded`, now with a SQLSTATE as well.
+--
+-- The function is named for what it checks, which is no longer the namespace
+-- alone: both halves answer one question, "may anything be written here".
+create function observation_target_writable() returns trigger language plpgsql as $$
 declare
   erased boolean;
+  expired boolean;
 begin
   select data_key_wrapped is null into erased
   from namespace where namespace_id = new.namespace_id for share;
@@ -636,13 +661,24 @@ begin
       message = 'namespace ' || new.namespace_id ||
                 ' was erased on request; no observation is written for it afterwards';
   end if;
+  -- Checked SECOND, so an erased namespace is reported as erased even when
+  -- its months are also gone. The erasure is the fact an operator needs.
+  select key_wrapped is null into expired
+  from namespace_key
+  where namespace_id = new.namespace_id and period = new.period for share;
+  if expired then
+    raise exception using
+      errcode = 'NNT09',
+      message = 'the month ' || new.period || ' of namespace ' || new.namespace_id ||
+                ' was shredded; no observation is written under an expired month';
+  end if;
   return new;
 end
 $$;
 
-create trigger observation_namespace_live_on_insert
+create trigger observation_target_writable_on_insert
   before insert on observation
-  for each row execute function observation_namespace_live();
+  for each row execute function observation_target_writable();
 
 
 -- === 7. permanent_record: the payload a rescue keeps (Task 9) ===============

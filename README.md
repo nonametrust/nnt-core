@@ -84,12 +84,15 @@ Four limits, each measured rather than reasoned, in the plan's §2c and R19:
    the erasure promise.
 3. Erasure is **content-only**. After a shred the counterparty identifier
    itself, every observation's channel, kind, evidence kind, instants and
-   producer, every tag's strength, every baseline's mean and all permanent-
-   record metadata are still plaintext. Two are worse than they look: a
-   baseline over a single observation has a mean equal to that observation's
-   amount, and the idempotency key is an unkeyed SHA-256 over mostly public
-   parts, from which a three-hundred-candidate dictionary recovered 3 of 3
-   source references of a shredded namespace.
+   producer, every tag's strength and **aspect**, every baseline's mean and
+   all permanent-record metadata are still plaintext. Three are worse than
+   they look: a baseline over a single observation has a mean equal to that
+   observation's amount; the idempotency key is an unkeyed SHA-256 over mostly
+   public parts, from which a three-hundred-candidate dictionary recovered 3
+   of 3 source references of a shredded namespace; and an aspect is derived
+   from the payload and reads like it -- the asset code and direction, the
+   quote unit, the on-ledger event name -- so after an erasure the tag queries
+   still answer what KIND of thing was observed, in the payload's own words.
 4. And the store **answers** a re-delivery for an erased space rather than
    refusing it, so the existence of an observation and the instant it was
    ingested stay answerable per source reference even when its content does

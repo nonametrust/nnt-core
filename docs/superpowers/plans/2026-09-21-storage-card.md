@@ -543,9 +543,21 @@ honest claim is "unreadable in the live database", not "erased".
 idempotency key leaks the source references.** After a shred the following are
 still plaintext: the counterparty identifier itself (`namespace.ns_id`, a
 wallet address), every observation's `channel`, `kind`, `evidence_kind`,
-`dated_at`, `ingested_at` and `producer`, every tag's strength and instant,
-every baseline's `mean` and `median_est`, and all `permanent_record` metadata.
-Two of those are worse than they look. A baseline over a single observation
+`dated_at`, `ingested_at` and `producer`, every tag's strength, instant AND
+`aspect`, every baseline's `mean` and `median_est`, and all
+`permanent_record` metadata.
+
+`aspect` was added to this list by the branch-wide review and is the one entry
+this card itself created: Task 2 put the column on `tag`, and this paragraph
+was written before it existed and never revisited. It is not metadata in the
+way the rest of the list is. An aspect is derived from the payload and reads
+like one -- the asset code and direction, the quote unit, the on-ledger event
+name, the content field name -- so after an erasure `findLive` and `listLive`
+still answer "what kind of thing was observed about this counterparty", in the
+payload's own vocabulary. Measured through the package's own API, with the
+payload genuinely unreadable beside it.
+
+Three of these are worse than they look. A baseline over a single observation
 has a `mean` equal to that observation's amount, so an aggregate column holds
 the payload value. And `idempotency_key` is an unkeyed SHA-256 over
 `(producer, network, ref, channel, kind, namespace id)` where every part but

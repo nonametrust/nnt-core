@@ -1,6 +1,6 @@
 /**
  * Every invariant the database holds maps to a class here. The triggers this
- * package writes raise their own SQLSTATEs, NNT01 to NNT08, and each maps to
+ * package writes raise their own SQLSTATEs, NNT01 to NNT09, and each maps to
  * a class of its own; the constraints Postgres names for itself, the foreign
  * keys, unique keys and check constraints, arrive as 23503, 23505 and 23514
  * and map to one class carrying the SQLSTATE and the constraint's name. Tests
@@ -164,6 +164,11 @@ const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreErro
   NNT06: PeriodKeyAltered,
   NNT07: TagAltered,
   NNT08: NamespaceShredded,
+  // The insert gate's month half: a write under a month whose key the
+  // retention clock already took. Mapped to the class that already means
+  // exactly that, so a caller has one thing to catch whether the month died
+  // before the read or before the write.
+  NNT09: PayloadExpired,
   // Postgres's own, not one this schema allocated.
   "40P01": Deadlocked,
 };

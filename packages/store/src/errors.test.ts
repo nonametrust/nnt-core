@@ -4,6 +4,7 @@ import {
   ChainBroken,
   ConstraintViolation,
   NamespaceAltered,
+  PayloadExpired,
   PeriodKeyAltered,
   StoreError,
   TagAltered,
@@ -34,6 +35,12 @@ describe("mapPgError", () => {
     ["NNT06", PeriodKeyAltered],
     ["NNT07", TagAltered],
     ["NNT08", NamespaceShredded],
+    // The insert gate's month half. It shares a class with the TypeScript
+    // refusal deliberately: whether the month died before the read or before
+    // the write, the caller has one thing to catch and the same answer,
+    // which is that this payload is gone and retrying will not bring it
+    // back.
+    ["NNT09", PayloadExpired],
     // Postgres's own, not one this schema allocated: two of this store's
     // single-statement writes composed in opposite orders inside a caller's
     // transaction deadlock, measured, and a caller's correct response to
