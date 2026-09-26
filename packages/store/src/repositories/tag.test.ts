@@ -48,12 +48,27 @@ function anEvent(over: Record<string, unknown> = {}): WireObservation {
 
 // Three observations under one namespace, each with its own source ref so the
 // idempotency key keeps them apart.
-async function appendUnder(nsId: string, ref: string): Promise<string> {
+async function appendUnder(nsId: string, ref: string, channel = "volume"): Promise<string> {
   const observation = storedObservation(await observations.append(
-    anEvent({ source: { ...src, ref }, namespace: { kind: "wallet", id: nsId } }),
+    anEvent({
+      source: { ...src, ref },
+      namespace: { kind: "wallet", id: nsId },
+      channel,
+      kind: channel === "volume" ? "payment" : `${channel}_observed`,
+    }),
   ));
   return observation.observationId!;
 }
+
+// One observation per channel this file tags on, because a tag's channel must
+// be its EVIDENCE's channel -- `tag_observation_in_namespace` now carries the
+// channel, since M2 guarantees the two agree and this schema holds what the
+// code guarantees. Before that key was widened these tests tagged a `volume`
+// observation as `price` or `latency` freely: the channel was incidental to
+// what each one measured, so nothing noticed, and the deliberate story in
+// `acceptance.test.ts` was the only place the two already agreed.
+const CHANNELS = ["price", "latency", "content"] as const;
+const obsOn: Record<string, string> = {};
 
 beforeAll(async () => {
   ({ db, done } = await withSchema("tag_test"));
@@ -61,6 +76,7 @@ beforeAll(async () => {
   observations = new ObservationRepository(db, namespaces, clock, RETENTION_V0);
   repo = new TagRepository(db, clock);
   obs = await appendUnder("GOLDADDRESS", "op:tag:1");
+  for (const c of CHANNELS) obsOn[c] = await appendUnder("GOLDADDRESS", `op:tag:${c}`, c);
   obs2 = await appendUnder("GOLDADDRESS", "op:tag:2");
   obs3 = await appendUnder("GOLDADDRESS", "op:tag:3");
   ns = (await namespaces.find("wallet", "GOLDADDRESS"))!.namespaceId;
@@ -224,6 +240,27 @@ describe("what the table refuses to hold", () => {
     ).rejects.toMatchObject({ code: "23502", column: "aspect" });
   });
 
+  // A tag says "this counterparty has an anomaly on channel X, evidenced by
+  // observation O", and until now nothing required O to be ON channel X. The
+  // foreign key held the namespace and stopped at the channel, so a `volume`
+  // observation could carry a `latency` tag -- which decays under the latency
+  // half-life while its evidence is about volume, and competes in the latency
+  // quota. M2 already guarantees it cannot happen: `decide` takes the tag's
+  // channel from the reading and `readingOf` switches on the observation's
+  // own channel. This branch made (namespace, channel, aspect) the tag's
+  // IDENTITY, so the channel being the evidence's channel is part of the same
+  // decision, and the rule belongs where every other invariant here lives.
+  it("refuses a tag whose channel is not the observation's, by foreign key", async () => {
+    const opened = repo.open({
+      namespaceId: ns, observationId: obs, channel: "latency", aspect: "p-chan",
+      g0: 0.5, taggedAt: clock.now(),
+    });
+    await expect(opened).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(opened).rejects.toMatchObject({
+      sqlstate: "23503", constraint: "tag_observation_in_namespace",
+    });
+  });
+
   it("refuses a tag whose namespace is not the observation's, by foreign key", async () => {
     const stranger = (await namespaces.ensure({ kind: "wallet", id: "STRANGER" })).namespaceId;
     const opened = repo.open({ namespaceId: stranger, observationId: obs, channel: "volume", aspect: "p2", g0: 0.5, taggedAt: clock.now() });
@@ -257,7 +294,7 @@ describe("opening and reading", () => {
     const happened = new Date("2026-09-05T10:00:00.000Z");
     expect(happened.getTime()).toBeLessThan(clock.now().getTime());
     const t = await repo.open({
-      namespaceId: ns, observationId: obs, channel: "latency", aspect: "p4",
+      namespaceId: ns, observationId: obsOn.latency!, channel: "latency", aspect: "p4",
       g0: 0.2, taggedAt: happened,
     });
     expect(t.taggedAt).toEqual(happened);
@@ -289,11 +326,11 @@ describe("opening and reading", () => {
   // Retirement frees the pair. The operation itself is M4's; the column and
   // the fact that a retired tag stops being live are this card's.
   it("stops counting a retired tag as the live one, and lets the pair open again", async () => {
-    const first = await repo.open({ namespaceId: ns, observationId: obs, channel: "content", aspect: "memo", g0: 0.3, taggedAt: clock.now() });
+    const first = await repo.open({ namespaceId: ns, observationId: obsOn.content!, channel: "content", aspect: "memo", g0: 0.3, taggedAt: clock.now() });
     await sql`update tag set retired_at = ${clock.now()} where tag_id = ${first.tagId}`.execute(db);
     const live = await repo.listLive(ns);
     expect(live.map((t) => t.tagId)).not.toContain(first.tagId);
-    const again = await repo.open({ namespaceId: ns, observationId: obs2, channel: "content", aspect: "memo", g0: 0.6, taggedAt: clock.now() });
+    const again = await repo.open({ namespaceId: ns, observationId: obsOn.content!, channel: "content", aspect: "memo", g0: 0.6, taggedAt: clock.now() });
     expect(again.tagId).not.toBe(first.tagId);
   });
 
@@ -304,7 +341,7 @@ describe("opening and reading", () => {
   // moved backward is credited with a future it did not have.
   describe("the guard", () => {
     async function aTag(aspect: string) {
-      return repo.open({ namespaceId: ns, observationId: obs, channel: "latency", aspect, g0: 0.5, taggedAt: clock.now() });
+      return repo.open({ namespaceId: ns, observationId: obsOn.latency!, channel: "latency", aspect, g0: 0.5, taggedAt: clock.now() });
     }
 
     it("refuses a delete: retirement is a column, not a disappearance", async () => {
@@ -486,11 +523,11 @@ describe("suppression", () => {
 describe("the instant a tag is stamped with", () => {
   it("refuses something that is not a Date at all, by argument name", async () => {
     await expect(repo.open({
-      namespaceId: ns, observationId: obs, channel: "price", aspect: "notadate",
+      namespaceId: ns, observationId: obsOn.price!, channel: "price", aspect: "notadate",
       g0: 0.5, taggedAt: "2026-09-12T00:00:00.000Z" as unknown as Date,
     })).rejects.toThrow(/taggedAt must be a valid Date/);
     await expect(repo.open({
-      namespaceId: ns, observationId: obs, channel: "price", aspect: "notadate2",
+      namespaceId: ns, observationId: obsOn.price!, channel: "price", aspect: "notadate2",
       g0: 0.5, taggedAt: new Date("not a date"),
     })).rejects.toThrow(/taggedAt must be a valid Date/);
   });
@@ -503,7 +540,7 @@ describe("findLive", () => {
   // two tags on one pair apart, because the pair was not a key.
   it("finds the live tag on a pair, and nothing for a pair with none", async () => {
     const t = await repo.open({
-      namespaceId: ns, observationId: obs, channel: "price", aspect: "usd",
+      namespaceId: ns, observationId: obsOn.price!, channel: "price", aspect: "usd",
       g0: 0.5, taggedAt: clock.now(),
     });
     expect(await repo.findLive(ns, "price", "usd")).toMatchObject({ tagId: t.tagId });
@@ -531,8 +568,10 @@ describe("findLive", () => {
     // changes what the `listLive` tests count, and a test that has to be
     // read alongside two others to be correct is a test that will be broken
     // by the next one.
-    const aObs = await appendUnder("PAIRA", "op:tag:paira");
-    const bObs = await appendUnder("PAIRB", "op:tag:pairb");
+    // On the channel the tags are opened on, because a tag's channel is its
+    // evidence's channel.
+    const aObs = await appendUnder("PAIRA", "op:tag:paira", "price");
+    const bObs = await appendUnder("PAIRB", "op:tag:pairb", "price");
     const a = (await namespaces.find("wallet", "PAIRA"))!.namespaceId;
     const b = (await namespaces.find("wallet", "PAIRB"))!.namespaceId;
     const tagA = await repo.open({
@@ -550,7 +589,7 @@ describe("findLive", () => {
 
   it("stops finding a tag once it is retired, which is what frees the pair", async () => {
     const t = await repo.open({
-      namespaceId: ns, observationId: obs, channel: "price", aspect: "gbp",
+      namespaceId: ns, observationId: obsOn.price!, channel: "price", aspect: "gbp",
       g0: 0.5, taggedAt: clock.now(),
     });
     await sql`update tag set retired_at = ${clock.now()} where tag_id = ${t.tagId}`.execute(db);
@@ -643,7 +682,7 @@ describe("refresh", () => {
   it("refuses a tag stamped after the clock, which would never decay", async () => {
     const ahead = new Date(clock.now().getTime() + DAY);
     await expect(repo.open({
-      namespaceId: ns, observationId: obs, channel: "price", aspect: "future",
+      namespaceId: ns, observationId: obsOn.price!, channel: "price", aspect: "future",
       g0: 0.5, taggedAt: ahead,
     })).rejects.toBeInstanceOf(RangeError);
     const t = await aLive("r:future");
@@ -727,16 +766,20 @@ describe("listLive", () => {
   let lister: TagRepository;
   let otherNs: string;
   let otherObs: string;
+  let otherLatency: string;
   beforeAll(async () => {
     lister = new TagRepository(db, listClock);
     otherObs = await appendUnder("OTHERADDRESS", "op:tag:other");
     otherNs = (await namespaces.find("wallet", "OTHERADDRESS"))!.namespaceId;
+    // This block tags on two channels, and a tag's channel is its evidence's,
+    // so it needs evidence on both.
+    otherLatency = await appendUnder("OTHERADDRESS", "op:tag:other:latency", "latency");
   });
 
   it("returns the namespace's tags newest first and nobody else's", async () => {
     const first = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "volume", aspect: "p15", g0: 0.3, taggedAt: listClock.now() });
     listClock.advance(DAY);
-    const second = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "latency", aspect: "p16", g0: 0.6, taggedAt: listClock.now() });
+    const second = await lister.open({ namespaceId: otherNs, observationId: otherLatency, channel: "latency", aspect: "p16", g0: 0.6, taggedAt: listClock.now() });
     listClock.advance(DAY);
     const third = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "volume", aspect: "p17", g0: 0.9, taggedAt: listClock.now() });
     const live = await lister.listLive(otherNs);

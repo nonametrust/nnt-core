@@ -123,6 +123,28 @@ alter table tag add constraint tag_aspect_nonempty check (length(aspect) > 0);
 -- index below is partial on it; the nightly operation that sets it is M4's.
 alter table tag add column retired_at timestamptz;
 -- R11 as a check as well as a guard branch. The guard fires on UPDATE and
+-- A tag's channel is its EVIDENCE's channel, and the foreign key stopped at
+-- the namespace. So a `volume` observation could carry a `latency` tag -- one
+-- that decays under the latency half-life while its evidence is about volume,
+-- and competes in the latency quota. M2 already guarantees it cannot happen
+-- (`decide` takes the channel from the reading and `readingOf` switches on the
+-- observation's own channel), which is exactly why the database should hold
+-- it: this schema's rule is that what the code guarantees, the table refuses
+-- from any writer. This card made (namespace, channel, aspect) the tag's
+-- IDENTITY, so the channel being the evidence's is part of the same decision.
+--
+-- Done by widening the existing key rather than adding a second one, so there
+-- is one statement about what a tag may point at and not two that could
+-- disagree. The unique index the wider key needs is on a superset of the
+-- observation's primary key, so it forbids nothing the table did not already
+-- forbid; it exists to be referenced.
+create unique index observation_identity_channel
+  on observation (observation_id, namespace_id, channel);
+alter table tag drop constraint tag_observation_in_namespace;
+alter table tag add constraint tag_observation_in_namespace
+  foreign key (observation_id, namespace_id, channel)
+  references observation (observation_id, namespace_id, channel);
+
 -- DELETE, like every guard in this schema, so a raw INSERT could write a tag
 -- retired eleven days before it was opened and nothing refused it -- measured,
 -- not supposed. A tag cannot retire before it exists, whichever statement
