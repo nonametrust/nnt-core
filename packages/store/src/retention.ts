@@ -36,8 +36,15 @@
  *
  * Why the store gets its own policy value rather than sharing the tagging
  * package's: the store may not import tagging, and these four inputs are the
- * store's own. The engine composes the two and every audit row names both
- * versions.
+ * store's own. The engine composes the two, and the audit body is where both
+ * versions must appear.
+ *
+ * That last clause read "every audit row names both versions" until the
+ * close-out review, which is a present-tense claim about code that does not
+ * exist: `AuditChain.append` takes a `policyVersion` and writes it, and no
+ * caller in this package fills it -- the engine that will is M3's. R7's
+ * second clause is the one ruling in the plan's §2 with no row in its gate
+ * map, and this docstring was repeating it as a fact.
  */
 export interface RetentionPolicy {
   /** What a champion-challenger arrangement keys on; every result names it. */

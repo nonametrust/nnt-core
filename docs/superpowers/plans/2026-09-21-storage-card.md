@@ -71,6 +71,8 @@ These are mine, could be overturned, and each says what it costs. They are the p
 
 **R7. The store gets its own versioned value, `RetentionPolicy`, and M3's audit body names both versions.** Store cannot import tagging (dependency table in the M0 spec, `store/package.json`), and the four inputs are the store's. Cost: two policy versions where the M0 spec (line 306-311) says one file; the engine composes them, and every audit row carries both.
 
+*Second clause unheld, and it is the only ruling in §2 with no row in the gate map.* `AuditChain.append` takes a `policyVersion` and writes it, and no non-test caller in `packages/store/src` fills it -- the engine that would is M3's. So "every audit row carries both versions" is a statement about code that does not exist yet, written in the present tense here and repeated verbatim in `retention.ts`'s own docstring. Nothing is wrong with the intention; what is wrong is that both places assert it as a fact. M3's card owns making it one, and until then the honest form is "the audit body is where both versions must appear, and no writer fills it yet".
+
 **R8. `period` is a `date` column that the repository never reads back as a driver `Date`.** The driver parses a `date` at *local* midnight (db.ts:72-75 records that no parser is configured), and a process east of UTC would then re-render `2026-09-01` as `2026-08-31T21:00Z` and look up the wrong month key, silently. Every select of `period` renders it as text in SQL. A test sets `TZ` to a zone ahead of UTC and proves the round trip. Cost: one cast per query.
 
 ---
@@ -799,6 +801,69 @@ describes.
   rather than false: test files name them as fixtures, and the gate exempts
   tests.
 
+### What the branch-wide review found and this card did NOT fix
+
+A ten-lens review of the whole diff produced 73 raw findings; 40 survived
+triage, 36 survived three independent refuters each, and all 36 were then
+reproduced by running them. Most became commits. These did not, and each says
+why -- a finding left out of a list is indistinguishable from a finding nobody
+had, which is the failure this section exists to avoid.
+
+- **A pool-built write awaited inside a caller's open transaction blocks
+  without bound.** `refuseWriteInsideTransaction` tests the `Db` the
+  repository was BUILT on, so a pool-built repository passes it; if the
+  caller's own transaction holds the shred's lock on the same namespace row,
+  `ensure`'s insert waits on it forever and the transaction can never commit
+  because it is awaiting that promise. Measured: one backend `active / Lock`,
+  no error of any kind. NOT FIXED, and the reason is that the obvious fix is
+  worse than the defect: a `lock_timeout` in `PINS` would bound every
+  statement this store issues, including the migrate advisory-lock wait and
+  the deliberate lock handshakes, and would turn a slow lock into a failure on
+  a healthy system. The refusal cannot see it either -- a pool-built
+  repository has no way to know a caller opened a transaction elsewhere. This
+  is R21's boundary and belongs in §2c with the other limits: **the store can
+  refuse a write it is HANDED a transaction for, and cannot refuse one that
+  races a transaction it was never shown.** M4's runbook decides whether the
+  engine takes a timeout.
+- **`permanent_record` can be promoted from without bound.** Nothing limits
+  how many rescues one observation or one namespace may accumulate, and each
+  is a namespace-sealed copy that survives every retention sweep. Recorded in
+  §2c as the third unbounded table beside `observation` and `audit_entry`,
+  not fixed: a cap here is a policy number and this card's four are already
+  uncalibrated.
+- **`read` does not compare the parsed observation's own id to the row's.**
+  Held two-deep instead: `permanentAad` binds `observationId`, so a
+  row-exchange is refused by the AEAD before the parse. The check would be
+  defence in depth against a holder of the namespace key, which is a different
+  threat model, and adding it would put the same rule in two places with no
+  test able to tell which one refused.
+- **The erasure gate's `for share` is pinned only against weakening.**
+  Strengthening it to `for update` leaves the suite green. The rule is "the
+  weakest mode that works", and the difference is that share locks do not
+  conflict with each other so concurrent appends to one namespace do not
+  queue -- a property only a timing test could see, and a timing test for a
+  performance property is how flaky suites start. Left unheld and said so.
+- **`index.ts` exports more than its own stated rule allows.** Its header says
+  "Repositories and errors are exported; the Kysely instance, the connection
+  and the SQL are not", and `export *` carries `Schema`, `Db` and `withIsoDates`
+  out with them. Either the sentence or the exports should change; which one is
+  M3's to say, because M3 is the first consumer and the answer depends on what
+  it needs.
+- **`expiresAt` is exported and validates nothing.** Reachable from outside
+  the store, where no constructor has asserted the policy. The docstring already
+  admits this and explains why it is safe INSIDE the store; what it does not
+  say is that the export makes "inside" not the only caller.
+- **The advisory-lock key space is shared and unallocated.** `hashtext(producer)`
+  and `migrate`'s own key live in one 64-bit space with nothing recording the
+  allocation. No collision is reachable today; the prose that implies the space
+  is owned is what is wrong.
+- **`AppendResult` types the observation's identity differently in each arm.**
+  The unreadable arm declares `observationId: string`; the readable arms carry
+  an `Observation` whose `observationId` is optional. A caller narrowing on
+  `created` gets a different type for the same field. `storedObservation` exists
+  to paper over exactly this, and the honest fix is a schema change M3 should
+  drive.
+
 ## 3. Global constraints for every task
 
 - Everything M1 and M2 fixed: Node 22, pnpm, strict TS, `tsconfig.test.json` with `"exclude": []`, build before typecheck, Apache-2.0, English in code, Turkish on the board, no Stellar-shaped id in a tracked file.
@@ -806,6 +871,20 @@ describes.
 - `Date.now` and a no-argument `new Date` do not appear in `packages/store/src` outside `clock.ts:12` and `clock.test.ts`. Task 10 makes that a gate.
 - No line in `packages/store/src` names `observedAt`, `validFrom` or `validUntil`, in code or comment (`gates/single-date-reader.test.ts:40`). The store reaches an instant through `datedAt` (`observation.ts:82`).
 - **The store computes nothing.** No arithmetic on `g0`, on strength, on counts. It writes what it is handed and refuses what the table refuses.
+
+  *Corrected at close-out, because the sentence is false in three places and
+  nothing on the branch had ever cited it.* `strength.ts` is an exported
+  computation in `packages/store`, and the acceptance test reads a tag's
+  strength through it; `tag.ts`'s refresh does arithmetic on `refresh_count`
+  in its WHERE clause; and `append` counts rows for the producer cap. The
+  accurate rule is narrower and is what the code actually holds: **the store
+  computes nothing a DECISION depends on.** `g0`, `taggedAt`, the saturation
+  state and the surprise all arrive from M2 and are written as handed, and the
+  three computations above are a pure read-side function, an optimistic
+  concurrency check and a bound -- none of which changes what a decision is.
+  Keeping the shorter sentence would mean either deleting `strength.ts` from
+  this package or letting the constraint be decorative, and this card chose
+  neither on purpose.
 - The two test habits from the M2 ledger (501-515): assert a refusal's message or constraint name, not only its class; override every `RetentionPolicy` field in at least one test with a number no other field shares (the shipped values are 90, 86 400 000 and 1 000 000; no two collide).
 - For every test in a brief, delete the line it claims to protect and confirm the test fails; report any that stay green (M2 ledger 452-482; seven of eleven tasks had one).
 - The plan's code blocks are intent, not transcription: keep every guard the current code has unless the task says to remove it (M2 ledger 488-499).
@@ -985,6 +1064,18 @@ Each named, what it refuses, how it is proven to fail on a planted violation, wh
 12. **The producer cap is exact and an expired re-delivery is not a revival; no wall clock in the store** (new). Planted: the lock removed under twenty concurrent appends; a re-delivery after expiry with `xmin` compared; `new Date()` in a store module.
 
 Existing gates untouched and still required green: no Stellar address, single date reader, baseline shape, no test file in `dist`.
+
+*That sentence is wrong about two of its four, and the `gates/` directory grew
+134 lines on this branch that no review lens cited.* The baseline-shape gate
+was not untouched: its extractor was lifted into `gates/interface-fields.ts`
+and parameterised so the new tag-refresh gate could share it, which is a
+change to the gate that holds the older claim. And "no test file in `dist`" is
+a build-output gate whose subject this branch does not produce, so calling it
+"still required green" says less than it sounds like. The two that ARE
+untouched and still green are the Stellar-address gate and the single-date-
+reader gate. Named here rather than left as a closing flourish, because a list
+of four gates that is right about two is the shape of claim this whole card
+kept finding in other people's comments.
 
 ---
 
