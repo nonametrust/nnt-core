@@ -1,7 +1,12 @@
+import { readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sql } from "kysely";
 import { openDb, type Db } from "../db.js";
 import { migrate } from "../migrate.js";
+import type { Observation } from "@nonametrust/schema";
+import type { AppendResult } from "../repositories/observation.js";
 
 const MIGRATIONS = fileURLToPath(new URL("../../migrations/", import.meta.url));
 
@@ -52,4 +57,69 @@ export async function withSchema(name: string): Promise<{ db: Db; done: () => Pr
       await cleanup.destroy();
     },
   };
+}
+
+/**
+ * Removes this suite's leftover temp directories, by prefix, and returns how
+ * many it took. Called on ENTRY rather than relied on at teardown, for the
+ * same reason `withSchema` drops its schema on entry: an ordinary failure
+ * runs afterAll, a SIGKILL does not, and the directories then accumulate one
+ * per killed run. Measured: eight had built up before this existed.
+ */
+export function sweepTempDirs(prefix: string): number {
+  const stale = readdirSync(tmpdir())
+    .filter((n) => n.startsWith(prefix))
+    .filter((n) => !isLiveRun(n.slice(prefix.length)));
+  for (const name of stale) rmSync(join(tmpdir(), name), { recursive: true, force: true });
+  return stale.length;
+}
+
+/**
+ * Whether a directory name's leading `<pid>-` belongs to a process that is
+ * still running.
+ *
+ * The prefix alone is not ownership. The temp directory is per MACHINE while
+ * the test databases are per run, so two concurrent runs of the same file --
+ * two review agents, or a shard -- swept each other's LIVE working directory
+ * on entry. Measured: three of three concurrent pairs failed before this
+ * predicate and three of three passed after. It is the same shape as the
+ * `pg_locks` filter that had to be scoped to `current_database()`, and the
+ * same lesson: anything machine-wide or cluster-wide needs a predicate that
+ * names US.
+ *
+ * `kill(pid, 0)` signals nothing and only asks whether the pid exists. EPERM
+ * means it exists and belongs to another user, which is still alive. A name
+ * with no leading pid is a leftover from before this rule and is swept, or
+ * the old directories would never go away. A recycled pid makes a dead run's
+ * directory survive one sweep longer, which is the harmless direction.
+ */
+function isLiveRun(suffix: string): boolean {
+  const pid = Number(suffix.split("-")[0]);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as { code?: string }).code === "EPERM";
+  }
+}
+
+/**
+ * The observation an append result carries, or a throw naming the shape that
+ * came back instead.
+ *
+ * `AppendResult` became a union in Task 8 (R19): an append can answer that a
+ * row exists and cannot be opened, and such a result carries no observation.
+ * A test that reaches for `.observation` is asserting the append stored one
+ * or could read one back, so that assertion is made here, once, and fails
+ * with the two flags rather than with `undefined is not an object` wherever
+ * the value is first used.
+ */
+export function storedObservation(result: AppendResult): Observation {
+  if (result.created) return result.observation;
+  if (result.readable) return result.observation;
+  throw new Error(
+    `append answered unreadable for observation ${result.observationId}: ` +
+      `periodExpired=${result.periodExpired}, namespaceErased=${result.namespaceErased}`,
+  );
 }

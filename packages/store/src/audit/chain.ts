@@ -2,7 +2,7 @@ import { createHash, createHmac } from "node:crypto";
 import { sql, type Selectable } from "kysely";
 import type { Clock } from "../clock.js";
 import type { KeyRing } from "../crypto.js";
-import type { Db, Schema } from "../db.js";
+import { refuseWriteInsideTransaction, type Db, type Schema } from "../db.js";
 import { DayNotClosed, NothingToSeal, SealMismatch, mapPgError } from "../errors.js";
 
 /**
@@ -266,6 +266,7 @@ export class AuditChain {
    * stored, with the sequence the database assigned.
    */
   async append(e: AuditEntryInput): Promise<StoredAuditEntry> {
+    refuseWriteInsideTransaction(this.db, "AuditChain.append");
     const occurredAt = this.clock.now();
     const { bodyJson, canonical } = render({
       occurredAt, policyVersion: e.policyVersion, kind: e.kind, body: e.body,

@@ -9,9 +9,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NNT_TEST_DATABASE_URL: postgres://nnt:nnt@127.0.0.1:5432/nnt_test
-      # A fixed key in a public workflow, acceptable only because it encrypts
-      # nothing but test fixtures. The deployed key is not in this repository.
-      NNT_MASTER_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      # No NNT_MASTER_KEY here. There used to be an all-zero one, justified as
+      # "it encrypts nothing but test fixtures" -- and nothing read it: every
+      # suite builds its ring from randomBytes and passes the env in
+      # explicitly. A dead all-zero key in a public workflow is a thing people
+      # copy, and the README already says none is needed to run the tests.
     services:
       postgres:
         image: postgres:17

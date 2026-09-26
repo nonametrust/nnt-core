@@ -6,6 +6,11 @@ export * from "./clock.js";
 export * from "./errors.js";
 export { migrate } from "./migrate.js";
 export * from "./crypto.js";
+// Exported here rather than in the final task, because NamespaceRepository's
+// constructor now requires a RetentionPolicy: without this, the package's
+// public surface cannot construct its own repository and a consumer would
+// have to reach past index.ts for the value and the type.
+export * from "./retention.js";
 export * from "./repositories/namespace.js";
 export * from "./repositories/observation.js";
 export * from "./repositories/tag.js";

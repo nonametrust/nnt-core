@@ -46,14 +46,60 @@ any file under `packages/*/dist` matches `*.test.*` or `*.spec.*`.
 ## The store
 
 `packages/store` holds the observations, tags, permanent records, the audit
-chain, and the four tables M2 and M3 fill. Its invariants are the database's:
-append-only tables, the chain's linkage and hashes, and the promotion instant
-are held by triggers that raise, and the package maps each SQLSTATE to a named
+chain, the counterparty spaces and their month keys, and the four tables M2
+and M3 fill -- eleven tables. Its invariants are the database's:
+append-only tables, the chain's linkage and hashes, the promotion instant,
+the namespace and month-key guards and the refusal to observe an erased
+counterparty are held by triggers that raise, and the package maps each SQLSTATE to a named
 error. Tag strength is never stored, only derived. Time enters through an
 injected clock and nowhere else, which is what lets
 `packages/store/src/acceptance.test.ts` run the design's day-twelve to
 day-twenty-one scenario, all four acceptance criteria on one database, in
 milliseconds.
+
+Retention is the store's own design rather than a policy applied to it, and
+it is not deletion. A payload is sealed under a key per (counterparty space,
+calendar month), and that month key is wrapped under the space's own key. A
+declared grace after the month closes, a sweep shreds the month key: the
+payload stops opening while the row, its foreign keys, the audit chain and
+every seal stay exactly where they are and stay verifiable. An erasure
+request shreds the outer key instead and takes the whole space with it. A
+promotion re-seals the rescued observation under that outer key, which is how
+a captured trace outlives its month and still dies with an erasure request.
+
+**What "erasure" does NOT mean here**, because the word invites more than the
+mechanism delivers and a reader who skips this paragraph will assume the rest.
+Four limits, each measured rather than reasoned, in the plan's §2c and R19:
+
+1. A shred is an UPDATE that nulls a column. The wrapped key stays in the
+   pre-vacuum heap -- read back with `pageinspect` and used to open an
+   expired month -- and in WAL, where a blind scan found one after
+   `VACUUM FULL`. So anything that archives WAL, streams to a replica or
+   takes base backups keeps every key for as long as it keeps those.
+2. Which makes the realistic attacker **a database backup**: the wrap binds a
+   key to its row's identity and not to time, so restoring a pre-shred copy
+   into its own row makes the space readable again. Irreversible erasure
+   needs two things this repository does not have -- a master-key rotation
+   runbook whose old master is destroyed, and a backup retention shorter than
+   the erasure promise.
+3. Erasure is **content-only**. After a shred the counterparty identifier
+   itself, every observation's channel, kind, evidence kind, instants and
+   producer, every tag's strength and **aspect**, every baseline's mean and
+   all permanent-record metadata are still plaintext. Three are worse than
+   they look: a baseline over a single observation has a mean equal to that
+   observation's amount; the idempotency key is an unkeyed SHA-256 over mostly
+   public parts, from which a three-hundred-candidate dictionary recovered 3
+   of 3 source references of a shredded namespace; and an aspect is derived
+   from the payload and reads like it -- the asset code and direction, the
+   quote unit, the on-ledger event name -- so after an erasure the tag queries
+   still answer what KIND of thing was observed, in the payload's own words.
+4. And the store **answers** a re-delivery for an erased space rather than
+   refusing it, so the existence of an observation and the instant it was
+   ingested stay answerable per source reference even when its content does
+   not.
+
+The defensible sentence is therefore "content unreadable through this
+package's API", not "erased".
 
 ### Running the store tests
 
@@ -141,6 +187,33 @@ true. The ones worth knowing before you add a file:
   store, so the shape is declared twice and this gate reads both
   declarations as text and compares names and written types. Refuses to
   report green unless it finds the Welford fields in each.
+- **The two `TagRefresh` declarations agree field for field**
+  (`gates/tag-refresh-shape.test.ts`), sharing its reader with the gate
+  above (`gates/interface-fields.ts`). The consequence of a drift is worse
+  here: the store writes these four values as handed and recomputes none of
+  them, so a field the arithmetic starts returning and the store does not
+  know about is simply not written, the refresh appears to succeed, and the
+  row is left half-updated with nothing raising anything.
+- **The store reads no clock but its own**
+  (`packages/store/src/clock-gate.test.ts`), a lint over `packages/store/src`
+  in the idiom of the tagging package's. It matters because retention is a
+  simulated calendar: expiry derived from the period and not from today, a
+  sweep told `now` rather than asking, a producer cap measured against the
+  caller's instant. All of it is provable in milliseconds only because the
+  clock is an argument. Two modules are exempt and both are named in the
+  file: `clock.ts`, which is the injection point, and `migrate.ts`, whose
+  migration ledger stamps `applied_at` with the database's `now()` -- a
+  deployment fact rather than a domain instant, and one a simulated clock
+  cannot supply, since the migration is what creates the schema. The exempt
+  set is pinned by name, so it cannot widen quietly.
+
+  Called a **lint** deliberately. Review walked about a dozen spellings past
+  its first version -- `new (Date)()`, a destructured `now`, a bare `Date()`,
+  a Postgres `now()` inside a query -- and the predicate is wider now and
+  still cannot be complete, because a lexical scan holds spellings and not
+  semantics. What makes the rule true is the suite: every retention fixture
+  pins a fixed instant, so a repository that started reading the wall clock
+  fails eleven tests before it reaches this one.
 - **The schema version is checked exactly** on every observation
   (`packages/schema/src/payloads.test.ts`), and the golden fixtures must all
   validate (`packages/schema/src/fixtures.test.ts`).

@@ -3,14 +3,15 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { WireObservation } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db } from "../db.js";
-import { withSchema } from "../testing/harness.js";
+import { withSchema, storedObservation } from "../testing/harness.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
-import { ConstraintViolation, StoreError, TagNotFound } from "../errors.js";
+import { RETENTION_V0 } from "../retention.js";
+import { ConstraintViolation, StoreError, TagAltered, TagNotFound, TagRefreshStale } from "../errors.js";
 import { strengthAt } from "../strength.js";
 import { NamespaceRepository } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
-import { TagRepository } from "./tag.js";
+import { TagRepository, type TagRefresh } from "./tag.js";
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -47,19 +48,35 @@ function anEvent(over: Record<string, unknown> = {}): WireObservation {
 
 // Three observations under one namespace, each with its own source ref so the
 // idempotency key keeps them apart.
-async function appendUnder(nsId: string, ref: string): Promise<string> {
-  const { observation } = await observations.append(
-    anEvent({ source: { ...src, ref }, namespace: { kind: "wallet", id: nsId } }),
-  );
+async function appendUnder(nsId: string, ref: string, channel = "volume"): Promise<string> {
+  const observation = storedObservation(await observations.append(
+    anEvent({
+      source: { ...src, ref },
+      namespace: { kind: "wallet", id: nsId },
+      channel,
+      kind: channel === "volume" ? "payment" : `${channel}_observed`,
+    }),
+  ));
   return observation.observationId!;
 }
 
+// One observation per channel this file tags on, because a tag's channel must
+// be its EVIDENCE's channel -- `tag_observation_in_namespace` now carries the
+// channel, since M2 guarantees the two agree and this schema holds what the
+// code guarantees. Before that key was widened these tests tagged a `volume`
+// observation as `price` or `latency` freely: the channel was incidental to
+// what each one measured, so nothing noticed, and the deliberate story in
+// `acceptance.test.ts` was the only place the two already agreed.
+const CHANNELS = ["price", "latency", "content"] as const;
+const obsOn: Record<string, string> = {};
+
 beforeAll(async () => {
   ({ db, done } = await withSchema("tag_test"));
-  namespaces = new NamespaceRepository(db, ring, clock);
-  observations = new ObservationRepository(db, namespaces, clock);
+  namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
+  observations = new ObservationRepository(db, namespaces, clock, RETENTION_V0);
   repo = new TagRepository(db, clock);
   obs = await appendUnder("GOLDADDRESS", "op:tag:1");
+  for (const c of CHANNELS) obsOn[c] = await appendUnder("GOLDADDRESS", `op:tag:${c}`, c);
   obs2 = await appendUnder("GOLDADDRESS", "op:tag:2");
   obs3 = await appendUnder("GOLDADDRESS", "op:tag:3");
   ns = (await namespaces.find("wallet", "GOLDADDRESS"))!.namespaceId;
@@ -100,9 +117,17 @@ describe("what the table refuses to hold", () => {
       select column_name from information_schema.columns
       where table_name = 'tag' and table_schema = current_schema()
     `.execute(db);
+    // Two columns were argued in on purpose by the storage card. `aspect`
+    // because M2 keys the live tag on (namespace, channel, aspect) and the
+    // table held only the channel, so one asset's deviation refreshed
+    // another's tag. `retired_at` because retirement is named in three
+    // documents and existed nowhere, and the one-live-per-pair index is
+    // partial on it. Still no strength-like column; that gate is separate
+    // and above.
     expect(rows.rows.map((r) => r.column_name).sort()).toEqual([
-      "channel", "g0", "namespace_id", "observation_id", "refresh_count",
-      "saturation_state", "suppression_factor", "tag_id", "tagged_at",
+      "aspect", "channel", "g0", "namespace_id", "observation_id",
+      "refresh_count", "retired_at", "saturation_state", "suppression_factor",
+      "tag_id", "tagged_at",
     ]);
   });
 
@@ -114,7 +139,7 @@ describe("what the table refuses to hold", () => {
   // real surface.
   it("offers no way to delete a tag by identifier, because suppression is not deletion", async () => {
     expect(Object.getOwnPropertyNames(TagRepository.prototype).sort()).toEqual([
-      "constructor", "get", "listLive", "open", "refresh", "suppress",
+      "constructor", "findLive", "get", "listLive", "open", "refresh", "suppress",
     ]);
     expect(Object.getOwnPropertyNames(TagRepository).sort()).toEqual(["length", "name", "prototype"]);
     expect(Object.keys(await import("./tag.js")).sort()).toEqual(["TagRepository"]);
@@ -151,12 +176,12 @@ describe("what the table refuses to hold", () => {
     ];
     for (const [g0, factor] of cases) {
       await expect(
-        sql`insert into tag (tag_id, namespace_id, observation_id, channel, g0, tagged_at, suppression_factor)
-            values (${randomUUID()}, ${ns}, ${obs}, 'volume', ${sql.raw(g0)}, ${clock.now()}, ${sql.raw(factor)})`
+        sql`insert into tag (tag_id, namespace_id, observation_id, channel, aspect, g0, tagged_at, suppression_factor)
+            values (${randomUUID()}, ${ns}, ${obs}, 'volume', ${`raw:${g0}:${factor}`}, ${sql.raw(g0)}, ${clock.now()}, ${sql.raw(factor)})`
           .execute(db),
       ).rejects.toMatchObject({ code: "23514" });
     }
-    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", g0: 0.5 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p1", g0: 0.5, taggedAt: clock.now() });
     await expect(
       sql`update tag set g0 = 'NaN'::float8 where tag_id = ${t.tagId}`.execute(db),
     ).rejects.toMatchObject({ code: "23514" });
@@ -167,9 +192,78 @@ describe("what the table refuses to hold", () => {
   // foreign keys would let it name a counterparty the observation is not
   // about, and listLive would then surface it under the wrong namespace,
   // which is the one query the nightly job runs. The pair is one key.
+  // The aspect is the tag's key and an empty one is a tag on no aspect at
+  // all, which would collide with every other empty one under the unique
+  // index. The check has to be tested or it can be deleted without anything
+  // going red.
+  it("refuses an empty aspect from a raw writer, by name", async () => {
+    await expect(
+      sql`insert into tag (tag_id, namespace_id, observation_id, channel, aspect, g0, tagged_at)
+          values (${randomUUID()}, ${ns}, ${obs}, 'volume', '', 0.5, ${clock.now()})`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "tag_aspect_nonempty" });
+  });
+
+  // The nonempty check and the not-null are two rules, and only the first was
+  // held. `length(aspect) > 0` evaluates to NULL, not false, for a null
+  // aspect, so a check constraint passes it -- and the partial unique index
+  // treats NULLs as distinct, so a null aspect would also admit any number of
+  // live tags on one (namespace, channel). This is the same null-versus-check
+  // gap the producer column had one migration section down; review deleted
+  // `alter column aspect set not null` and the whole suite stayed green.
+  // R11 was a guard branch, and the guard fires on UPDATE and DELETE only --
+  // so a raw INSERT could write a tag already retired before it was opened
+  // and nothing refused it. A tag cannot retire before it exists, whichever
+  // statement writes it, so the rule is a check constraint as well.
+  it("refuses a tag retired before it was opened, on insert as well as on update", async () => {
+    const opened = clock.now();
+    await expect(
+      sql`insert into tag (tag_id, namespace_id, observation_id, channel, aspect, g0, tagged_at, retired_at)
+          values (${randomUUID()}, ${ns}, ${obs}, 'volume', 'r11', 0.5, ${opened},
+                  ${new Date(opened.getTime() - 1)})`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23514", constraint: "tag_retired_after_opened" });
+    // The same instant is allowed: a tag opened and retired in one operation
+    // is not a contradiction, and nothing in the design forbids it.
+    await expect(
+      sql`insert into tag (tag_id, namespace_id, observation_id, channel, aspect, g0, tagged_at, retired_at)
+          values (${randomUUID()}, ${ns}, ${obs}, 'volume', 'r11b', 0.5, ${opened}, ${opened})`
+        .execute(db),
+    ).resolves.toBeDefined();
+  });
+
+  it("refuses a tag with no aspect at all, which the nonempty check alone admits", async () => {
+    await expect(
+      sql`insert into tag (tag_id, namespace_id, observation_id, channel, aspect, g0, tagged_at)
+          values (${randomUUID()}, ${ns}, ${obs}, 'volume', null, 0.5, ${clock.now()})`
+        .execute(db),
+    ).rejects.toMatchObject({ code: "23502", column: "aspect" });
+  });
+
+  // A tag says "this counterparty has an anomaly on channel X, evidenced by
+  // observation O", and until now nothing required O to be ON channel X. The
+  // foreign key held the namespace and stopped at the channel, so a `volume`
+  // observation could carry a `latency` tag -- which decays under the latency
+  // half-life while its evidence is about volume, and competes in the latency
+  // quota. M2 already guarantees it cannot happen: `decide` takes the tag's
+  // channel from the reading and `readingOf` switches on the observation's
+  // own channel. This branch made (namespace, channel, aspect) the tag's
+  // IDENTITY, so the channel being the evidence's channel is part of the same
+  // decision, and the rule belongs where every other invariant here lives.
+  it("refuses a tag whose channel is not the observation's, by foreign key", async () => {
+    const opened = repo.open({
+      namespaceId: ns, observationId: obs, channel: "latency", aspect: "p-chan",
+      g0: 0.5, taggedAt: clock.now(),
+    });
+    await expect(opened).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(opened).rejects.toMatchObject({
+      sqlstate: "23503", constraint: "tag_observation_in_namespace",
+    });
+  });
+
   it("refuses a tag whose namespace is not the observation's, by foreign key", async () => {
     const stranger = (await namespaces.ensure({ kind: "wallet", id: "STRANGER" })).namespaceId;
-    const opened = repo.open({ namespaceId: stranger, observationId: obs, channel: "volume", g0: 0.5 });
+    const opened = repo.open({ namespaceId: stranger, observationId: obs, channel: "volume", aspect: "p2", g0: 0.5, taggedAt: clock.now() });
     await expect(opened).rejects.toBeInstanceOf(ConstraintViolation);
     await expect(opened).rejects.toMatchObject({ sqlstate: "23503", constraint: "tag_observation_in_namespace" });
     expect(await repo.listLive(stranger)).toEqual([]);
@@ -178,19 +272,189 @@ describe("what the table refuses to hold", () => {
 
 describe("opening and reading", () => {
   it("round-trips a tag through get, with the defaults a fresh tag carries", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", g0: 0.7 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p3", g0: 0.7, taggedAt: clock.now() });
     expect(t.tagId).toMatch(/^[0-9a-f-]{36}$/);
     const read = await repo.get(t.tagId);
     expect(read).toEqual({
-      tagId: t.tagId, namespaceId: ns, observationId: obs, channel: "volume", g0: 0.7,
+      tagId: t.tagId, namespaceId: ns, observationId: obs, channel: "volume",
+      aspect: "p3", g0: 0.7,
       taggedAt: new Date("2026-09-07T00:00:00.000Z"),
       refreshCount: 0, saturationState: "open", suppressionFactor: 1,
+      retiredAt: null,
     });
   });
 
-  it("stamps taggedAt from the injected clock, not from the database's now()", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "latency", g0: 0.2 });
-    expect(t.taggedAt.toISOString()).toBe("2026-09-07T00:00:00.000Z");
+  // Inverted by the storage card, and this is the finding the card itself did
+  // not have. M2's decide returns taggedAt from the EVENT's own instant, not
+  // from any clock, and M1's own acceptance test insists the two differ: an
+  // observation ingested a minute after it happened must not be dated at
+  // ingest. Stamped from the clock, every event tag decays from the wrong
+  // instant, and a backfill dates a whole history at the day it was loaded.
+  it("stamps taggedAt from the decision, which for an event is earlier than the clock", async () => {
+    const happened = new Date("2026-09-05T10:00:00.000Z");
+    expect(happened.getTime()).toBeLessThan(clock.now().getTime());
+    const t = await repo.open({
+      namespaceId: ns, observationId: obsOn.latency!, channel: "latency", aspect: "p4",
+      g0: 0.2, taggedAt: happened,
+    });
+    expect(t.taggedAt).toEqual(happened);
+    expect((await repo.get(t.tagId)).taggedAt).toEqual(happened);
+  });
+
+  // M2 keys the live tag on (namespace, channel, aspect) and tagReading takes
+  // one live tag or none for a pair. Held only in the arithmetic, that is a
+  // promise; held here it is a constraint, and the difference shows the day a
+  // second writer opens a tag on a pair that already has one. Without the
+  // aspect the tag layer pools exactly what the aspect vocabulary exists to
+  // keep apart: a deviation on one asset refreshes a tag another opened.
+  it("holds one live tag per namespace, channel and aspect", async () => {
+    await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "usdc:in", g0: 0.4, taggedAt: clock.now() });
+    const second = repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", aspect: "usdc:in", g0: 0.5, taggedAt: clock.now() });
+    await expect(second).rejects.toBeInstanceOf(ConstraintViolation);
+    await expect(second).rejects.toMatchObject({ sqlstate: "23505", constraint: "tag_one_live_per_pair" });
+  });
+
+  // The same pair on a different aspect is a different tag, which is the
+  // whole point of the column: two assets moving on one channel are two
+  // histories, not one.
+  it("opens a second tag on the same channel under a different aspect", async () => {
+    await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "xlm:in", g0: 0.4, taggedAt: clock.now() });
+    const other = await repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", aspect: "xlm:out", g0: 0.5, taggedAt: clock.now() });
+    expect(other.aspect).toBe("xlm:out");
+  });
+
+  // Retirement frees the pair. The operation itself is M4's; the column and
+  // the fact that a retired tag stops being live are this card's.
+  it("stops counting a retired tag as the live one, and lets the pair open again", async () => {
+    const first = await repo.open({ namespaceId: ns, observationId: obsOn.content!, channel: "content", aspect: "memo", g0: 0.3, taggedAt: clock.now() });
+    await sql`update tag set retired_at = ${clock.now()} where tag_id = ${first.tagId}`.execute(db);
+    const live = await repo.listLive(ns);
+    expect(live.map((t) => t.tagId)).not.toContain(first.tagId);
+    const again = await repo.open({ namespaceId: ns, observationId: obsOn.content!, channel: "content", aspect: "memo", g0: 0.6, taggedAt: clock.now() });
+    expect(again.tagId).not.toBe(first.tagId);
+  });
+
+  // The guard. M1's rule is that an invariant is held by the database rather
+  // than by a caller's good manners, and every rule below is one the
+  // arithmetic computes and no raw writer may undo. The forward-only instant
+  // matters most: strengthAt reads the decay curve from taggedAt, so a tag
+  // moved backward is credited with a future it did not have.
+  describe("the guard", () => {
+    async function aTag(aspect: string) {
+      return repo.open({ namespaceId: ns, observationId: obsOn.latency!, channel: "latency", aspect, g0: 0.5, taggedAt: clock.now() });
+    }
+
+    it("refuses a delete: retirement is a column, not a disappearance", async () => {
+      const t = await aTag("g:delete");
+      await expect(sql`delete from tag where tag_id = ${t.tagId}`.execute(db))
+        .rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("never deleted") });
+      expect((await repo.get(t.tagId)).tagId).toBe(t.tagId);
+    });
+
+    it("fixes the identity columns, so a tag never becomes a tag about something else", async () => {
+      const t = await aTag("g:identity");
+      for (const [column, value] of [
+        ["tag_id", sql`${randomUUID()}`],
+        ["namespace_id", sql`${randomUUID()}`],
+        ["observation_id", sql`${obs2}`],
+        ["channel", sql`'volume'`],
+        ["aspect", sql`'g:moved'`],
+      ] as const) {
+        await expect(
+          sql`update tag set ${sql.ref(column)} = ${value} where tag_id = ${t.tagId}`.execute(db),
+          column,
+        ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("identity is fixed") });
+      }
+    });
+
+    it("refuses an instant that moves backward, and allows one that moves forward", async () => {
+      const t = await aTag("g:instant");
+      await expect(
+        sql`update tag set tagged_at = ${new Date(t.taggedAt.getTime() - 1)} where tag_id = ${t.tagId}`.execute(db),
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("only moves forward") });
+      await sql`update tag set tagged_at = ${new Date(t.taggedAt.getTime() + DAY)},
+                refresh_count = ${t.refreshCount + 1} where tag_id = ${t.tagId}`.execute(db);
+      expect((await repo.get(t.tagId)).refreshCount).toBe(1);
+    });
+
+    // A refresh moves the count by one and a suppression does not move it at
+    // all; nothing moves it by two. Without this a writer could refresh once
+    // and claim a history of repeats, which is the saturation curve's input.
+    it("lets the count stand or rise by one, and refuses a jump", async () => {
+      const t = await aTag("g:count");
+      await expect(
+        sql`update tag set refresh_count = ${t.refreshCount + 2} where tag_id = ${t.tagId}`.execute(db),
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("stands or rises by one") });
+      await sql`update tag set suppression_factor = 2 where tag_id = ${t.tagId}`.execute(db);
+      expect((await repo.get(t.tagId)).refreshCount).toBe(0);
+    });
+
+    it("refuses a saturated tag returning to open", async () => {
+      const t = await aTag("g:saturation");
+      await sql`update tag set saturation_state = 'saturated' where tag_id = ${t.tagId}`.execute(db);
+      await expect(
+        sql`update tag set saturation_state = 'open' where tag_id = ${t.tagId}`.execute(db),
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("saturation is one-way") });
+    });
+
+    // Not in the plan's list, found by review: the repository's `suppress`
+    // takes the greater of the two factors, and its own test says lowering
+    // one "is a way to revive evidence that nothing in the design asks for".
+    // Held only there, it was a promise a raw writer could break -- and the
+    // house rule is that an invariant lives in the database.
+    it("refuses a suppression factor that falls, because that revives evidence", async () => {
+      const t = await aTag("g:suppression");
+      await repo.suppress(t.tagId, 4);
+      await expect(
+        sql`update tag set suppression_factor = 1 where tag_id = ${t.tagId}`.execute(db),
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("suppression only rises") });
+      expect((await repo.get(t.tagId)).suppressionFactor).toBe(4);
+    });
+
+    // Also from review. Retirement takes a tag out of the live set, and a
+    // refresh puts strength back into it; a refreshed retired tag is a row
+    // whose strength moves while nothing can see it, and the pair it once
+    // held has since been reopened by another tag.
+    it("refuses a refresh of a retired tag", async () => {
+      const t = await aTag("g:retired-refresh");
+      await sql`update tag set retired_at = ${clock.now()} where tag_id = ${t.tagId}`.execute(db);
+      await expect(
+        sql`update tag set g0 = 0.9, refresh_count = 1,
+            tagged_at = ${new Date(t.taggedAt.getTime() + DAY)} where tag_id = ${t.tagId}`.execute(db),
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("not refreshed") });
+    });
+
+    // Found by review. The retired-tag rule reads old.retired_at, so a single
+    // statement that retires and refreshes at once passes it: the row was
+    // live when the statement began. The result is a retired row carrying a
+    // strength no decision produced, which is the same defect from the other
+    // direction.
+    it("refuses retiring and refreshing in one statement", async () => {
+      const t = await aTag("g:retire-and-refresh");
+      await expect(
+        sql`update tag set retired_at = ${clock.now()}, g0 = 0.99, refresh_count = 1,
+            tagged_at = ${new Date(t.taggedAt.getTime() + 1)} where tag_id = ${t.tagId}`.execute(db),
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("retires and refreshes") });
+      expect((await repo.get(t.tagId)).g0).toBe(0.5);
+    });
+
+    it("refuses a retirement instant before the tag's own", async () => {
+      const t = await aTag("g:retired-before");
+      await expect(
+        sql`update tag set retired_at = ${new Date(t.taggedAt.getTime() - 1)} where tag_id = ${t.tagId}`.execute(db),
+      ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("not before tagged_at") });
+    });
+
+    it("holds retirement one-way: once set it neither moves nor clears", async () => {
+      const t = await aTag("g:retire");
+      const at = new Date(t.taggedAt.getTime() + DAY);
+      await sql`update tag set retired_at = ${at} where tag_id = ${t.tagId}`.execute(db);
+      for (const value of [sql`${new Date(at.getTime() + DAY)}`, sql`null`]) {
+        await expect(
+          sql`update tag set retired_at = ${value} where tag_id = ${t.tagId}`.execute(db),
+        ).rejects.toMatchObject({ code: "NNT07", message: expect.stringContaining("retirement is one-way") });
+      }
+    });
   });
 
   it("names a missing tag by class, so a bad id is not mistaken for a bug", async () => {
@@ -199,7 +463,7 @@ describe("opening and reading", () => {
   });
 
   it("refuses a tag on an observation that does not exist, on the foreign key", async () => {
-    const opened = repo.open({ namespaceId: ns, observationId: randomUUID(), channel: "volume", g0: 0.5 });
+    const opened = repo.open({ namespaceId: ns, observationId: randomUUID(), channel: "volume", aspect: "p5", g0: 0.5, taggedAt: clock.now() });
     await expect(opened).rejects.toBeInstanceOf(ConstraintViolation);
     await expect(opened).rejects.toMatchObject({ sqlstate: "23503" });
   });
@@ -211,7 +475,7 @@ describe("opening and reading", () => {
     const before = await rowVersions();
     for (const g0 of [-0.1, Number.NaN, Number.POSITIVE_INFINITY]) {
       await expect(
-        repo.open({ namespaceId: ns, observationId: obs, channel: "volume", g0 }),
+        repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p6", g0, taggedAt: clock.now() }),
       ).rejects.toBeInstanceOf(RangeError);
     }
     expect(await rowVersions()).toEqual(before);
@@ -220,7 +484,7 @@ describe("opening and reading", () => {
 
 describe("suppression", () => {
   it("suppresses by raising the factor and leaves the row in place", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", g0: 1 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p7", g0: 1, taggedAt: clock.now() });
     await repo.suppress(t.tagId, 4);
     const after = await repo.get(t.tagId);
     expect(after.suppressionFactor).toBe(4);
@@ -231,14 +495,14 @@ describe("suppression", () => {
   // would slow a tag's decay back down, which is a way to revive evidence
   // that nothing in the design asks for; the larger factor stands.
   it("does not lower a factor already raised", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", g0: 1 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p8", g0: 1, taggedAt: clock.now() });
     await repo.suppress(t.tagId, 4);
     await repo.suppress(t.tagId, 2);
     expect((await repo.get(t.tagId)).suppressionFactor).toBe(4);
   });
 
   it("refuses a factor below one or not finite, because that would be deceleration", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", g0: 1 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs, channel: "volume", aspect: "p9", g0: 1, taggedAt: clock.now() });
     for (const factor of [0.5, 0, Number.NaN, Number.POSITIVE_INFINITY]) {
       await expect(repo.suppress(t.tagId, factor)).rejects.toBeInstanceOf(RangeError);
     }
@@ -250,45 +514,219 @@ describe("suppression", () => {
   });
 });
 
-describe("refresh", () => {
-  it("refreshes rather than stacking: the new g0 is the larger of the two", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", g0: 0.4 });
-    await repo.refresh(t.tagId, 0.9);
-    await repo.refresh(t.tagId, 0.2);
-    const after = await repo.get(t.tagId);
-    expect(after.g0).toBe(0.9);
-    expect(after.refreshCount).toBe(2);
+// `requireInstant` refuses two things and only one was held: an Invalid Date
+// is covered, and something that is not a Date at all is not -- deleting the
+// `!(value instanceof Date)` half left the whole suite green. It matters at
+// the boundary, where a caller hands JSON: a string reaches Postgres as a
+// bind the column may well accept, and the tag is then stamped with an
+// instant nobody chose.
+describe("the instant a tag is stamped with", () => {
+  it("refuses something that is not a Date at all, by argument name", async () => {
+    await expect(repo.open({
+      namespaceId: ns, observationId: obsOn.price!, channel: "price", aspect: "notadate",
+      g0: 0.5, taggedAt: "2026-09-12T00:00:00.000Z" as unknown as Date,
+    })).rejects.toThrow(/taggedAt must be a valid Date/);
+    await expect(repo.open({
+      namespaceId: ns, observationId: obsOn.price!, channel: "price", aspect: "notadate2",
+      g0: 0.5, taggedAt: new Date("not a date"),
+    })).rejects.toThrow(/taggedAt must be a valid Date/);
+  });
+});
+
+describe("findLive", () => {
+  // M2's tagObservation takes the live tag on a pair or null, and until now
+  // the only reader was listLive, so a caller would have had to pull every
+  // live tag in the namespace and filter in memory -- and could not have told
+  // two tags on one pair apart, because the pair was not a key.
+  it("finds the live tag on a pair, and nothing for a pair with none", async () => {
+    const t = await repo.open({
+      namespaceId: ns, observationId: obsOn.price!, channel: "price", aspect: "usd",
+      g0: 0.5, taggedAt: clock.now(),
+    });
+    expect(await repo.findLive(ns, "price", "usd")).toMatchObject({ tagId: t.tagId });
+    expect(await repo.findLive(ns, "price", "eur")).toBeNull();
+    expect(await repo.findLive(ns, "volume", "usd")).toBeNull();
   });
 
-  // greatest(g0, NaN) is NaN in Postgres, so a NaN refresh that reached the
-  // statement would replace a real g0 with one that no decay curve can read.
-  it("refuses a g0 that is not a finite non-negative number, and leaves the tag as it was", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", g0: 0.4 });
-    for (const g0 of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
-      await expect(repo.refresh(t.tagId, g0)).rejects.toBeInstanceOf(RangeError);
-    }
+  // The namespace predicate itself, which nothing held: deleting
+  // `.where("namespace_id", "=", namespaceId)` left all 463 tests green,
+  // because every other test in this file asks about a pair that exists in
+  // one namespace only. Without it `findLive` answers with ANOTHER
+  // counterparty's tag -- the pair is unique per namespace, not globally --
+  // and M3's brief would read one counterparty's history into another's
+  // decision.
+  it("does not answer with another namespace's tag on the same pair", async () => {
+    // The namespace predicate itself, which nothing held: deleting
+    // `.where("namespace_id", "=", namespaceId)` left all 463 tests green,
+    // because every other test here asks about a pair that exists in one
+    // namespace only. Without it `findLive` answers with ANOTHER
+    // counterparty's tag -- the pair is unique PER namespace, not globally --
+    // and M3's brief would read one counterparty's history into another's
+    // decision.
+    //
+    // Two namespaces of its own and not the file's `ns`: a tag added there
+    // changes what the `listLive` tests count, and a test that has to be
+    // read alongside two others to be correct is a test that will be broken
+    // by the next one.
+    // On the channel the tags are opened on, because a tag's channel is its
+    // evidence's channel.
+    const aObs = await appendUnder("PAIRA", "op:tag:paira", "price");
+    const bObs = await appendUnder("PAIRB", "op:tag:pairb", "price");
+    const a = (await namespaces.find("wallet", "PAIRA"))!.namespaceId;
+    const b = (await namespaces.find("wallet", "PAIRB"))!.namespaceId;
+    const tagA = await repo.open({
+      namespaceId: a, observationId: aObs, channel: "price", aspect: "shared-pair",
+      g0: 0.5, taggedAt: clock.now(),
+    });
+    const tagB = await repo.open({
+      namespaceId: b, observationId: bObs, channel: "price", aspect: "shared-pair",
+      g0: 0.9, taggedAt: clock.now(),
+    });
+    expect(tagA.tagId).not.toBe(tagB.tagId);
+    expect(await repo.findLive(a, "price", "shared-pair")).toMatchObject({ tagId: tagA.tagId });
+    expect(await repo.findLive(b, "price", "shared-pair")).toMatchObject({ tagId: tagB.tagId });
+  });
+
+  it("stops finding a tag once it is retired, which is what frees the pair", async () => {
+    const t = await repo.open({
+      namespaceId: ns, observationId: obsOn.price!, channel: "price", aspect: "gbp",
+      g0: 0.5, taggedAt: clock.now(),
+    });
+    await sql`update tag set retired_at = ${clock.now()} where tag_id = ${t.tagId}`.execute(db);
+    expect(await repo.findLive(ns, "price", "gbp")).toBeNull();
+  });
+});
+
+describe("refresh", () => {
+  // Opened a day back so a refresh at the clock's own instant moves forward
+  // without landing in the future, which is the shape of the real thing: the
+  // tag was opened when the observation happened and the repeat is later.
+  function aLive(aspect: string, g0 = 0.4) {
+    return repo.open({
+      namespaceId: ns, observationId: obs2, channel: "volume", aspect, g0,
+      taggedAt: new Date(clock.now().getTime() - DAY),
+    });
+  }
+  function next(t: { g0: number; taggedAt: Date; refreshCount: number }, over: Partial<TagRefresh> = {}): TagRefresh {
+    return {
+      g0: t.g0, taggedAt: clock.now(),
+      refreshCount: t.refreshCount + 1, saturationState: "open", ...over,
+    };
+  }
+
+  // The inversion the storage card exists for. M1 took the greater of the
+  // stored g0 and the new one and added one to the count, which was the
+  // store doing arithmetic. M2 does that arithmetic now -- over the DECAYED
+  // strength, which the store cannot compute because it deliberately holds
+  // no half-life -- and returns the four values. The store writes them as
+  // handed, including a g0 that is lower than the one already there.
+  it("writes the g0 the decision returns, even when it is lower than the stored one", async () => {
+    const t = await aLive("r:lower", 0.9);
+    await repo.refresh(t.tagId, next(t, { g0: 0.2 }));
     const after = await repo.get(t.tagId);
-    expect(after.g0).toBe(0.4);
-    expect(after.refreshCount).toBe(0);
+    expect(after.g0).toBe(0.2);
+    expect(after.refreshCount).toBe(1);
+  });
+
+  it("writes the instant, the count and the saturation state the decision returns", async () => {
+    const t = await aLive("r:fields");
+    const at = clock.now();
+    expect(at.getTime()).toBeGreaterThan(t.taggedAt.getTime());
+    await repo.refresh(t.tagId, { g0: 0.8, taggedAt: at, refreshCount: 1, saturationState: "saturated" });
+    expect(await repo.get(t.tagId)).toMatchObject({
+      g0: 0.8, taggedAt: at, refreshCount: 1, saturationState: "saturated",
+    });
+  });
+
+  it("refuses a g0 that is not a finite non-negative number, and leaves the tag as it was", async () => {
+    const t = await aLive("r:g0");
+    for (const g0 of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await expect(repo.refresh(t.tagId, next(t, { g0 }))).rejects.toBeInstanceOf(RangeError);
+    }
+    expect(await repo.get(t.tagId)).toMatchObject({ g0: 0.4, refreshCount: 0 });
+  });
+
+  it("refuses an invalid instant and a count that is not a safe integer", async () => {
+    const t = await aLive("r:args");
+    await expect(repo.refresh(t.tagId, next(t, { taggedAt: new Date(Number.NaN) })))
+      .rejects.toBeInstanceOf(RangeError);
+    await expect(repo.refresh(t.tagId, next(t, { refreshCount: 1.5 })))
+      .rejects.toBeInstanceOf(RangeError);
+    expect(await repo.get(t.tagId)).toMatchObject({ refreshCount: 0 });
+  });
+
+  // The guard's refusals reach the caller through `refresh`, so they must
+  // arrive as the class and not as a driver error. M3 retries on
+  // TagRefreshStale and must not retry on a guard refusal; told apart only by
+  // a SQLSTATE string, it would either retry forever or give up wrongly.
+  it("raises a guard refusal as its class, not as a driver error", async () => {
+    const t = await aLive("r:mapped");
+    const back = repo.refresh(t.tagId, next(t, { taggedAt: new Date(t.taggedAt.getTime() - 1) }));
+    // The class, and the message that names which rule. TagAltered is a
+    // plain StoreError like NamespaceAltered beside it, so there is no
+    // sqlstate to assert; the class is the contract and the message is the
+    // rule.
+    await expect(back).rejects.toBeInstanceOf(TagAltered);
+    await expect(back).rejects.toThrowError(/only moves forward/);
+  });
+
+  // Not the clock's instant but the clock's bound. A tag stamped in the
+  // future is full strength forever, because the decay curve reads any
+  // instant before the tag as g0, and it cannot be retired either, since the
+  // guard refuses a retirement before the tag's own instant. M2 never
+  // produces one -- its decide clamps an event to the caller's `at` -- and
+  // the database cannot hold the rule without reading a wall clock, which
+  // every simulated day in this suite forbids. So it is refused here, where
+  // the clock is injected. This is also what the repository's Clock is for
+  // now that `open` no longer stamps from it.
+  it("refuses a tag stamped after the clock, which would never decay", async () => {
+    const ahead = new Date(clock.now().getTime() + DAY);
+    await expect(repo.open({
+      namespaceId: ns, observationId: obsOn.price!, channel: "price", aspect: "future",
+      g0: 0.5, taggedAt: ahead,
+    })).rejects.toBeInstanceOf(RangeError);
+    const t = await aLive("r:future");
+    await expect(repo.refresh(t.tagId, next(t, { taggedAt: ahead }))).rejects.toBeInstanceOf(RangeError);
+  });
+
+  it("refuses a count below one, because a refresh is never the first write", async () => {
+    const t = await aLive("r:floor");
+    for (const refreshCount of [0, -1]) {
+      await expect(repo.refresh(t.tagId, next(t, { refreshCount }))).rejects.toBeInstanceOf(RangeError);
+    }
   });
 
   it("names a missing tag by class rather than updating nothing quietly", async () => {
-    await expect(repo.refresh(randomUUID(), 0.5)).rejects.toBeInstanceOf(TagNotFound);
+    const t = await aLive("r:missing");
+    await expect(repo.refresh(randomUUID(), next(t))).rejects.toBeInstanceOf(TagNotFound);
   });
 
-  // The reason refresh is one statement. Each of these runs on its own pooled
-  // connection, so up to the pool's width of them are inside Postgres at
-  // once. A read-modify-write would have two of them read the same
-  // refresh_count and one write would vanish; the single statement locks the
-  // row and re-evaluates on the current version, so every one of them lands.
-  it("loses nothing when many refreshes run at once", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs2, channel: "volume", g0: 0.1 });
+  // The reason refresh stopped being one merging statement. The merged value
+  // depends on the decayed strength at the caller's instant, and the store
+  // holds no half-life to compute it with, so two refreshes cannot be
+  // combined here at all. The count the caller was handed is the version it
+  // read: one lands, the rest are told their read is stale and the caller
+  // re-reads and recomputes. Silently merging would write a strength that
+  // no decision produced.
+  it("lets exactly one of many concurrent refreshes land, and calls the rest stale", async () => {
+    const t = await aLive("r:race", 0.1);
     const rounds = 40;
-    const values = Array.from({ length: rounds }, (_, i) => ((i * 7919) % rounds) / rounds);
-    await Promise.all(values.map((g0) => repo.refresh(t.tagId, g0)));
-    const after = await repo.get(t.tagId);
-    expect(after.refreshCount).toBe(rounds);
-    expect(after.g0).toBe(Math.max(0.1, ...values));
+    const results = await Promise.allSettled(
+      Array.from({ length: rounds }, (_, i) => repo.refresh(t.tagId, next(t, { g0: i / rounds }))),
+    );
+    const landed = results.filter((r) => r.status === "fulfilled");
+    const stale = results.filter(
+      (r) => r.status === "rejected" && r.reason instanceof TagRefreshStale,
+    );
+    expect(landed).toHaveLength(1);
+    expect(stale).toHaveLength(rounds - 1);
+    expect((await repo.get(t.tagId)).refreshCount).toBe(1);
+  });
+
+  it("tells a stale refresh from a missing tag, because the cures differ", async () => {
+    const t = await aLive("r:stale");
+    await repo.refresh(t.tagId, next(t));
+    await expect(repo.refresh(t.tagId, next(t))).rejects.toBeInstanceOf(TagRefreshStale);
   });
 });
 
@@ -297,7 +735,7 @@ describe("strength", () => {
   // existed, read off one stored tag under a fixed clock, and the table's row
   // versions are the same afterwards: deriving strength wrote nothing.
   it("derives strength from a stored tag at an arbitrary instant with no write", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs3, channel: "volume", g0: 1 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs3, channel: "volume", aspect: "p13", g0: 1, taggedAt: clock.now() });
     const before = await rowVersions();
     const stored = await repo.get(t.tagId);
     const at = (iso: string) => strengthAt(stored, new Date(iso), 7 * DAY);
@@ -311,7 +749,7 @@ describe("strength", () => {
   });
 
   it("reads a suppressed tag as weaker at the same instant, from the same row", async () => {
-    const t = await repo.open({ namespaceId: ns, observationId: obs3, channel: "volume", g0: 1 });
+    const t = await repo.open({ namespaceId: ns, observationId: obs3, channel: "volume", aspect: "p14", g0: 1, taggedAt: clock.now() });
     const instant = new Date("2026-09-14T00:00:00.000Z");
     const plain = strengthAt(await repo.get(t.tagId), instant, 7 * DAY);
     await repo.suppress(t.tagId, 3);
@@ -328,18 +766,22 @@ describe("listLive", () => {
   let lister: TagRepository;
   let otherNs: string;
   let otherObs: string;
+  let otherLatency: string;
   beforeAll(async () => {
     lister = new TagRepository(db, listClock);
     otherObs = await appendUnder("OTHERADDRESS", "op:tag:other");
     otherNs = (await namespaces.find("wallet", "OTHERADDRESS"))!.namespaceId;
+    // This block tags on two channels, and a tag's channel is its evidence's,
+    // so it needs evidence on both.
+    otherLatency = await appendUnder("OTHERADDRESS", "op:tag:other:latency", "latency");
   });
 
   it("returns the namespace's tags newest first and nobody else's", async () => {
-    const first = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "volume", g0: 0.3 });
+    const first = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "volume", aspect: "p15", g0: 0.3, taggedAt: listClock.now() });
     listClock.advance(DAY);
-    const second = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "latency", g0: 0.6 });
+    const second = await lister.open({ namespaceId: otherNs, observationId: otherLatency, channel: "latency", aspect: "p16", g0: 0.6, taggedAt: listClock.now() });
     listClock.advance(DAY);
-    const third = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "volume", g0: 0.9 });
+    const third = await lister.open({ namespaceId: otherNs, observationId: otherObs, channel: "volume", aspect: "p17", g0: 0.9, taggedAt: listClock.now() });
     const live = await lister.listLive(otherNs);
     expect(live.map((t) => t.tagId)).toEqual([third.tagId, second.tagId, first.tagId]);
     expect(live.every((t) => t.namespaceId === otherNs)).toBe(true);

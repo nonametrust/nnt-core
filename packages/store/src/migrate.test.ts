@@ -97,6 +97,16 @@ describe("migrate", () => {
           join pg_stat_activity a on a.pid = l.pid
           where l.locktype = 'advisory' and l.granted and l.objid = ${LOCK_KEY}
             and a.application_name = ${APP}
+            -- pg_locks is CLUSTER-wide, and this file announces the same
+            -- application_name in every database. Without this line the count
+            -- includes a session running this very test against ANOTHER
+            -- database on the same cluster, and the assertion below reads 2
+            -- where it demands 1. Found when three reviewers ran the suite
+            -- side by side on their own databases: a test that held only
+            -- while nothing else on the machine was running it. Locks taken
+            -- by pg_advisory_lock are database-scoped, so pg_locks.database
+            -- is the OID to compare against.
+            and l.database = (select oid from pg_database where datname = current_database())
         `.execute(db)
       ).rows[0]?.n;
     const admin = openDb(announced(url));

@@ -1,7 +1,18 @@
 import { randomBytes } from "node:crypto";
 import { describe, it, expect } from "vitest";
 import {
-  keyRingFromEnv, newDataKey, seal, open, payloadAad, type PayloadBinding, type Sealed,
+  keyRingFromEnv,
+  newDataKey,
+  open,
+  payloadAad,
+  periodKeyAad,
+  permanentAad,
+  seal,
+  type PayloadBinding,
+  type PermanentBinding,
+  type Sealed,
+  unwrapUnder,
+  wrapUnder,
 } from "./crypto.js";
 import { CiphertextMalformed, CiphertextRejected, StoreError } from "./errors.js";
 
@@ -20,17 +31,94 @@ function flipByte(buf: Buffer, i: number): void {
   buf[i] = buf.readUInt8(i) ^ 0xff;
 }
 
+const RECORD = "33333333-3333-4333-8333-333333333333";
+const OBSERVATION = "44444444-4444-4444-8444-444444444444";
+
+// The two instants differ, and by more than a rounding. An observation is
+// ingested after it is observed, and on a fixture where the two were equal a
+// function reading the wrong one would agree with itself and no test would
+// see it. M1's acceptance test makes the same point about the two columns.
 function binding(over: Partial<PayloadBinding> = {}): PayloadBinding {
   return {
     namespaceId: NS,
+    observationId: OBSERVATION,
     idempotencyKey: "abc123",
     evidenceKind: "event",
     channel: "volume",
     kind: "payment",
+    producer: "indexer",
+    ingestedAt: new Date("2026-09-12T09:30:00.000Z"),
     datedAt: new Date("2026-09-12T09:00:00.000Z"),
     ...over,
   };
 }
+
+// Promoted eight days after the observation it rescues: a permanent record is
+// written when a trigger fires, not when the evidence arrived.
+const TRIGGER = "9f1f4b0e-0f7a-4a1a-9b3e-2c5d7e8f0a11";
+const OTHER_TRIGGER = "9f1f4b0e-0f7a-4a1a-9b3e-2c5d7e8f0a22";
+
+function record(over: Partial<PermanentBinding> = {}): PermanentBinding {
+  return {
+    recordId: RECORD,
+    observationId: OBSERVATION,
+    namespaceId: NS,
+    originalDatedAt: new Date("2026-09-12T09:00:00.000Z"),
+    promotedAt: new Date("2026-09-20T11:00:00.000Z"),
+    confidence: 0.7,
+    rescuedBy: TRIGGER,
+    ...over,
+  };
+}
+
+describe("wrapping a key under a key", () => {
+  // Lifted out of the ring so a month key can be wrapped under a namespace
+  // key with the same layout the namespace key already uses under the master.
+  // One layout, so `namespace_key_present`'s 29-byte header stays one number
+  // rather than becoming two that must be kept equal by hand.
+  const outer = randomBytes(32);
+  const inner = randomBytes(32);
+
+  it("round-trips a key under another key", () => {
+    const wrapped = wrapUnder(outer, inner, "ns:2026-09-01");
+    expect(wrapped.length).toBe(29 + 32);
+    expect(unwrapUnder(outer, wrapped, "ns:2026-09-01").equals(inner)).toBe(true);
+  });
+
+  // The binding is the whole point. Without it, copying one period's wrapped
+  // key into another period's row before the first is shredded leaves a live
+  // copy that survives the shred -- and shredding is the only erasure this
+  // design has, so a shred a row copy can evade is not one.
+  it("refuses a wrapped key opened under a different binding, by class", () => {
+    const wrapped = wrapUnder(outer, inner, "ns:2026-09-01");
+    // CiphertextRejected and not CiphertextMalformed: the bytes are the right
+    // shape and the right version, they simply do not authenticate. The two
+    // classes say different things to an operator -- a corrupted row against
+    // a key or a binding that does not belong to it.
+    expect(() => unwrapUnder(outer, wrapped, "ns:2026-10-01")).toThrow(CiphertextRejected);
+    expect(() => unwrapUnder(randomBytes(32), wrapped, "ns:2026-09-01")).toThrow(CiphertextRejected);
+  });
+
+  it("refuses a wrapped key shorter than its header, and an unknown version", () => {
+    const wrapped = wrapUnder(outer, inner, "b");
+    expect(() => unwrapUnder(outer, wrapped.subarray(0, 28), "b")).toThrow(CiphertextMalformed);
+    const bumped = Buffer.from(wrapped);
+    bumped.writeUInt8(99, 0);
+    expect(() => unwrapUnder(outer, bumped, "b")).toThrow(CiphertextMalformed);
+    expect(() => unwrapUnder(outer, bumped, "b")).toThrow(/version 99/);
+  });
+
+  // The ring's own wrap must be these functions and not a second copy of the
+  // layout: a copy drifts, and the drift is silent until a key minted by one
+  // cannot be opened by the other.
+  it("is the same layout the ring wraps a namespace key with", () => {
+    const ring = keyRingFromEnv({ NNT_MASTER_KEY: outer.toString("base64") } as NodeJS.ProcessEnv);
+    const byRing = ring.wrap(inner, "namespace-id");
+    expect(unwrapUnder(outer, byRing, "namespace-id").equals(inner)).toBe(true);
+    const byHand = wrapUnder(outer, inner, "namespace-id");
+    expect(ring.unwrap(byHand, "namespace-id").equals(inner)).toBe(true);
+  });
+});
 
 describe("keyRingFromEnv", () => {
   it("refuses to start without a master key, with no default and no fallback", () => {
@@ -157,9 +245,17 @@ describe("seal and open", () => {
   it("refuses a ciphertext whose bound columns were rewritten, one column at a time", () => {
     const s = seal(dk, '{"a":1}', aad);
     const moves: Partial<PayloadBinding>[] = [
+      { observationId: RECORD },
       { evidenceKind: "state", datedAt: null },
       { channel: "latency" },
       { kind: "tampered" },
+      { producer: "tampered" },
+      { ingestedAt: new Date("2026-09-12T10:30:00.000Z") },
+      // A move across a month boundary is the one the period column is
+      // derived from; a move of a single millisecond is the one a check
+      // constraint on that column would not see.
+      { ingestedAt: new Date("2026-10-12T09:30:00.000Z") },
+      { ingestedAt: new Date("2026-09-12T09:30:00.001Z") },
       { datedAt: new Date("2026-09-13T09:00:00.000Z") },
       { datedAt: new Date("2026-09-12T09:00:00.001Z") },
       { datedAt: null },
@@ -216,11 +312,57 @@ describe("seal and open", () => {
 });
 
 describe("payloadAad", () => {
-  it("cannot be re-partitioned into a different tuple, at either adjacent pair of free parts", () => {
+  it("cannot be re-partitioned into a different tuple, at every adjacent pair of free parts", () => {
     expect(payloadAad(binding({ namespaceId: "ab", idempotencyKey: "c" }))
       .equals(payloadAad(binding({ namespaceId: "a", idempotencyKey: "bc" })))).toBe(false);
     expect(payloadAad(binding({ channel: "ab", kind: "c" }))
       .equals(payloadAad(binding({ channel: "a", kind: "bc" })))).toBe(false);
+    expect(payloadAad(binding({ kind: "ab", producer: "c" }))
+      .equals(payloadAad(binding({ kind: "a", producer: "bc" })))).toBe(false);
+  });
+
+  // The order of the parts is a rule, and nothing else here holds it: seal and
+  // open render the same binding the same way, so any consistent order passes
+  // a round trip. Swap two parts and only this test goes red.
+  //
+  // Last is a convention, not a necessity: with a fixed part count and a
+  // separator no part may contain, an empty part is unambiguous anywhere.
+  // This pin is what holds the order; nothing deeper does.
+  it("renders the nine parts in one fixed order, the two instants last", () => {
+    expect(payloadAad(binding()).toString("utf8").split("\u0000")).toEqual([
+      NS,
+      OBSERVATION,
+      "abc123",
+      "event",
+      "volume",
+      "payment",
+      "indexer",
+      "2026-09-12T09:30:00.000Z",
+      "2026-09-12T09:00:00.000Z",
+    ]);
+  });
+
+  // The layout moved: the two columns the store derives and keeps beside the
+  // payload, `producer` and `ingested_at`, were outside the envelope and are
+  // now inside it. This is what that costs, spelled out rather than asserted
+  // in a comment -- the six-part envelope is built here by hand, because the
+  // function that used to build it is gone.
+  //
+  // It cost nothing today because nothing is deployed, and the migration
+  // refuses to run over a non-empty observation table for exactly this
+  // reason. Over stored rows it would be a re-encryption of every one.
+  it("refuses a payload sealed under the six-part layout that preceded the columns beside it", () => {
+    const dk = newDataKey();
+    const b = binding();
+    const sixPart = Buffer.from(
+      [b.namespaceId, b.idempotencyKey, b.evidenceKind, b.channel, b.kind,
+        b.datedAt!.toISOString()].join("\u0000"),
+      "utf8",
+    );
+    const s = seal(dk, '{"a":1}', sixPart);
+    expect(() => open(dk, s, payloadAad(b))).toThrow(CiphertextRejected);
+    // And it is the layout that refuses it, not the key or the payload.
+    expect(open(dk, s, sixPart)).toBe('{"a":1}');
   });
 
   // The re-partition property above holds only while no part can contain the
@@ -229,11 +371,63 @@ describe("payloadAad", () => {
   // because this function's signature is strings and it cannot see which.
   it("refuses a part that contains the separator, in every position", () => {
     for (const move of [
-      { namespaceId: "a\u0000b" }, { idempotencyKey: "a\u0000b" }, { evidenceKind: "a\u0000b" },
-      { channel: "a\u0000b" }, { kind: "a\u0000b" },
+      { namespaceId: "a\u0000b" }, { observationId: "a\u0000b" },
+      { idempotencyKey: "a\u0000b" }, { evidenceKind: "a\u0000b" },
+      { channel: "a\u0000b" }, { kind: "a\u0000b" }, { producer: "a\u0000b" },
     ]) {
       expect(() => payloadAad(binding(move)), JSON.stringify(move)).toThrow(RangeError);
     }
+  });
+
+  // A lone surrogate is not a character: UTF-8 cannot encode one, so Node
+  // encodes it as U+FFFD, and so does Postgres when it stores the column.
+  // The payload keeps the original escape inside its JSON while the column
+  // holds the replacement, both render to the SAME associated data, and the
+  // payload opens -- with a `kind` that disagrees with its own column. That
+  // falsifies the sentence the read path states outright, that a column which
+  // disagrees with the payload does not open at all.
+  //
+  // Verified before it was fixed: Buffer.from("\uD800") and
+  // Buffer.from("\uFFFD") are both ef bf bd, and the driver round-trips a
+  // lone surrogate back as U+FFFD.
+  //
+  // The separator check is not enough, because the two strings differ without
+  // either containing a NUL. What the parts must guarantee is that distinct
+  // tuples render to distinct bytes, and only well-formed strings do.
+  it("refuses a part that is not well-formed, because two of them can render the same bytes", () => {
+    const lone = "a\uD800b";
+    const replaced = "a\uFFFDb";
+    expect(lone).not.toBe(replaced);
+    expect(Buffer.from(lone, "utf8").equals(Buffer.from(replaced, "utf8"))).toBe(true);
+    for (const move of [{ channel: lone }, { kind: lone }, { producer: lone }, { namespaceId: lone }]) {
+      expect(() => payloadAad(binding(move)), JSON.stringify(move)).toThrow(RangeError);
+    }
+    expect(() => permanentAad(record({ recordId: lone }))).toThrow(RangeError);
+    // The well-formed twin is still accepted: what is refused is the
+    // ill-formed string, not the character it would have collapsed to.
+    expect(() => payloadAad(binding({ kind: replaced }))).not.toThrow();
+    // And a VALID surrogate pair is accepted, which is the other direction of
+    // the same rule and the one a careless check gets wrong: an astral
+    // character is stored as two surrogate code units, so a pattern without
+    // the unicode flag sees them individually and refuses legitimate text.
+    // Under `u` a valid pair is one non-surrogate code point and does not
+    // match at all. Nothing caught this until the flag was mutated away.
+    for (const good of ["a\u{1F600}b", "\u{1F600}", "ödeme-çğş", "日本語"]) {
+      expect(() => payloadAad(binding({ kind: good })), good).not.toThrow();
+      expect(payloadAad(binding({ kind: good })).toString("utf8").split("\u0000")[5]).toBe(good);
+    }
+  });
+
+  // An Invalid Date reaches toISOString and throws the runtime's own
+  // RangeError, which names no field. periodOf already refuses one by name;
+  // this is the same instant arriving one function later.
+  it("refuses an invalid instant by name, rather than by the runtime's own error", () => {
+    expect(() => payloadAad(binding({ ingestedAt: new Date(Number.NaN) })))
+      .toThrow(/ingestedAt/);
+    expect(() => payloadAad(binding({ datedAt: new Date(Number.NaN) })))
+      .toThrow(/datedAt/);
+    expect(() => permanentAad(record({ promotedAt: new Date(Number.NaN) })))
+      .toThrow(/promotedAt/);
   });
 
   // A state has no instant and its column is null. The rendering is fixed,
@@ -250,6 +444,132 @@ describe("payloadAad", () => {
     const a = payloadAad(binding({ datedAt: new Date("2026-09-12T09:00:00Z") }));
     const b = payloadAad(binding({ datedAt: new Date("2026-09-12T09:00:00.000Z") }));
     expect(a.equals(b)).toBe(true);
+  });
+});
+
+describe("permanentAad", () => {
+  // A permanent record is sealed under the SAME namespace data key as the
+  // observation it rescues, so the two envelopes share a key and must not
+  // share a domain. Without separation, a permanent record's ciphertext and
+  // an observation's could be swapped for each other.
+  it("cannot equal a payload envelope, whatever a caller passes", () => {
+    // The adversarial case for the stated reason. The domain literal is first
+    // "because no uuid can equal it" -- but this function does not check that
+    // its namespace is a uuid, so a caller that passes the literal itself is
+    // the case that reason does not cover.
+    const impostor = payloadAad(binding({ namespaceId: "permanent" }));
+    expect(impostor.equals(permanentAad(record()))).toBe(false);
+    // What actually holds it: the two carry a different number of parts, and
+    // no part may contain the separator, so one join has seven separators and
+    // the other eight. They cannot be equal for any inputs at all. The two
+    // counts are asserted rather than their difference, because the day they
+    // become equal is the day this reason stops being true and the test has
+    // to say so out loud.
+    expect(permanentAad(record()).toString("utf8").split("\u0000").length).toBe(8);
+    expect(impostor.toString("utf8").split("\u0000").length).toBe(9);
+  });
+
+  it("renders the eight parts in one fixed order, the domain literal first and the instants last", () => {
+    expect(permanentAad(record()).toString("utf8").split("\u0000")).toEqual([
+      "permanent",
+      RECORD,
+      OBSERVATION,
+      NS,
+      TRIGGER,
+      "0.7",
+      "2026-09-12T09:00:00.000Z",
+      "2026-09-20T11:00:00.000Z",
+    ]);
+    // Null renders empty, the same way an absent `datedAt` does in the
+    // payload binding. A uuid cannot be empty, so the two stay distinct.
+    expect(permanentAad(record({ rescuedBy: null })).toString("utf8").split("\u0000")[4]).toBe("");
+  });
+
+  // Every column the record keeps beside its payload is inside the envelope,
+  // for the reason the payload's own binding gives: under the write access
+  // that moves a row, a column can be rewritten while the payload still
+  // opens. `original_dated_at` is the one the promotion trigger measures the
+  // record against, and it is not nullable -- a state has no instant to
+  // preserve and `promote` refuses one before it reaches here.
+  //
+  // That sentence was false when it was written and the branch review
+  // measured it: `confidence` and `rescued_by` were NOT in the envelope, and
+  // with the append-only trigger disabled -- the same bypass this test's
+  // sibling already sets up -- a rewritten confidence and a record repointed
+  // at a sibling trigger both still opened and still returned the rescued
+  // observation. `0004`'s own comment names both as exactly what a session
+  // with write access would rewrite. R15's precedent settled which way to
+  // fix it: add the missing part, do not soften the sentence.
+  it("refuses a permanent payload whose bound columns were rewritten, one at a time", () => {
+    const dk = newDataKey();
+    const s = seal(dk, '{"a":1}', permanentAad(record()));
+    const moves: Partial<PermanentBinding>[] = [
+      { recordId: OTHER_NS },
+      { observationId: OTHER_NS },
+      { namespaceId: OTHER_NS },
+      { originalDatedAt: new Date("2026-09-12T09:00:00.001Z") },
+      { promotedAt: new Date("2026-09-20T11:00:00.001Z") },
+      // The two the comment above claimed were bound and were not. `0004`'s
+      // own comment names both as things a session with write access could
+      // rewrite, and until the branch review a rewritten `confidence` or a
+      // record repointed at a sibling trigger still opened and still returned
+      // the rescued observation. The comment was the rule and nothing
+      // enforced it.
+      { confidence: 0.01 },
+      { rescuedBy: OTHER_TRIGGER },
+      // Null is a value here, not an absence: a record rescued by no trigger
+      // must not open under a binding that names one, or the field would be
+      // forgeable in the one direction that matters.
+      { rescuedBy: null },
+    ];
+    for (const move of moves) {
+      expect(() => open(dk, s, permanentAad(record(move))), JSON.stringify(move))
+        .toThrow(CiphertextRejected);
+    }
+    expect(open(dk, s, permanentAad(record()))).toBe('{"a":1}');
+  });
+
+  // The three uuids cannot carry a separator and the two instants cannot
+  // either, so this guards a caller this package has not met yet -- the same
+  // reason the payload binding checks every part rather than the two it knows
+  // to be free.
+  it("refuses a part that contains the separator, in every position", () => {
+    for (const move of [
+      { recordId: "a\u0000b" }, { observationId: "a\u0000b" }, { namespaceId: "a\u0000b" },
+    ]) {
+      expect(() => permanentAad(record(move)), JSON.stringify(move)).toThrow(RangeError);
+    }
+  });
+});
+
+describe("periodKeyAad", () => {
+  // The claim this function makes is that it inherits the envelope's refusals
+  // rather than restating them -- and that claim was untested: hand-
+  // concatenating the two parts passed every other test, because both callers
+  // build the binding the same way and a consistent mistake round-trips.
+  it("inherits the separator and well-formedness refusals from the join", () => {
+    expect(() => periodKeyAad("a\u0000b", "2026-09-01")).toThrow(RangeError);
+    expect(() => periodKeyAad(NS, "2026-09\u000001")).toThrow(RangeError);
+    expect(() => periodKeyAad("a\uD800b", "2026-09-01")).toThrow(RangeError);
+  });
+
+  // The ORDER of the two parts is a rule and nothing else held it. Both
+  // callers -- the mint in `periodKey` and the open in `openPeriodKey` --
+  // build the binding the same way, so swapping the two arguments in the
+  // function body is a CONSISTENT change and every round trip still passes.
+  // Its siblings `payloadAad` and `permanentAad` each have exactly this pin;
+  // this one did not, which is the whole lesson about mutating both sides of
+  // a binding together as well as separately.
+  it("renders the namespace first and the period second, which no round trip can hold", () => {
+    expect(periodKeyAad(NS, "2026-09-01").split("\u0000")).toEqual([NS, "2026-09-01"]);
+  });
+
+  // Two distinct pairs cannot render the same binding, which is what stops a
+  // wrapped month key being useful in another row.
+  it("cannot be re-partitioned into a different pair", () => {
+    expect(periodKeyAad("ab", "c")).not.toEqual(periodKeyAad("a", "bc"));
+    expect(periodKeyAad(NS, "2026-09-01")).not.toEqual(periodKeyAad(NS, "2026-10-01"));
+    expect(periodKeyAad(NS, "2026-09-01")).not.toEqual(periodKeyAad(OTHER_NS, "2026-09-01"));
   });
 });
 

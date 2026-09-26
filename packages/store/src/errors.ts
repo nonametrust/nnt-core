@@ -1,6 +1,6 @@
 /**
  * Every invariant the database holds maps to a class here. The triggers this
- * package writes raise their own SQLSTATEs, NNT01 to NNT05, and each maps to
+ * package writes raise their own SQLSTATEs, NNT01 to NNT09, and each maps to
  * a class of its own; the constraints Postgres names for itself, the foreign
  * keys, unique keys and check constraints, arrive as 23503, 23505 and 23514
  * and map to one class carrying the SQLSTATE and the constraint's name. Tests
@@ -18,7 +18,81 @@ export class NamespaceShredded extends StoreError {}
 // meant to be updated, and an operator must be able to tell the two apart
 // by class.
 export class NamespaceAltered extends StoreError {}
-// Raised in TypeScript, like NamespaceShredded, so it carries no SQLSTATE. It
+// Raised by the namespace_key guard, under NNT06. Like the namespace guard's
+// class and unlike the append-only one: this table is meant to be updated,
+// because expiry IS an update, so a refusal here says an update broke a rule
+// rather than that the row was immutable.
+export class PeriodKeyAltered extends StoreError {}
+// Raised in TypeScript, not by the database. A month whose key has been
+// shredded is a payload nobody can read, and that is a different condition
+// from a shredded namespace: the counterparty space is intact and every other
+// month of it is still readable. An operator told "shredded" about an expired
+// month would look for an erasure request that never happened.
+export class PayloadExpired extends StoreError {}
+// Raised by the tag guard, under its own SQLSTATE rather than the append-only
+// one: the tag table is meant to be updated, so a refusal here says an update
+// broke a rule the arithmetic holds, not that the row was immutable.
+export class TagAltered extends StoreError {}
+// Raised in TypeScript by `refresh`, and deliberately not a ConstraintViolation:
+// nothing was refused by the database, the caller's read is simply older than
+// the row. The cure is to read the live tag again and decide again, which is
+// a different instruction from "this tag does not exist".
+export class TagRefreshStale extends StoreError {}
+
+// Raised in TypeScript, so it carries no SQLSTATE: the database refused
+// nothing, this repository counted and declined. It names the producer, the
+// window and the count because an operator's next move depends on all three
+// -- R3 rules that this cap is not a defence against an attacker (the
+// producer name is free text until signatures are enforced) but a tripwire
+// for our own indexer in a loop, and a tripwire that does not say what it
+// counted is a tripwire nobody can act on.
+export class SourceRateExceeded extends StoreError {}
+
+// Raised in TypeScript when a write path is handed a repository built on a
+// Transaction. R21: reads compose and writes do not. Kysely refuses a nested
+// transaction with a bare Error, and it does so AFTER the earlier steps of
+// the write have already written into the caller's transaction, so this
+// moves the refusal to the front and gives it a name. The rule is not
+// fastidiousness: composing two of this store's writes in one transaction
+// produces a lock-ordering cycle that deadlocks in about a second, measured.
+export class WriteInsideTransaction extends StoreError {}
+
+// 40P01, Postgres's own deadlock detector firing about a second after two
+// transactions have taken this store's row locks in opposite orders.
+//
+// R21 refuses the three writes that open a transaction of their own, and
+// review then measured that it is NOT enough: `{shred A; shred B}` against
+// `{shred B; shred A}` deadlocks, and so does a shred against
+// `expirePeriods`. Those are single statements, they compose in a caller's
+// transaction, and nothing refuses them. Naming the failure is not a fix and
+// does not pretend to be one -- it is so a caller can tell a deadlock from a
+// constraint and retry, which is the correct response to 40P01 and the
+// wrong one to almost everything else this store raises.
+export class Deadlocked extends StoreError {}
+// 55P03 and 57014: an operator's `lock_timeout` or `statement_timeout`
+// cancelling a statement this store was waiting on. Neither is ours to
+// allocate and neither is a defect -- section 4 of `0007` tells the hand-run
+// migration path to set one on purpose, and a lock wait bounded by policy is
+// what a healthy operator does.
+//
+// Mapped because an unmapped one is worse than either. Measured against a
+// server with `lock_timeout = 50ms`: an `append` queued behind an erasure's
+// row lock came back with a raw driver error carrying `code: '55P03'` and a
+// message about `PL/pgSQL function observation_target_writable()` -- from
+// inside this store's own trigger -- where the caller was told to expect
+// `NamespaceShredded`. Under the same setting BOTH sides of a deadlock get
+// 55P03 and `Deadlocked` never fires at all. Nothing was written wrongly in
+// any case; the transaction aborts. What was wrong is that a caller catching
+// this package's classes caught nothing.
+//
+// One class for both, because the caller's answer is the same: the work did
+// not happen, the reason is a policy and not a rule, and retrying is
+// reasonable if the policy allows time. Distinct from `Deadlocked` because a
+// deadlock says two callers collided and this says one waited too long.
+export class Cancelled extends StoreError {}
+// Raised in TypeScript, so it carries no SQLSTATE. (NamespaceShredded used
+// to be the comparison here and no longer is: NNT08 maps to it since the
+// erasure gate, so it arrives both ways.) It
 // exists because an erasure request naming a subject that has no row must not
 // resolve as success: nothing was examined, and "the data is gone" would be
 // reported to an operator about data that was never looked for.
@@ -108,6 +182,18 @@ const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreErro
   NNT03: ChainBroken,
   NNT04: TimestampAltered,
   NNT05: NamespaceAltered,
+  NNT06: PeriodKeyAltered,
+  NNT07: TagAltered,
+  NNT08: NamespaceShredded,
+  // The insert gate's month half: a write under a month whose key the
+  // retention clock already took. Mapped to the class that already means
+  // exactly that, so a caller has one thing to catch whether the month died
+  // before the read or before the write.
+  NNT09: PayloadExpired,
+  "55P03": Cancelled,
+  "57014": Cancelled,
+  // Postgres's own, not one this schema allocated.
+  "40P01": Deadlocked,
 };
 
 /**

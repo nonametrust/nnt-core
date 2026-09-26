@@ -33,13 +33,14 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { validateObservation, type Observation } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db } from "./db.js";
-import { withSchema } from "./testing/harness.js";
+import { withSchema, storedObservation } from "./testing/harness.js";
 import { keyRingFromEnv } from "./crypto.js";
 import { fixedClock } from "./clock.js";
+import { RETENTION_V0 } from "./retention.js";
 import {
-  AppendOnlyViolation, DayNotClosed, TimestampAltered, mapPgError,
+  AppendOnlyViolation, DayNotClosed, TimestampAltered, mapPgError, PayloadExpired,
 } from "./errors.js";
-import { NamespaceRepository } from "./repositories/namespace.js";
+import { NamespaceRepository, sweepOrder } from "./repositories/namespace.js";
 import { ObservationRepository } from "./repositories/observation.js";
 import { TagRepository, type StoredTag } from "./repositories/tag.js";
 import { TriggerEventRepository, type StoredTriggerEvent } from "./repositories/trigger-event.js";
@@ -191,7 +192,9 @@ function idOf(o: Observation): string {
 // assertion.
 async function ingest(wire: Observation, at: Date): Promise<Observation> {
   advanceTo(at);
-  const { observation, created } = await observations.append(wire);
+  const _r = await observations.append(wire);
+    const created = _r.created;
+    const observation = storedObservation(_r);
   expect(created).toBe(true);
   await audit("observation.appended", {
     observationId: idOf(observation), idempotencyKey: observation.idempotencyKey,
@@ -226,13 +229,30 @@ async function tagRowVersions(): Promise<string[]> {
   return r.rows.map((x) => x.v);
 }
 
+// The retention policy this story runs under. One object, handed to every
+// repository that takes one: R16 refuses a stored expiry its own policy did
+// not compute, so a fixture appended through one policy and swept by another
+// is a PeriodKeyAltered on the next append rather than a sweep that finds
+// nothing -- and §2d names this suite by name as a place that would happen.
+//
+// Three days rather than ninety, so the story can reach its own expiry: the
+// scenario is twenty-two days long and a ninety-day grace would need a
+// hundred and fourteen. Three collides with no other field of the policy,
+// which is the habit the M2 ledger asks for -- the shipped numbers are 90,
+// 86,400,000 and 10,000,000, and a function reading the wrong one would show.
+//
+// What this does NOT prove, and the card says so: the full horizon over a
+// real ninety days across a calendar month belongs to M5. This proves the
+// mechanism on M1's scenario.
+const RETENTION = Object.freeze({ ...RETENTION_V0, graceDays: 3 });
+
 beforeAll(async () => {
   ({ db, done } = await withSchema("acceptance"));
-  namespaces = new NamespaceRepository(db, ring, clock);
-  observations = new ObservationRepository(db, namespaces, clock);
+  namespaces = new NamespaceRepository(db, ring, clock, RETENTION);
+  observations = new ObservationRepository(db, namespaces, clock, RETENTION);
   tags = new TagRepository(db, clock);
   triggers = new TriggerEventRepository(db, clock);
-  records = new PermanentRecordRepository(db, clock);
+  records = new PermanentRecordRepository(db, ring, clock, RETENTION);
   chain = new AuditChain(db, clock, ring);
   provider = (await namespaces.ensure(PROVIDER)).namespaceId;
 });
@@ -288,21 +308,65 @@ describe("2. a tag's strength is derivable at an arbitrary instant", () => {
     // alerts nobody. Lowering the provider's brief threshold on its account
     // is M2's arithmetic and is not stored here.
     limboTag = await tags.open({
+      // The aspect the tagging vocabulary gives this channel: address_integrity
+      // is categorical and one transition is one aspect, so a revert is a
+      // second observation on the same aspect, which is what refresh is for
+      // (tagging reading.ts, the address_integrity template).
       namespaceId: provider, observationId: idOf(stored.movedAway!),
-      channel: "address_integrity", g0: 0.6,
+      channel: "address_integrity", aspect: "transition", g0: 0.6,
+      // From the decision, which stamps the EVENT's own instant -- 08:15,
+      // when the address moved -- while the clock reads 16:50, when the
+      // decision was made. The two must differ here or this story cannot see
+      // the inversion the card was written to remove: with them equal, `open`
+      // stamping from the clock instead of the decision passes every
+      // assertion below. A mutation audit found exactly that, and the comment
+      // this replaces conceded it ("the clock here happens to agree").
+      taggedAt: day(12, "08:15"),
     });
     await audit("tag.opened", {
       tagId: limboTag.tagId, observationId: limboTag.observationId,
       channel: limboTag.channel, g0: limboTag.g0, taggedAt: limboTag.taggedAt.toISOString(),
     });
     // A repeated deviation on an already-tagged pair refreshes rather than
-    // stacks, and the larger g0 is kept.
-    await tags.refresh(limboTag.tagId, 0.4);
-    await audit("tag.refreshed", { tagId: limboTag.tagId, g0: 0.4 });
+    // stacks. What is stored is what M2's decision returned, and nothing
+    // here recomputes it: the maximum M2 takes is over the DECAYED strength
+    // at the instant of the repeat, which this package cannot compute because
+    // it holds no half-life. Under M1's arithmetic this row would have kept
+    // 0.6 by taking the greater of the two stored numbers, which is the
+    // substitution the storage card exists to remove.
+    const refreshedAt = day(12, "17:30");
+    // The story's clock moves with it: the repeat happens forty minutes
+    // later, and a decision may not stamp a tag ahead of the clock.
+    advanceTo(refreshedAt);
+    // The number comes from the curve, not from what makes the test pass.
+    // M2's refreshTag holds max(decayedStrength, freshG0), so a fresh
+    // deviation weaker than what is already there leaves the decayed value
+    // standing: nine and a quarter hours from the tag's own instant into a
+    // seven-day half-life, 0.6 has decayed to 0.577533… and that is what the
+    // decision returns. Nine and a quarter hours, not the forty minutes
+    // between the two clock readings, because the decay runs from when the
+    // address moved and not from when anyone noticed.
+    const decayed = strengthAt(limboTag, refreshedAt, HALF_LIFE);
+    const held = Math.max(decayed, 0.1);
+    expect(held).toBe(decayed);
+    await tags.refresh(limboTag.tagId, {
+      g0: held, taggedAt: refreshedAt, refreshCount: 1, saturationState: "open",
+    });
+    await audit("tag.refreshed", { tagId: limboTag.tagId, g0: held });
     const after = await tags.get(limboTag.tagId);
     expect(after.refreshCount).toBe(1);
-    expect(after.g0).toBe(0.6);
-    expect(after.taggedAt.toISOString()).toBe(day(12, "16:50").toISOString());
+    // M1's arithmetic took greatest(stored g0, new g0) and would have left
+    // 0.6 here. M2's takes the maximum over the DECAYED strength and returns
+    // 0.577533…, which is smaller, and that difference is the whole
+    // substitution this card removed.
+    expect(after.g0).toBe(held);
+    expect(after.g0).toBeLessThan(0.6);
+    expect(after.g0).toBeCloseTo(0.577533, 6);
+    expect(after.taggedAt.toISOString()).toBe(refreshedAt.toISOString());
+    // And the tag was opened at the event's instant, not at the clock's. This
+    // is the assertion that makes the story able to see F2 at all.
+    expect(limboTag.taggedAt.toISOString()).toBe(day(12, "08:15").toISOString());
+    expect(limboTag.aspect).toBe("transition");
     expect(await tags.listLive(provider)).toHaveLength(1);
   });
 
@@ -315,17 +379,21 @@ describe("2. a tag's strength is derivable at an arbitrary instant", () => {
     const before = await tagRowVersions();
     const tag = await tags.get(limboTag.tagId);
     const at_ = (instant: Date) => strengthAt(tag, instant, HALF_LIFE);
+    // The readings follow from the g0 the decision wrote, which is the
+    // decayed strength at the refresh rather than the 0.6 M1 would have kept.
+    const g0 = tag.g0;
+    expect(g0).toBeLessThan(0.6);
     // Before the tag existed: g0, not more. A clock skew cannot invent
     // evidence.
-    expect(at_(day(0))).toBeCloseTo(0.6, 12);
+    expect(at_(day(0))).toBeCloseTo(g0, 12);
     // At the instant of tagging: g0.
-    expect(at_(tag.taggedAt)).toBeCloseTo(0.6, 12);
+    expect(at_(tag.taggedAt)).toBeCloseTo(g0, 12);
     // One half-life on: half.
-    expect(at_(new Date(tag.taggedAt.getTime() + HALF_LIFE))).toBeCloseTo(0.3, 12);
+    expect(at_(new Date(tag.taggedAt.getTime() + HALF_LIFE))).toBeCloseTo(g0 / 2, 12);
     // Now, nine days on: still there, still readable, and less than half.
     const now = at_(clock.now());
     expect(now).toBeGreaterThan(0);
-    expect(now).toBeLessThan(0.3);
+    expect(now).toBeLessThan(g0 / 2);
     // The brief is a decision, and the strength it read is reproducible from
     // this entry and the tag's row, because nothing was overwritten to
     // produce it.
@@ -397,6 +465,8 @@ describe("3. a promotion preserves the original timestamp", () => {
   });
 });
 
+let tagVersionsBeforeSweep: string[] = [];
+
 describe("4. the audit chain verifies", () => {
   it("holds one entry per operation the story performed, in order, and nothing else", async () => {
     const rows = await db.selectFrom("audit_entry").select(["seq", "kind"]).orderBy("seq").execute();
@@ -459,5 +529,212 @@ describe("4. the audit chain verifies", () => {
     expect(seals[12]!.terminal_seq).toBe(seq("tag.refreshed", 0));
     expect(seals[21]!.terminal_seq).toBe(journal.at(-1)!.seq);
     expect(await chain.verify()).toEqual({ ok: true });
+  });
+});
+
+// The fifth criterion, and the sentence the whole card exists for: a captured
+// trace outlives its month.
+//
+// It runs last on purpose. Everything above proves the four M1 criteria on a
+// live database; this proves they survive the thing retention does TO that
+// database, which is the M1 lesson the M2 spec records in §14 -- criteria
+// that hold in isolation and not in composition.
+describe("5. retention runs, and the rescue survives it", () => {
+  // Day 0 is 31 August and day 12 is 12 September, so this story spans two
+  // calendar months and therefore two month keys per namespace. August closed
+  // on 1 September and expired on the 4th; September closes on 1 October and
+  // expires on the 4th.
+  //
+  // The sweep therefore runs TWICE, and the two days are the point. On day
+  // thirty-three August is past its grace and September has a day left, so a
+  // sweep that ignored `expires_at` would be visible here and nowhere else in
+  // this file. On day thirty-five September's grace has run out, and a sweep
+  // that ignored `key_wrapped is not null` would hand August back a second
+  // time. A single sweep on day thirty-five proves neither, because by then
+  // every month in the database is expired -- which is what stood here, with
+  // a name that claimed both rules. Both mutants die in the unit suite too;
+  // this file is where they have to die in COMPOSITION.
+  //
+  // Note what the gap between the two days means and does not mean: from day
+  // four to day thirty-three August is expired and still readable, because
+  // `openPeriodKey` asks whether the key was shredded and never asks the
+  // clock. Expiry is what the sweep acts on, not a state the store enforces
+  // on read; the sweep is the caller's to run, and until it runs nothing has
+  // happened.
+  const FIRST_SWEEP_DAY = 33; // 3 October 2026, one day inside September's grace
+  const SWEEP_DAY = 35; // 5 October 2026
+
+  it("holds two months for each namespace before anything is swept", async () => {
+    // Asserted from the STORY rather than read off the sweep: day zero wrote
+    // to both namespaces in August, day twelve onwards in September. Without
+    // this the sweep's own list would be its own oracle.
+    const wallet = (await namespaces.find(WALLET.kind, WALLET.id))!.namespaceId;
+    // Three key rows, not four, and the asymmetry is the story rather than
+    // an accident: the two address changes and the price quote are evidence
+    // ABOUT THE PROVIDER -- a provider's payment address changed -- so they
+    // land in the provider's September. The wallet is named in the day-zero
+    // payment and never again, so it holds August alone. Getting this wrong
+    // was my first guess, and writing it down is cheaper than guessing again.
+    expect(await namespaces.periodsOf(provider)).toEqual(["2026-08-01", "2026-09-01"]);
+    expect(await namespaces.periodsOf(wallet)).toEqual(["2026-08-01"]);
+  });
+
+  it("day thirty-three: takes the two Augusts and leaves September standing, with a day of its grace to run", async () => {
+    advanceTo(day(FIRST_SWEEP_DAY, "03:00"));
+    const wallet = (await namespaces.find(WALLET.kind, WALLET.id))!.namespaceId;
+    // Captured here, one line before the FIRST sweep, rather than at the end
+    // of criterion four: the tag assertion below has to compare against the
+    // instant before expiry, and reading it from another describe block made
+    // that depend on the order of two blocks instead of on one line.
+    tagVersionsBeforeSweep = await tagRowVersions();
+    const { shredded } = await namespaces.expirePeriods();
+    expect(shredded).toEqual([
+      { namespaceId: provider, period: "2026-08-01", namespaceErasedAtSweep: false },
+      { namespaceId: wallet, period: "2026-08-01", namespaceErasedAtSweep: false },
+    // The repository's own comparator, so the test states the same rule the
+    // code does rather than a locale-dependent approximation of it.
+    ].sort(sweepOrder));
+    // And the day-twelve observations still read, which is the other half of
+    // "leaves September standing": the grace is a promise about readability,
+    // so asserting only the sweep's return would let a sweep that shredded
+    // September and forgot to mention it pass.
+    for (const name of ["movedAway", "movedBack", "largeQuote"] as const) {
+      const still = await observations.get(idOf(stored[name]!));
+      expect(still.observationId, name).toBe(idOf(stored[name]!));
+      expect("observedAt" in still ? still.observedAt : "", name).toMatch(/^2026-09-/);
+    }
+  });
+
+  it("day thirty-five: September's grace runs out, the sweep takes it and hands back no August twice", async () => {
+    advanceTo(day(SWEEP_DAY, "03:00"));
+    const { shredded } = await namespaces.expirePeriods();
+    // One row, and the two Augusts are NOT in it. Neither namespace was
+    // erased on request, so this is a retention expiry and the flag says so
+    // -- the mixed case is exercised in the unit suite.
+    expect(shredded).toEqual([
+      { namespaceId: provider, period: "2026-09-01", namespaceErasedAtSweep: false },
+    ]);
+    // The store wrote no audit row for either sweep. The nightly job's
+    // `periods.expired` entry is M4's to write from exactly this return
+    // value, which is why the sweep returns it at all.
+    expect(journal.filter((j) => j.kind.startsWith("periods"))).toEqual([]);
+  });
+
+  it("makes every day-twelve observation unreadable, and leaves its row standing", async () => {
+    for (const [name, o] of Object.entries(stored)) {
+      await expect(observations.get(idOf(o!)), name).rejects.toBeInstanceOf(PayloadExpired);
+    }
+    // Unreadability and nothing else: the rows, the foreign keys and the key
+    // rows are all where they were.
+    const counts = await sql<{ obs: string; keys: string; orphans: string }>`
+      select (select count(*) from observation)::text as obs,
+             (select count(*) from namespace_key)::text as keys,
+             (select count(*) from observation o where not exists (
+                select 1 from namespace_key k
+                 where k.namespace_id = o.namespace_id and k.period = o.period))::text as orphans
+    `.execute(db);
+    expect(counts.rows[0]!.obs).toBe("5");
+    expect(counts.rows[0]!.keys).toBe("3");
+    expect(counts.rows[0]!.orphans).toBe("0");
+  });
+
+  it("still reads both rescued observations back, dated day twelve", async () => {
+    // This is the card's sentence. The sources are gone and the rescues are
+    // not, because a promotion re-sealed them under the namespace key while
+    // the month keys were what expired.
+    expect(promoted).toHaveLength(2);
+    // Read out of the RESCUE after the sweep, not off the array criterion
+    // three filled before it. The previous version of this test checked only
+    // `observationId` and then asserted the date from `promoted`, so a
+    // `read` that returned any date at all passed: measured with a `read`
+    // stamping 2099, twenty of twenty green. "Dated day twelve" is the
+    // card's sentence, so it is the half that has to come back from disk.
+    const rescuedDates: (string | null)[] = [];
+    const recordDates: string[] = [];
+    for (const record of promoted) {
+      const rescued = await records.read(record.recordId);
+      expect(rescued.observationId).toBe(record.observationId);
+      rescuedDates.push("observedAt" in rescued ? rescued.observedAt : null);
+      // And the metadata row, re-read after the sweep rather than
+      // remembered from before it.
+      recordDates.push((await records.get(record.recordId)).originalDatedAt.toISOString());
+      await expect(observations.get(record.observationId)).rejects.toBeInstanceOf(PayloadExpired);
+    }
+    const dayTwelve = ["2026-09-12T08:14:00.000Z", "2026-09-12T16:47:00.000Z"];
+    expect(rescuedDates).toEqual(dayTwelve);
+    expect(recordDates).toEqual(dayTwelve);
+    expect(promoted.map((r) => r.originalDatedAt.toISOString().slice(0, 10)))
+      .toEqual(["2026-09-12", "2026-09-12"]);
+  });
+
+  it("leaves the tag exactly as it was, because retention is not a decision", async () => {
+    // `xmin` moves on any UPDATE, including one that writes the value a
+    // column already had, so this is the strongest form of "untouched".
+    expect(await tagRowVersions()).toEqual(tagVersionsBeforeSweep);
+    expect(await tags.listLive(provider)).toHaveLength(1);
+  });
+
+  it("verifies the chain, and re-sealing every day after the sweep moves nothing", async () => {
+    expect(await chain.verify()).toEqual({ ok: true });
+    // Sealing a day that is already sealed is a no-op rather than an error,
+    // so the nightly job can re-run over a range it has seen. Re-sealed
+    // here across the whole scenario, after the sweep, to show that expiry
+    // moved no seal.
+    //
+    // What this does NOT prove, and used to claim by its name: that the
+    // re-seal VERIFIES anything. `sealDay`'s existing-seal branch checks the
+    // sealed entry's hash and the seal's HMAC, and replacing both checks
+    // with `true` leaves every test in this file green -- the branch is
+    // taken, but nothing here can tell a check from a skip. Those two rules
+    // are held in `chain.test.ts` by "refuses to re-seal a day whose sealed
+    // entry was rewritten" and "...whose seal no longer verifies", which is
+    // where a corrupted seal can be planted. Measured, both directions.
+    const before = await db.selectFrom("audit_day").select(["day", "terminal_seq"])
+      .orderBy("day").execute();
+    for (let n = 0; n <= 21; n++) await chain.sealDay(dayString(n));
+    const after = await db.selectFrom("audit_day").select(["day", "terminal_seq"])
+      .orderBy("day").execute();
+    expect(after).toEqual(before);
+    expect(await chain.verify()).toEqual({ ok: true });
+  });
+
+  it("answers a re-delivery of the day-twelve fixture instead of throwing", async () => {
+    // The indexer's normal retry, after the month it belongs to is gone. It
+    // is answered, not refused, and the answer says which erasure happened:
+    // the month expired and the counterparty space did not.
+    const again = await observations.append(movedAway);
+    expect(again).toMatchObject({
+      created: false,
+      readable: false,
+      observationId: idOf(stored.movedAway!),
+      periodExpired: true,
+      namespaceErased: false,
+    });
+  });
+
+  it("adds no kind to the journal, because the store writes no audit row", async () => {
+    // The eleven kinds of criterion four, unchanged. Retention is an
+    // operation the CALLER journals; this suite is the caller and
+    // deliberately does not, so that the absence is visible here rather
+    // than assumed.
+    expect(journal.map((j) => j.kind)).toEqual([
+      "observation.appended", "observation.appended",
+      "observation.appended", "observation.appended",
+      "tag.opened", "tag.refreshed",
+      "observation.appended", "brief.read",
+      "trigger.recorded", "record.promoted", "record.promoted",
+    ]);
+    // And the DATABASE agrees with the journal, which is the half that
+    // carries the claim. `journal` grows only when this file calls
+    // `audit()`, so a store method that appended an entry of its own would
+    // leave the array untouched and the assertion above green. Measured
+    // rather than reasoned: an `AuditChain.append` planted at the top of
+    // `expirePeriods` passed 462 of 463 tests, and the one that went red did
+    // so because it happened to call the sweep inside a transaction and
+    // R21's guard fired -- a test of another rule entirely, which is not
+    // evidence for this one. This comparison is what refuses the plant.
+    const entries = await sql<{ kind: string }>`
+      select kind from audit_entry order by seq`.execute(db);
+    expect(entries.rows.map((r) => r.kind)).toEqual(journal.map((j) => j.kind));
   });
 });
