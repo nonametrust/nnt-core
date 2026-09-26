@@ -1458,6 +1458,25 @@ describe("a re-delivery whose payload cannot be opened", () => {
   // duplicate-retry path's use of the skeleton. Every one passed all 376
   // tests before these were written.
 
+  // The other half of the same constructor, and the half nothing held:
+  // deleting the whole `policy !== namespaces.policy` block left the suite
+  // green. It is the mechanism §2d's rule became after review handed the two
+  // repositories different policies and the store capped under one while
+  // expiring under the other, silently. IDENTITY and not equality is the
+  // rule, so the test hands an equal copy -- which is exactly the shape a
+  // caller produces with a spread and exactly what drifts apart later.
+  it("refuses a policy object that is equal to its namespace repository's but not the same one", () => {
+    const ns = new NamespaceRepository(db, ring, fixedClock(new Date("2027-01-01T00:00:00.000Z")), RETENTION_V0);
+    const copy = { ...RETENTION_V0 };
+    expect(copy).toEqual(RETENTION_V0);
+    expect(() => new ObservationRepository(db, ns, fixedClock(new Date("2027-01-01T00:00:00.000Z")), copy))
+      .toThrow(/Pass one policy object to both/);
+    // And the same object is accepted, so the refusal is about identity and
+    // not about the constructor refusing everything.
+    expect(() => new ObservationRepository(db, ns, fixedClock(new Date("2027-01-01T00:00:00.000Z")), RETENTION_V0))
+      .not.toThrow();
+  });
+
   it("refuses a malformed policy in its own constructor, by field name", async () => {
     // R16's sibling. Without this the required parameter is indistinguishable
     // from a decorative one: deleting assertRetentionPolicy(policy) from the

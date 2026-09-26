@@ -307,6 +307,19 @@ describe("what the repository refuses before writing", () => {
 // outlives its month -- and until now `promote` copied metadata and never
 // opened the observation at all, so a promotion after expiry succeeded while
 // rescuing nothing. §1 found it; this is where it closes.
+// The third of the three construction sites that assert the policy, and the
+// second of the three that nothing held: deleting this call left the suite
+// green. `expiresAt`'s docstring claims an unvalidated policy cannot reach it
+// from inside the store, and that claim is about all three sites.
+describe("the policy this repository is built on", () => {
+  it("refuses a malformed one in its own constructor, by field name", () => {
+    expect(() => new PermanentRecordRepository(db, ring, clock, { ...RETENTION_V0, graceDays: 1.5 }))
+      .toThrow(/graceDays/);
+    expect(() => new PermanentRecordRepository(db, ring, clock, { ...RETENTION_V0, producerMaxObservations: 0 }))
+      .toThrow(/producerMaxObservations/);
+  });
+});
+
 describe("the permanent copy outlives its month", () => {
   const grace7 = { ...RETENTION_V0, graceDays: 7 };
 

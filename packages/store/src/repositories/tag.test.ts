@@ -477,6 +477,25 @@ describe("suppression", () => {
   });
 });
 
+// `requireInstant` refuses two things and only one was held: an Invalid Date
+// is covered, and something that is not a Date at all is not -- deleting the
+// `!(value instanceof Date)` half left the whole suite green. It matters at
+// the boundary, where a caller hands JSON: a string reaches Postgres as a
+// bind the column may well accept, and the tag is then stamped with an
+// instant nobody chose.
+describe("the instant a tag is stamped with", () => {
+  it("refuses something that is not a Date at all, by argument name", async () => {
+    await expect(repo.open({
+      namespaceId: ns, observationId: obs, channel: "price", aspect: "notadate",
+      g0: 0.5, taggedAt: "2026-09-12T00:00:00.000Z" as unknown as Date,
+    })).rejects.toThrow(/taggedAt must be a valid Date/);
+    await expect(repo.open({
+      namespaceId: ns, observationId: obs, channel: "price", aspect: "notadate2",
+      g0: 0.5, taggedAt: new Date("not a date"),
+    })).rejects.toThrow(/taggedAt must be a valid Date/);
+  });
+});
+
 describe("findLive", () => {
   // M2's tagObservation takes the live tag on a pair or null, and until now
   // the only reader was listLive, so a caller would have had to pull every
@@ -490,6 +509,43 @@ describe("findLive", () => {
     expect(await repo.findLive(ns, "price", "usd")).toMatchObject({ tagId: t.tagId });
     expect(await repo.findLive(ns, "price", "eur")).toBeNull();
     expect(await repo.findLive(ns, "volume", "usd")).toBeNull();
+  });
+
+  // The namespace predicate itself, which nothing held: deleting
+  // `.where("namespace_id", "=", namespaceId)` left all 463 tests green,
+  // because every other test in this file asks about a pair that exists in
+  // one namespace only. Without it `findLive` answers with ANOTHER
+  // counterparty's tag -- the pair is unique per namespace, not globally --
+  // and M3's brief would read one counterparty's history into another's
+  // decision.
+  it("does not answer with another namespace's tag on the same pair", async () => {
+    // The namespace predicate itself, which nothing held: deleting
+    // `.where("namespace_id", "=", namespaceId)` left all 463 tests green,
+    // because every other test here asks about a pair that exists in one
+    // namespace only. Without it `findLive` answers with ANOTHER
+    // counterparty's tag -- the pair is unique PER namespace, not globally --
+    // and M3's brief would read one counterparty's history into another's
+    // decision.
+    //
+    // Two namespaces of its own and not the file's `ns`: a tag added there
+    // changes what the `listLive` tests count, and a test that has to be
+    // read alongside two others to be correct is a test that will be broken
+    // by the next one.
+    const aObs = await appendUnder("PAIRA", "op:tag:paira");
+    const bObs = await appendUnder("PAIRB", "op:tag:pairb");
+    const a = (await namespaces.find("wallet", "PAIRA"))!.namespaceId;
+    const b = (await namespaces.find("wallet", "PAIRB"))!.namespaceId;
+    const tagA = await repo.open({
+      namespaceId: a, observationId: aObs, channel: "price", aspect: "shared-pair",
+      g0: 0.5, taggedAt: clock.now(),
+    });
+    const tagB = await repo.open({
+      namespaceId: b, observationId: bObs, channel: "price", aspect: "shared-pair",
+      g0: 0.9, taggedAt: clock.now(),
+    });
+    expect(tagA.tagId).not.toBe(tagB.tagId);
+    expect(await repo.findLive(a, "price", "shared-pair")).toMatchObject({ tagId: tagA.tagId });
+    expect(await repo.findLive(b, "price", "shared-pair")).toMatchObject({ tagId: tagB.tagId });
   });
 
   it("stops finding a tag once it is retired, which is what frees the pair", async () => {

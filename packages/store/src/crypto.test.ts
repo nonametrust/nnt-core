@@ -519,6 +519,17 @@ describe("periodKeyAad", () => {
     expect(() => periodKeyAad("a\uD800b", "2026-09-01")).toThrow(RangeError);
   });
 
+  // The ORDER of the two parts is a rule and nothing else held it. Both
+  // callers -- the mint in `periodKey` and the open in `openPeriodKey` --
+  // build the binding the same way, so swapping the two arguments in the
+  // function body is a CONSISTENT change and every round trip still passes.
+  // Its siblings `payloadAad` and `permanentAad` each have exactly this pin;
+  // this one did not, which is the whole lesson about mutating both sides of
+  // a binding together as well as separately.
+  it("renders the namespace first and the period second, which no round trip can hold", () => {
+    expect(periodKeyAad(NS, "2026-09-01").split("\u0000")).toEqual([NS, "2026-09-01"]);
+  });
+
   // Two distinct pairs cannot render the same binding, which is what stops a
   // wrapped month key being useful in another row.
   it("cannot be re-partitioned into a different pair", () => {

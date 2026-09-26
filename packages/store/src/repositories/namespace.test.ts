@@ -750,6 +750,51 @@ describe("what the namespace_key table refuses to hold", () => {
   //
   // `graceDays: 3650` puts `expires_at` past `period + 10 years`, which is
   // the one refusal a caller can provoke through this path without raw SQL.
+  // `assertRetentionPolicy` is called at three construction sites and only
+  // one of them was held: deleting the calls in NamespaceRepository and
+  // PermanentRecordRepository left the suite green. The assertion is what
+  // makes `expiresAt`'s docstring true -- it says an unvalidated policy
+  // cannot reach it from inside the store, which is a claim about all three
+  // sites and not about one.
+  // Two rules of this repository that read as obvious and were held by
+  // nothing: both mutants left the whole suite green.
+  //
+  // `periodsOf`'s ORDER. Without `order by period` the rows come back in
+  // whatever order the heap gives, which for a small table is insertion
+  // order -- so a namespace whose months were minted out of order (a
+  // backfill after a live month, which is the normal case) lists them out of
+  // order, and the acceptance story's `toEqual([...])` was passing on
+  // insertion order rather than on the clause.
+  it("lists a namespace's months oldest first, even when they were minted out of order", async () => {
+    const ns = (await repo.ensure({ kind: "wallet", id: "ORDERMONTHS" })).namespaceId;
+    // Minted newest first on purpose.
+    await repo.periodKey(ns, "2026-11-01");
+    await repo.periodKey(ns, "2026-09-01");
+    await repo.periodKey(ns, "2026-10-01");
+    expect(await repo.periodsOf(ns)).toEqual(["2026-09-01", "2026-10-01", "2026-11-01"]);
+  });
+
+  // And a month with no key row at all. The docstring says it is a caller
+  // defect and a plain Error rather than `PayloadExpired`, because the two
+  // mean different things to an operator -- "you asked for a month that was
+  // never minted" against "this month's key is gone". Deleting the guard
+  // left the suite green: the next line reads `row.key_wrapped` and a
+  // TypeError is what a caller would have got.
+  it("names a month with no key row as a plain Error, not as an expiry", async () => {
+    const ns = (await repo.ensure({ kind: "wallet", id: "NOMONTHROW" })).namespaceId;
+    const thrown = await repo.openPeriodKey(ns, "2026-12-01").then(() => null, (e: unknown) => e);
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(StoreError);
+    expect((thrown as Error).message).toMatch(/no month key 2026-12-01/);
+  });
+
+  it("refuses a malformed policy in its own constructor, by field name", () => {
+    expect(() => new NamespaceRepository(db, ring, clock, { ...RETENTION_V0, graceDays: -1 }))
+      .toThrow(/graceDays/);
+    expect(() => new NamespaceRepository(db, ring, clock, { ...RETENTION_V0, version: "  " }))
+      .toThrow(/version/);
+  });
+
   it("maps the mint's own constraint refusal to a class, like every other write here", async () => {
     const far = new NamespaceRepository(db, ring, clock, { ...RETENTION_V0, graceDays: 3650 });
     const ns = (await far.ensure({ kind: "wallet", id: "MAPMINT" })).namespaceId;
