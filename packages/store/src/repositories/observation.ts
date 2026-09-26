@@ -114,6 +114,25 @@ export class ObservationRepository {
           `Pass one policy object to both.`,
       );
     }
+    // The clock is the other object these two share by convention, and the
+    // convention was guarded on one of the pair and not the other -- which a
+    // close-out review pointed out is the same argument twice with one half
+    // written. `append` stamps `ingested_at` from THIS clock and derives the
+    // period from it, then asks `namespaces.periodKey` to compute that
+    // period's expiry from ITS clock, and counts the cap's window from this
+    // one again. Two clocks put the row in one month and its key's expiry in
+    // another, with no error anywhere.
+    //
+    // Identity, not "reads the same instant": two clocks that agree now are
+    // two clocks that will disagree after the first `advance`, and a fixed
+    // clock in a test is advanced constantly. The whole point is to pass ONE.
+    if (clock !== namespaces.clock) {
+      throw new RangeError(
+        "this repository and its namespace repository were built on different clocks: " +
+          "the ingest instant and the month's expiry would be computed from two " +
+          "different nows. Pass one clock object to both.",
+      );
+    }
   }
 
   /**

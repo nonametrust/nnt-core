@@ -118,7 +118,13 @@ export class NamespaceRepository {
   constructor(
     private readonly db: Db,
     private readonly ring: KeyRing,
-    private readonly clock: Clock,
+    // Readable for the same reason `policy` below is: the observation
+    // repository refuses a clock that is not this one, rather than trusting
+    // a convention. Two repositories on one namespace with two clocks would
+    // stamp `ingested_at` from one and compute the cap's window and the
+    // month's expiry from the other, and nothing downstream compares them --
+    // which is the same failure the policy guard exists for, one field over.
+    readonly clock: Clock,
     // Needed at mint and nowhere else: expires_at is fixed on the row from
     // the period and the policy in force (R2). Required rather than
     // defaulted, for the reason the key ring has no default master key -- a

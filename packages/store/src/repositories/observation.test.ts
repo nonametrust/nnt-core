@@ -267,10 +267,12 @@ describe("idempotency", () => {
       dataKey: async () => newDataKey(),
       periodKey: async () => undefined,
       openPeriodKey: async () => newDataKey(),
-      // The stand-in carries the policy too, because the repository now
-      // refuses a namespace repository built on a different one -- a stub
-      // without it is a composition this store would reject in production.
+      // The stand-in carries the policy AND the clock, because the repository
+      // refuses a namespace repository built on either a different policy or
+      // a different clock -- a stub without them is a composition this store
+      // would reject in production.
       policy: RETENTION_V0,
+      clock,
     } as unknown as NamespaceRepository;
     const broken = new ObservationRepository(db, orphan, clock, RETENTION_V0);
     const standIn = storedObservation(await observations.append(anEvent({ source: { ...src, ref: "op:orphan:standin" } })));
@@ -1466,15 +1468,38 @@ describe("a re-delivery whose payload cannot be opened", () => {
   // rule, so the test hands an equal copy -- which is exactly the shape a
   // caller produces with a spread and exactly what drifts apart later.
   it("refuses a policy object that is equal to its namespace repository's but not the same one", () => {
-    const ns = new NamespaceRepository(db, ring, fixedClock(new Date("2027-01-01T00:00:00.000Z")), RETENTION_V0);
+    // ONE clock for both, so what is refused below is the policy and not the
+    // clock: the constructor now guards both, and a test that trips the wrong
+    // guard says nothing about the one it names.
+    const c = fixedClock(new Date("2027-01-01T00:00:00.000Z"));
+    const ns = new NamespaceRepository(db, ring, c, RETENTION_V0);
     const copy = { ...RETENTION_V0 };
     expect(copy).toEqual(RETENTION_V0);
-    expect(() => new ObservationRepository(db, ns, fixedClock(new Date("2027-01-01T00:00:00.000Z")), copy))
+    expect(() => new ObservationRepository(db, ns, c, copy))
       .toThrow(/Pass one policy object to both/);
     // And the same object is accepted, so the refusal is about identity and
     // not about the constructor refusing everything.
-    expect(() => new ObservationRepository(db, ns, fixedClock(new Date("2027-01-01T00:00:00.000Z")), RETENTION_V0))
-      .not.toThrow();
+    expect(() => new ObservationRepository(db, ns, c, RETENTION_V0)).not.toThrow();
+  });
+
+  // The clock is the other object the two share by convention, and until a
+  // close-out review asked, only the policy half was guarded -- the same
+  // argument twice with one half written. `append` stamps `ingested_at` from
+  // its own clock and derives the period from it, then asks `periodKey` to
+  // compute that period's expiry from the namespace repository's clock: two
+  // clocks put the row in one month and its key's expiry in another, with no
+  // error anywhere.
+  it("refuses a clock that is not its namespace repository's, so one now decides both", () => {
+    const c = fixedClock(new Date("2027-01-01T00:00:00.000Z"));
+    const ns = new NamespaceRepository(db, ring, c, RETENTION_V0);
+    // A second clock reading the SAME instant is still refused: two clocks
+    // that agree now disagree after the first advance, and a fixed clock in
+    // a test is advanced constantly.
+    const twin = fixedClock(new Date("2027-01-01T00:00:00.000Z"));
+    expect(twin.now().toISOString()).toBe(c.now().toISOString());
+    expect(() => new ObservationRepository(db, ns, twin, RETENTION_V0))
+      .toThrow(/Pass one clock object to both/);
+    expect(() => new ObservationRepository(db, ns, c, RETENTION_V0)).not.toThrow();
   });
 
   it("refuses a malformed policy in its own constructor, by field name", async () => {
