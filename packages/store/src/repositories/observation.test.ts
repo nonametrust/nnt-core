@@ -1,8 +1,9 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { deriveIdempotencyKey, type WireObservation } from "@nonametrust/schema";
-import { sql } from "kysely";
-import { openDb, type Db } from "../db.js";
+import { sql, Kysely, PostgresDialect } from "kysely";
+import pg from "pg";
+import { openDb, withIsoDates, type Db, type Schema } from "../db.js";
 import {
   requireTestUrl, storedObservation, urlForSchema, withSchema,
 } from "../testing/harness.js";
@@ -1379,6 +1380,58 @@ describe("a re-delivery whose payload cannot be opened", () => {
         decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
       )`.execute(db).then(() => null, (e: unknown) => e);
     expect(mapPgError(planted)).toBeInstanceOf(NamespaceShredded);
+  });
+
+  // The gate reads `from namespace` unqualified, and an unqualified name is
+  // resolved through `search_path` -- which has the session's implicit
+  // `pg_temp` at the FRONT unless the function says otherwise. A temp table
+  // called `namespace` therefore answers the gate's question instead of the
+  // real one, and review measured the whole erasure refusal disappearing
+  // with no setting changed and no privilege a plain application role does
+  // not already have: TEMP is granted to PUBLIC by default, while `alter
+  // table ... disable trigger` needs ownership and `create schema` needs
+  // CREATE on the database. So this is the one route that gives a
+  // non-owning role exactly the capability the deployment denies it.
+  //
+  // Fixed by pinning `search_path` on every trigger function in the store's
+  // schema, with `pg_temp` named LAST: leaving it out is what puts it first.
+  it("refuses an erased namespace even when a temp table shadows the one the gate reads", async () => {
+    // One session throughout: a temp table belongs to the session that made
+    // it, so the shadow and the insert must share a connection.
+    const session = new Kysely<Schema>({
+      dialect: new PostgresDialect({
+        pool: new pg.Pool({ connectionString: withIsoDates(urlForSchema(requireTestUrl(), "obs_test")), max: 1 }),
+      }),
+    });
+    try {
+      const may = at("2027-05-04T00:00:00.000Z");
+      await may.obs.append(anEvent({ namespace: { kind: "wallet", id: "SHADOW" },
+        source: { ...src, ref: "op:shadow:1" } }));
+      const nsId = (await may.ns.find("wallet", "SHADOW"))!.namespaceId;
+      await at("2027-05-10T00:00:00.000Z").ns.shred(nsId);
+
+      await sql`create temp table namespace (namespace_id uuid primary key, data_key_wrapped bytea)`
+        .execute(session);
+      // The shadow says this counterparty is alive, which the real table
+      // denies. Non-vacuous: without the pin the gate believes the shadow.
+      await sql`insert into namespace values (${nsId}, decode('00', 'hex'))`.execute(session);
+
+      const planted = await sql`
+        insert into observation (
+          observation_id, idempotency_key, namespace_id, channel, kind, evidence_kind,
+          dated_at, ingested_at, producer, period, payload_nonce, payload_tag, payload_ciphertext
+        ) values (
+          ${randomUUID()}, ${randomUUID()}, ${nsId}, 'protocol', 'raw', 'state',
+          null, ${new Date("2027-05-20T00:00:00.000Z")}, 'shadow-writer', '2027-05-01'::date,
+          decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
+        )`.execute(session).then(() => null, (e: unknown) => e);
+      expect(mapPgError(planted)).toBeInstanceOf(NamespaceShredded);
+      const rows = await sql<{ n: string }>`
+        select count(*)::text as n from observation where producer = 'shadow-writer'`.execute(db);
+      expect(rows.rows[0]!.n).toBe("0");
+    } finally {
+      await session.destroy();
+    }
   });
 
   // A live month of a live namespace is untouched by the gate: the rule is

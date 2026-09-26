@@ -144,6 +144,33 @@ describe("0007 over stored observations", () => {
       const row = await freshDb.selectFrom("schema_migration").select(["filename"])
         .where("filename", "=", seventh).executeTakeFirst();
       expect(row).toBeDefined();
+
+      // Section 8, and the "EVERY trigger function" half of it specifically.
+      // The guards read their tables unqualified, so an unpinned one resolves
+      // `namespace` through the session's `search_path` -- whose implicit
+      // `pg_temp` comes FIRST -- and a temp table of that name answers the
+      // gate instead of the real one. Pinning the function 0007 added and
+      // leaving `0001`-`0006`'s eight alone would read as done and close
+      // nothing, so what is asserted here is that NONE is left unpinned, and
+      // that the count is not zero, which is what makes the first half mean
+      // anything.
+      const fns = await sql<{ name: string; config: string[] | null }>`
+        select p.proname as name, p.proconfig as config
+          from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+         where n.nspname = ${fresh}
+           and p.prorettype = 'pg_catalog.trigger'::regtype
+         order by p.proname`.execute(freshDb);
+      expect(fns.rows.length).toBeGreaterThanOrEqual(9);
+      const unpinned = fns.rows.filter(
+        (f) => !(f.config ?? []).some((c) => c.startsWith("search_path=")),
+      );
+      expect(unpinned.map((f) => f.name)).toEqual([]);
+      // And `pg_temp` is named LAST rather than left out: leaving it out of
+      // the list is exactly what puts it first.
+      for (const f of fns.rows) {
+        const pinned = (f.config ?? []).find((c) => c.startsWith("search_path="))!;
+        expect(pinned, f.name).toBe(`search_path=${fresh}, pg_temp`);
+      }
     } finally {
       await freshDb.destroy();
       const cleanup = openDb(url);

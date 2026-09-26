@@ -726,3 +726,53 @@ create trigger observation_target_writable_on_insert
 alter table permanent_record add column payload_nonce bytea not null;
 alter table permanent_record add column payload_tag bytea not null;
 alter table permanent_record add column payload_ciphertext bytea not null;
+
+
+-- === 8. Every trigger function names where it looks (Task 11's review) =====
+--
+-- Every guard in this schema reads its tables UNQUALIFIED -- `from namespace`,
+-- `from namespace_key`, `from audit_entry` -- and an unqualified name is
+-- resolved through the session's `search_path`, which has the implicit
+-- `pg_temp` at the FRONT unless a function says otherwise. So
+--
+--   create temp table namespace (namespace_id uuid primary key,
+--                                data_key_wrapped bytea);
+--   insert into namespace values ('<the erased one>', '\x00');
+--
+-- makes the erasure gate ask a table the writer just made up, and the insert
+-- it exists to refuse commits. Measured on 17.7: NNT08 before the temp table,
+-- `INSERT 0 1` after it, with the real `namespace.data_key_wrapped` still
+-- null and no session setting changed.
+--
+-- This is not a theoretical privilege. TEMP is granted to PUBLIC by default,
+-- while `alter table ... disable trigger` needs ownership and `create schema`
+-- needs CREATE on the database -- both of which the non-owning application
+-- role `0002` anticipates is denied. Measured with exactly that role: the
+-- disable and the schema routes were refused and this one was not. It is the
+-- single route that hands such a role the capability the deployment takes
+-- away, so "no observation commits after the erasure commits" was false for
+-- the writer the sentence is about.
+--
+-- Pinned for EVERY trigger function in this schema and not only the ones this
+-- migration added, because the same hole is in `0001`-`0006`'s guards and
+-- fixing one of nine would be worse than fixing none: it would read as done.
+--
+-- Two details the measurement forced. `pg_temp` is listed LAST and
+-- explicitly: leaving it out of the list is exactly what puts it first. And
+-- the schema cannot be a literal, because the test harness installs this
+-- store into a schema per test file and a deployment chooses its own, so it
+-- is taken from `current_schema()` at migration time -- the schema these
+-- functions were just created in.
+do $$
+declare fn text; here text := current_schema();
+begin
+  for fn in
+    select p.oid::regprocedure::text
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = here
+       and p.prorettype = 'pg_catalog.trigger'::regtype
+  loop
+    execute format('alter function %s set search_path = %I, pg_temp', fn, here);
+  end loop;
+end $$;
