@@ -38,7 +38,7 @@ import { keyRingFromEnv } from "./crypto.js";
 import { fixedClock } from "./clock.js";
 import { RETENTION_V0 } from "./retention.js";
 import {
-  AppendOnlyViolation, DayNotClosed, TimestampAltered, mapPgError,
+  AppendOnlyViolation, DayNotClosed, TimestampAltered, mapPgError, PayloadExpired,
 } from "./errors.js";
 import { NamespaceRepository } from "./repositories/namespace.js";
 import { ObservationRepository } from "./repositories/observation.js";
@@ -229,13 +229,30 @@ async function tagRowVersions(): Promise<string[]> {
   return r.rows.map((x) => x.v);
 }
 
+// The retention policy this story runs under. One object, handed to every
+// repository that takes one: R16 refuses a stored expiry its own policy did
+// not compute, so a fixture appended through one policy and swept by another
+// is a PeriodKeyAltered on the next append rather than a sweep that finds
+// nothing -- and §2d names this suite by name as a place that would happen.
+//
+// Three days rather than ninety, so the story can reach its own expiry: the
+// scenario is twenty-two days long and a ninety-day grace would need a
+// hundred and fourteen. Three collides with no other field of the policy,
+// which is the habit the M2 ledger asks for -- the shipped numbers are 90,
+// 86,400,000 and 10,000,000, and a function reading the wrong one would show.
+//
+// What this does NOT prove, and the card says so: the full horizon over a
+// real ninety days across a calendar month belongs to M5. This proves the
+// mechanism on M1's scenario.
+const RETENTION = Object.freeze({ ...RETENTION_V0, graceDays: 3 });
+
 beforeAll(async () => {
   ({ db, done } = await withSchema("acceptance"));
-  namespaces = new NamespaceRepository(db, ring, clock, RETENTION_V0);
-  observations = new ObservationRepository(db, namespaces, clock, RETENTION_V0);
+  namespaces = new NamespaceRepository(db, ring, clock, RETENTION);
+  observations = new ObservationRepository(db, namespaces, clock, RETENTION);
   tags = new TagRepository(db, clock);
   triggers = new TriggerEventRepository(db, clock);
-  records = new PermanentRecordRepository(db, ring, clock, RETENTION_V0);
+  records = new PermanentRecordRepository(db, ring, clock, RETENTION);
   chain = new AuditChain(db, clock, ring);
   provider = (await namespaces.ensure(PROVIDER)).namespaceId;
 });
@@ -448,6 +465,8 @@ describe("3. a promotion preserves the original timestamp", () => {
   });
 });
 
+let tagVersionsBeforeSweep: string[] = [];
+
 describe("4. the audit chain verifies", () => {
   it("holds one entry per operation the story performed, in order, and nothing else", async () => {
     const rows = await db.selectFrom("audit_entry").select(["seq", "kind"]).orderBy("seq").execute();
@@ -510,5 +529,144 @@ describe("4. the audit chain verifies", () => {
     expect(seals[12]!.terminal_seq).toBe(seq("tag.refreshed", 0));
     expect(seals[21]!.terminal_seq).toBe(journal.at(-1)!.seq);
     expect(await chain.verify()).toEqual({ ok: true });
+  });
+});
+
+// The fifth criterion, and the sentence the whole card exists for: a captured
+// trace outlives its month.
+//
+// It runs last on purpose. Everything above proves the four M1 criteria on a
+// live database; this proves they survive the thing retention does TO that
+// database, which is the M1 lesson the M2 spec records in §14 -- criteria
+// that hold in isolation and not in composition.
+describe("5. retention runs, and the rescue survives it", () => {
+  // Day 0 is 31 August and day 12 is 12 September, so this story spans two
+  // calendar months and therefore two month keys per namespace. Both are past
+  // a three-day grace by now: August closed on 1 September and expired on the
+  // 4th, September closes on 1 October and expires on the 4th.
+  const SWEEP_DAY = 35; // 5 October 2026
+
+  it("holds two months for each namespace before anything is swept", async () => {
+    // Asserted from the STORY rather than read off the sweep: day zero wrote
+    // to both namespaces in August, day twelve onwards in September. Without
+    // this the sweep's own list would be its own oracle.
+    const wallet = (await namespaces.find(WALLET.kind, WALLET.id))!.namespaceId;
+    // Three key rows, not four, and the asymmetry is the story rather than
+    // an accident: the two address changes and the price quote are evidence
+    // ABOUT THE PROVIDER -- a provider's payment address changed -- so they
+    // land in the provider's September. The wallet is named in the day-zero
+    // payment and never again, so it holds August alone. Getting this wrong
+    // was my first guess, and writing it down is cheaper than guessing again.
+    expect(await namespaces.periodsOf(provider)).toEqual(["2026-08-01", "2026-09-01"]);
+    expect(await namespaces.periodsOf(wallet)).toEqual(["2026-08-01"]);
+  });
+
+  it("day thirty-five: the sweep expires every month past its grace, and says which", async () => {
+    advanceTo(day(SWEEP_DAY, "03:00"));
+    const wallet = (await namespaces.find(WALLET.kind, WALLET.id))!.namespaceId;
+    // Captured here, one line before the sweep, rather than at the end of
+    // criterion four: the tag assertion two tests below has to compare
+    // against the instant before expiry, and reading it from another
+    // describe block made that depend on the order of two blocks instead of
+    // on one line.
+    tagVersionsBeforeSweep = await tagRowVersions();
+    const { shredded } = await namespaces.expirePeriods();
+    // The whole list, per row, sorted as the repository sorts it. Three rows:
+    // the provider's two months and the wallet's one. Neither namespace was erased on
+    // request, so every one of them is a retention expiry and the flag says
+    // so -- the mixed case is exercised in the unit suite.
+    expect(shredded).toEqual([
+      { namespaceId: provider, period: "2026-08-01", namespaceErasedAtSweep: false },
+      { namespaceId: provider, period: "2026-09-01", namespaceErasedAtSweep: false },
+      { namespaceId: wallet, period: "2026-08-01", namespaceErasedAtSweep: false },
+    ].sort((a, b) => (a.namespaceId === b.namespaceId
+      ? a.period.localeCompare(b.period)
+      : a.namespaceId.localeCompare(b.namespaceId))));
+    // The store wrote no audit row for any of it. The nightly job's
+    // `periods.expired` entry is M4's to write from exactly this return
+    // value, which is why the sweep returns it at all.
+    expect(journal.filter((j) => j.kind.startsWith("periods"))).toEqual([]);
+  });
+
+  it("makes every day-twelve observation unreadable, and leaves its row standing", async () => {
+    for (const [name, o] of Object.entries(stored)) {
+      await expect(observations.get(idOf(o!)), name).rejects.toBeInstanceOf(PayloadExpired);
+    }
+    // Unreadability and nothing else: the rows, the foreign keys and the key
+    // rows are all where they were.
+    const counts = await sql<{ obs: string; keys: string; orphans: string }>`
+      select (select count(*) from observation)::text as obs,
+             (select count(*) from namespace_key)::text as keys,
+             (select count(*) from observation o where not exists (
+                select 1 from namespace_key k
+                 where k.namespace_id = o.namespace_id and k.period = o.period))::text as orphans
+    `.execute(db);
+    expect(counts.rows[0]!.obs).toBe("5");
+    expect(counts.rows[0]!.keys).toBe("3");
+    expect(counts.rows[0]!.orphans).toBe("0");
+  });
+
+  it("still reads both rescued observations back, dated day twelve", async () => {
+    // This is the card's sentence. The sources are gone and the rescues are
+    // not, because a promotion re-sealed them under the namespace key while
+    // the month keys were what expired.
+    expect(promoted).toHaveLength(2);
+    for (const record of promoted) {
+      const rescued = await records.read(record.recordId);
+      expect(rescued.observationId).toBe(record.observationId);
+      await expect(observations.get(record.observationId)).rejects.toBeInstanceOf(PayloadExpired);
+    }
+    expect(promoted.map((r) => r.originalDatedAt.toISOString().slice(0, 10)))
+      .toEqual(["2026-09-12", "2026-09-12"]);
+  });
+
+  it("leaves the tag exactly as it was, because retention is not a decision", async () => {
+    // `xmin` moves on any UPDATE, including one that writes the value a
+    // column already had, so this is the strongest form of "untouched".
+    expect(await tagRowVersions()).toEqual(tagVersionsBeforeSweep);
+    expect(await tags.listLive(provider)).toHaveLength(1);
+  });
+
+  it("verifies the chain and re-verifies every seal", async () => {
+    expect(await chain.verify()).toEqual({ ok: true });
+    // Sealing a day that is already sealed is a no-op rather than an error,
+    // so the nightly job can re-run over a range it has seen. Re-sealed
+    // here across the whole scenario, after the sweep, to show that expiry
+    // moved no seal.
+    const before = await db.selectFrom("audit_day").select(["day", "terminal_seq"])
+      .orderBy("day").execute();
+    for (let n = 0; n <= 21; n++) await chain.sealDay(dayString(n));
+    const after = await db.selectFrom("audit_day").select(["day", "terminal_seq"])
+      .orderBy("day").execute();
+    expect(after).toEqual(before);
+    expect(await chain.verify()).toEqual({ ok: true });
+  });
+
+  it("answers a re-delivery of the day-twelve fixture instead of throwing", async () => {
+    // The indexer's normal retry, after the month it belongs to is gone. It
+    // is answered, not refused, and the answer says which erasure happened:
+    // the month expired and the counterparty space did not.
+    const again = await observations.append(movedAway);
+    expect(again).toMatchObject({
+      created: false,
+      readable: false,
+      observationId: idOf(stored.movedAway!),
+      periodExpired: true,
+      namespaceErased: false,
+    });
+  });
+
+  it("adds no kind to the journal, because the store writes no audit row", async () => {
+    // The eleven kinds of criterion four, unchanged. Retention is an
+    // operation the CALLER journals; this suite is the caller and
+    // deliberately does not, so that the absence is visible here rather
+    // than assumed.
+    expect(journal.map((j) => j.kind)).toEqual([
+      "observation.appended", "observation.appended",
+      "observation.appended", "observation.appended",
+      "tag.opened", "tag.refreshed",
+      "observation.appended", "brief.read",
+      "trigger.recorded", "record.promoted", "record.promoted",
+    ]);
   });
 });
