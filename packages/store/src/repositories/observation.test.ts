@@ -11,7 +11,7 @@ import { keyRingFromEnv, newDataKey, payloadAad, seal } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import { RETENTION_V0, periodOf } from "../retention.js";
 import {
-  CiphertextRejected, ConstraintViolation, IdempotencyKeyMismatch, NamespaceShredded,
+  Cancelled, CiphertextRejected, ConstraintViolation, IdempotencyKeyMismatch, NamespaceShredded,
   ObservationNotFound, PayloadExpired, StoreError, mapPgError, SourceRateExceeded, WriteInsideTransaction, Deadlocked,
 } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
@@ -824,9 +824,16 @@ describe("the retention period", () => {
       source: { ...src, ref: "op:period:backfill" },
       observedAt: "2026-08-20T09:00:00.000Z",
     })));
+    // `dated_at` is a timestamptz and `to_char` renders one in the SESSION's
+    // zone, so this assertion was the test's own bug and not the store's: on
+    // a server set to UTC-11 it read 2026-08-19 while the store's answer was
+    // right. Its sibling two blocks up says a bare session-zone check "kills
+    // a check only on a cluster east of UTC"; this was the west-side twin, and
+    // nobody runs the tests there. `period` needs no conversion because it is
+    // a `date`, which has no zone to render in.
     const row = await sql<{ period: string; dated: string }>`
       select to_char(period, 'YYYY-MM-DD') as period,
-             to_char(dated_at, 'YYYY-MM-DD') as dated
+             to_char(timezone('UTC', dated_at), 'YYYY-MM-DD') as dated
       from observation where observation_id = ${observation.observationId!}`.execute(db);
     expect(row.rows[0]?.dated).toBe("2026-08-20");
     expect(row.rows[0]?.period).toBe("2026-09-01");
@@ -1906,6 +1913,99 @@ describe("the producer cap", () => {
     // And just past the second, it is admitted again.
     const t2 = at("2028-07-05T00:00:01.100Z", narrow);
     expect((await t2.obs.append(from("cap-msunit", "op:ms:3"))).created).toBe(true);
+  });
+
+  // What the store does when an operator's timeout fires, measured rather
+  // than assumed. `lock_timeout` is not this package's to prevent -- section 4
+  // of `0007` tells the hand-run migration path to set one, and a lock wait
+  // bounded by policy is what a healthy operator does. Naming it IS this
+  // package's: before `Cancelled` existed, an append queued behind an
+  // erasure's row lock came back as a raw driver error carrying
+  // `code: '55P03'` and a message about `PL/pgSQL function
+  // observation_target_writable()`, from inside this store's own trigger,
+  // where the caller had been told to expect `NamespaceShredded`.
+  it("names an operator's lock timeout instead of handing back a driver error", async () => {
+    const impatient = new URL(urlForSchema(requireTestUrl(), "obs_test"));
+    const options = impatient.searchParams.get("options") ?? "";
+    impatient.searchParams.set("options", `${options} -c lock_timeout=100ms`.trim());
+    const quick = openDb(impatient.toString());
+    const holder = openDb(urlForSchema(requireTestUrl(), "obs_test"));
+    try {
+      const c = fixedClock(new Date("2028-10-01T00:00:00.000Z"));
+      const ns = new NamespaceRepository(quick, ring, c, RETENTION_V0);
+      const obs = new ObservationRepository(quick, ns, c, RETENTION_V0);
+      // The namespace exists and is LIVE, so nothing here is about erasure:
+      // what the append meets is a lock, and only a lock.
+      const nsId = (await ns.ensure({ kind: "wallet", id: "LOCKTIMEOUT" })).namespaceId;
+      let release!: () => void, took!: () => void;
+      const held = new Promise<void>((r) => { release = r; });
+      const taken = new Promise<void>((r) => { took = r; });
+      const holding = holder.transaction().execute(async (trx) => {
+        // The row lock the erasure gate's `for share` has to wait behind.
+        await sql`select 1 from namespace where namespace_id = ${nsId} for update`.execute(trx);
+        took();
+        await held;
+      });
+      await taken;
+      const refused = await obs.append(anEvent({
+        namespace: { kind: "wallet", id: "LOCKTIMEOUT" },
+        source: { ...src, ref: "op:locktimeout:1" },
+      })).then(() => null, (e: unknown) => e);
+      release();
+      await holding;
+      expect(refused).toBeInstanceOf(StoreError);
+      expect(refused).toBeInstanceOf(Cancelled);
+      // And nothing was written: a cancelled statement aborts its
+      // transaction, which is the half that makes the class safe to retry on.
+      const rows = await sql<{ n: string }>`
+        select count(*)::text as n from observation where namespace_id = ${nsId}`.execute(db);
+      expect(rows.rows[0]!.n).toBe("0");
+    } finally {
+      await quick.destroy();
+      await holder.destroy();
+    }
+  }, 20_000);
+
+  // A third setting nobody had asked about, and the only one of the three
+  // found by looking rather than by a failure: `extra_float_digits` controls
+  // how many digits the SERVER prints for a float8, and this store's floats
+  // are `g0`, `confidence`, `surprise` and every baseline moment. Under
+  // `extra_float_digits = 0` a `g0` written as 0.5775328370803322 reads back
+  // as 0.577532837080332 -- not a refusal, not an error, just a different
+  // number than the one stored. Measured on 17.7: `0.1 + 0.2` renders as the
+  // literal "0.3".
+  //
+  // The second-order shape is worse than the first. M2 reads a baseline,
+  // updates it and writes it back; a `mean` read as 0.3 and written back as
+  // `median_est` is then refused by `baseline_location_is_mean`, whose own
+  // DETAIL line renders the failing row as "0.3, ..., 0.3" -- a named refusal
+  // that reads as impossible, on a write that was correct.
+  it("hands back the float it stored, whatever precision the connection asks for", async () => {
+    const dulled = new URL(urlForSchema(requireTestUrl(), "obs_test"));
+    const options = dulled.searchParams.get("options") ?? "";
+    // Both a hostile precision AND a DateStyle, which is the shape that
+    // defeated an earlier version of the pin: without the second fragment
+    // this test would pass against a `withIsoDates` that gave up whenever
+    // `options` mentioned anything at all.
+    dulled.searchParams.set(
+      "options",
+      `${options} -c datestyle=ISO -c extra_float_digits=0`.trim(),
+    );
+    const db0 = openDb(dulled.toString());
+    try {
+      const pinned = await sql<{ s: string }>`
+        select current_setting('extra_float_digits') as s`.execute(db0);
+      expect(pinned.rows[0]!.s).toBe("3");
+      // The value the server prints is the value the driver parses, so this
+      // is the whole property: a double the store wrote comes back equal.
+      const round = await sql<{ sum: number; awkward: number }>`
+        select (0.1::float8 + 0.2::float8) as sum,
+               0.5775328370803322::float8 as awkward`.execute(db0);
+      expect(round.rows[0]!.sum).toBe(0.1 + 0.2);
+      expect(round.rows[0]!.awkward).toBe(0.5775328370803322);
+    } finally {
+      await db0.destroy();
+    }
   });
 
   it("holds the cap even when the connection defaults to REPEATABLE READ", async () => {

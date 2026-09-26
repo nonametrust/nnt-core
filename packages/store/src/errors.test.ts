@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   AppendOnlyViolation,
+  Cancelled,
   ChainBroken,
   ConstraintViolation,
   NamespaceAltered,
@@ -47,6 +48,16 @@ describe("mapPgError", () => {
     // 40P01 is to retry -- which is the wrong response to almost every other
     // code in this table, so it has to be tellable apart.
     ["40P01", Deadlocked],
+    // Also Postgres's own, and also not a defect: an operator's lock_timeout
+    // or statement_timeout cancelling a statement this store was waiting on.
+    // Mapped because an unmapped one is the worst of the three outcomes:
+    // measured against `lock_timeout = 50ms`, an append queued behind an
+    // erasure came back as a raw driver error from inside this store's own
+    // trigger, where the caller had been told to expect NamespaceShredded --
+    // and under the same setting both sides of a deadlock get 55P03, so
+    // `Deadlocked` never fires either.
+    ["55P03", Cancelled],
+    ["57014", Cancelled],
   ])("maps %s to the named class", (code, Ctor) => {
     const mapped = mapPgError(pgError(code));
     expect(mapped).toBeInstanceOf(Ctor);

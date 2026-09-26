@@ -225,6 +225,23 @@ export function openDb(url: string): Db {
 const PINS = [
   "-c datestyle=ISO",
   "-c default_transaction_isolation=read\\ committed",
+  // How many digits the SERVER prints for a float8, and therefore what the
+  // driver parses. This store's floats are `g0`, `confidence`, `surprise` and
+  // every baseline moment. Under `extra_float_digits = 0` a `g0` written as
+  // 0.5775328370803322 reads back as 0.577532837080332: no refusal, no error,
+  // a different number than the one stored. On 17.7 any value >= 1 means
+  // shortest-precise output; 3 is the value the JDBC driver pins and also
+  // means 17 digits on majors old enough to need it.
+  //
+  // The second-order shape is what makes it a pin rather than a note. M2
+  // reads a baseline, updates it and writes it back: a `mean` read as "0.3"
+  // and written back as `median_est` is refused by
+  // `baseline_location_is_mean`, whose DETAIL line renders the failing row as
+  // "0.3, ..., 0.3" -- a named refusal that reads as impossible, on a write
+  // that was correct. Found by asking what else could be set against this
+  // store rather than by a failure, which is the only one of the three that
+  // was.
+  "-c extra_float_digits=3",
 ] as const;
 
 /**

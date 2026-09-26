@@ -119,9 +119,86 @@ describe("0007 over stored observations", () => {
   // review found that mutant alive. A namespace with no observation is
   // reachable in ordinary use -- `ensure` runs before an insert that then
   // fails -- so a deployment in that state must still migrate.
+  // The other thing that cannot be added quietly beside existing rows, and the
+  // one the preamble did not cover until a close-out review applied `0007`
+  // over a planted 0006-era database. `baseline` needs no observation row to
+  // exist, so it is non-empty in exactly the deployments the observation half
+  // of the preamble lets through -- and the merge-base's own code wrote rows
+  // section 1 refuses: `medianEst` was documented as "null until an estimator
+  // has produced them" and the fixture wrote a count of 7 beside a median of
+  // 500 and a mean of 512.5.
+  //
+  // What that produced before this refusal existed: `check constraint
+  // "baseline_pair_with_count" is violated by some row`, naming neither the
+  // rows nor the remedy, with nothing of the migration landing.
+  it("refuses a 0006-era baseline that section 1 would reject, and says which rows and what to do", async () => {
+    const fresh = `${schemaName}_baseline`;
+    const freshDir = mkdtempSync(join(tmpdir(), `${PREFIX}${process.pid}-baseline-`));
+    const admin = openDb(url);
+    await sql.raw(`drop schema if exists ${fresh} cascade`).execute(admin);
+    await sql.raw(`create schema ${fresh}`).execute(admin);
+    await admin.destroy();
+    const freshDb = openDb(urlForSchema(url, fresh));
+    try {
+      const names = readdirSync(MIGRATIONS).filter((n) => n.endsWith(".sql")).sort();
+      const seventh = "0007_retention_aspect_and_baseline_shape.sql";
+      for (const n of names.filter((n) => n < seventh)) {
+        copyFileSync(join(MIGRATIONS, n), join(freshDir, n));
+      }
+      await migrate(freshDb, freshDir);
+      const nsId = randomUUID();
+      await sql`
+        insert into namespace (namespace_id, kind, ns_id, data_key_wrapped, key_shredded_at, created_at)
+        values (${nsId}, 'wallet', 'BASELINEOLD', ${Buffer.alloc(61)}, null, now())
+      `.execute(freshDb);
+      // A count with no robust pair: the shape the merge-base's own fixture
+      // wrote, and one 0006 admits.
+      await sql`
+        insert into baseline (namespace_id, channel, aspect, n, mean, m2,
+                              median_est, mad_est, fast_mean, fast_m2,
+                              slow_mean, slow_m2, updated_at)
+        values (${nsId}, 'volume', 'amount/USDC/out', 20, 100, 0,
+                null, null, 100, 0, 100, 0, now())
+      `.execute(freshDb);
+
+      copyFileSync(join(MIGRATIONS, seventh), join(freshDir, seventh));
+      const refused = await migrate(freshDb, freshDir).then(() => null, (e: unknown) => e);
+      expect((refused as Error | null)?.message ?? "").toMatch(/1 existing baseline row\(s\)/);
+      expect((refused as Error).message).toMatch(/reset them/);
+      // And nothing of the migration landed, which is what makes the message
+      // the operator's only information.
+      const row = await freshDb.selectFrom("schema_migration").select(["filename"])
+        .where("filename", "=", seventh).executeTakeFirst();
+      expect(row).toBeUndefined();
+
+      // Reset the row the message names, and the migration applies.
+      await sql`
+        update baseline set n = 0, mean = 0, m2 = 0, fast_mean = 0, fast_m2 = 0,
+                            slow_mean = 0, slow_m2 = 0, median_est = null, mad_est = null
+         where namespace_id = ${nsId}`.execute(freshDb);
+      await migrate(freshDb, freshDir);
+      const applied = await freshDb.selectFrom("schema_migration").select(["filename"])
+        .where("filename", "=", seventh).executeTakeFirst();
+      expect(applied).toBeDefined();
+    } finally {
+      await freshDb.destroy();
+      const cleanup = openDb(url);
+      await sql.raw(`drop schema if exists ${fresh} cascade`).execute(cleanup);
+      await cleanup.destroy();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("runs over an empty observation table, even with other rows present", async () => {
     const fresh = `${schemaName}_fresh`;
-    const freshDir = mkdtempSync(join(tmpdir(), `${PREFIX}fresh-`));
+    // The pid goes FIRST, before `fresh`, because the sweep reads the pid off
+    // the front of the name and a directory with no pid there is swept as a
+    // leftover. This one had no pid at all when the sweep learned about pids:
+    // the main directory above got one and this did not, so a concurrent run
+    // of this file still deleted it mid-test -- measured, by a sibling agent
+    // running the same file against its own database while this one ran.
+    // Half a fix reads exactly like a whole one from inside.
+    const freshDir = mkdtempSync(join(tmpdir(), `${PREFIX}${process.pid}-fresh-`));
     const admin = openDb(url);
     await sql.raw(`drop schema if exists ${fresh} cascade`).execute(admin);
     await sql.raw(`create schema ${fresh}`).execute(admin);
@@ -205,22 +282,29 @@ describe("the suite's own leftovers", () => {
 describe("the temp-directory sweep", () => {
   it("removes a dead run's directory and leaves a living one's alone", () => {
     const probe = `nnt-sweepprobe-${randomUUID().slice(0, 8)}-`;
+    // Two names this process owns, not one: every directory this suite creates
+    // under a swept prefix must carry the pid, and the one that did not was
+    // found by a concurrent run deleting it rather than by this test.
+
     // A pid that is certainly gone: a child run to completion.
     const dead = spawnSync(process.execPath, ["-e", ""]).pid!;
     expect(dead).toBeGreaterThan(0);
     const mine = join(tmpdir(), `${probe}${process.pid}-live`);
+    const mineToo = join(tmpdir(), `${probe}${process.pid}-fresh-live`);
     const theirs = join(tmpdir(), `${probe}${dead}-stale`);
     // A name with no pid at all is a leftover from before this rule, and is
     // swept: otherwise the old directories never go away.
     const nameless = join(tmpdir(), `${probe}leftover`);
-    for (const d of [mine, theirs, nameless]) mkdirSync(d, { recursive: true });
+    for (const d of [mine, mineToo, theirs, nameless]) mkdirSync(d, { recursive: true });
     try {
       const swept = sweepTempDirs(probe);
       const left = readdirSync(tmpdir()).filter((n) => n.startsWith(probe));
-      expect(left).toEqual([`${probe}${process.pid}-live`]);
+      expect(left.sort()).toEqual([
+        `${probe}${process.pid}-fresh-live`, `${probe}${process.pid}-live`,
+      ].sort());
       expect(swept).toBe(2);
     } finally {
-      for (const d of [mine, theirs, nameless]) rmSync(d, { recursive: true, force: true });
+      for (const d of [mine, mineToo, theirs, nameless]) rmSync(d, { recursive: true, force: true });
     }
   });
 });

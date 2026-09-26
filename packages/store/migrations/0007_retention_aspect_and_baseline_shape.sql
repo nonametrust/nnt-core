@@ -49,6 +49,42 @@ begin
   end if;
 end $$;
 
+-- And the second thing that cannot be added quietly beside existing rows:
+-- section 1's two baseline checks. `baseline` is one of the four tables that
+-- CAN be non-empty when the refusal above passes -- a baseline needs no
+-- observation row to exist -- and a database that ran the pre-branch code
+-- holds exactly the rows section 1 refuses. The merge-base's `baseline.ts`
+-- documented `medianEst` and `madEst` as "null until an estimator has
+-- produced them" and its own fixture wrote `count: 7, mean: 512.5,
+-- medianEst: 500`, stored as given.
+--
+-- Section 1's comment already accepts that such a row surfaces as "the 23514
+-- naming the constraint rather than the preamble's refusal". Measured over a
+-- planted 0006-era database, that is not enough: the message is
+-- `check constraint "baseline_pair_with_count" is violated by some row`, which
+-- names neither the rows nor the remedy, and NOTHING of this migration lands
+-- -- no ledger row, no `tag.aspect`, no `namespace_key` -- so an operator is
+-- left with a failed deploy and a constraint name.
+--
+-- There is no honest backfill. The robust pair cannot be derived from Welford
+-- state, and `median_est := mean` would be a fabrication that the equality
+-- check would then happily accept. `ADD CONSTRAINT ... NOT VALID` would apply
+-- the migration and leave rows M3's read path throws on, which is what section
+-- 1 exists to prevent. So this refuses, the way the observation half refuses,
+-- and says what to do.
+do $$
+declare bad bigint;
+begin
+  select count(*) into bad from baseline
+   where (n = 0) <> (median_est is null)
+      or (median_est is null) <> (mad_est is null)
+      or (median_est is not null and median_est <> mean);
+  if bad > 0 then
+    raise exception
+      'migration 0007 adds the two baseline shapes M2 decided, and % existing baseline row(s) do not have them: a row with a count but no robust pair, a half pair, or a location estimate that is not the mean. There is no derivation for the missing half, so reset them (n = 0, mean = 0, m2 = 0, the fast and slow moments 0, median_est and mad_est null) and re-run; select them with: select namespace_id, channel, aspect from baseline where (n = 0) <> (median_est is null) or (median_est is null) <> (mad_est is null) or (median_est is not null and median_est <> mean)', bad;
+  end if;
+end $$;
+
 -- === 1. baseline: the two shapes M2's arithmetic refuses (Task 1) ============
 --
 -- 0006 landed this table with its own comment saying that "whether m2 is zero

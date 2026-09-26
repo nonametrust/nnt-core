@@ -69,6 +69,27 @@ export class WriteInsideTransaction extends StoreError {}
 // constraint and retry, which is the correct response to 40P01 and the
 // wrong one to almost everything else this store raises.
 export class Deadlocked extends StoreError {}
+// 55P03 and 57014: an operator's `lock_timeout` or `statement_timeout`
+// cancelling a statement this store was waiting on. Neither is ours to
+// allocate and neither is a defect -- section 4 of `0007` tells the hand-run
+// migration path to set one on purpose, and a lock wait bounded by policy is
+// what a healthy operator does.
+//
+// Mapped because an unmapped one is worse than either. Measured against a
+// server with `lock_timeout = 50ms`: an `append` queued behind an erasure's
+// row lock came back with a raw driver error carrying `code: '55P03'` and a
+// message about `PL/pgSQL function observation_target_writable()` -- from
+// inside this store's own trigger -- where the caller was told to expect
+// `NamespaceShredded`. Under the same setting BOTH sides of a deadlock get
+// 55P03 and `Deadlocked` never fires at all. Nothing was written wrongly in
+// any case; the transaction aborts. What was wrong is that a caller catching
+// this package's classes caught nothing.
+//
+// One class for both, because the caller's answer is the same: the work did
+// not happen, the reason is a policy and not a rule, and retrying is
+// reasonable if the policy allows time. Distinct from `Deadlocked` because a
+// deadlock says two callers collided and this says one waited too long.
+export class Cancelled extends StoreError {}
 // Raised in TypeScript, so it carries no SQLSTATE. (NamespaceShredded used
 // to be the comparison here and no longer is: NNT08 maps to it since the
 // erasure gate, so it arrives both ways.) It
@@ -169,6 +190,8 @@ const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreErro
   // exactly that, so a caller has one thing to catch whether the month died
   // before the read or before the write.
   NNT09: PayloadExpired,
+  "55P03": Cancelled,
+  "57014": Cancelled,
   // Postgres's own, not one this schema allocated.
   "40P01": Deadlocked,
 };
