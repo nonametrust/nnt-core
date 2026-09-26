@@ -1252,18 +1252,30 @@ describe("a re-delivery whose payload cannot be opened", () => {
           decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
         )`.execute(db).then(() => null, (e: unknown) => e);
 
+      // Sixty polls of fifty milliseconds, and the release in a `finally`,
+      // for the reason its sibling forty lines up spells out: at a hundred
+      // the poll budget equalled this test's own timeout, so a predicate
+      // that never matched killed the test by TIMING OUT instead of by its
+      // named assertion -- the message below never printed -- and the
+      // erasing transaction, never released, then wedged afterAll's schema
+      // drop behind it. Measured by breaking the predicate on purpose: 31.6
+      // seconds against a 1.7-second baseline, and the schema still there
+      // afterwards. The sibling was written this way and this one was not.
       let blocked = false;
-      for (let i = 0; i < 100 && !blocked; i++) {
-        const waiting = await sql<{ n: string }>`
-          select count(*)::text as n from pg_stat_activity
-          where datname = current_database() and wait_event_type = 'Lock'
-            and query ilike '%insert into observation%'`.execute(db);
-        blocked = waiting.rows[0]!.n !== "0";
-        if (!blocked) await new Promise((r) => setTimeout(r, 50));
+      try {
+        for (let i = 0; i < 60 && !blocked; i++) {
+          const waiting = await sql<{ n: string }>`
+            select count(*)::text as n from pg_stat_activity
+            where datname = current_database() and wait_event_type = 'Lock'
+              and query ilike '%insert into observation%'`.execute(db);
+          blocked = waiting.rows[0]!.n !== "0";
+          if (!blocked) await new Promise((r) => setTimeout(r, 50));
+        }
+      } finally {
+        go();
       }
       expect(blocked, "the insert never queued behind the erasure's own lock mode").toBe(true);
 
-      go();
       await erasing;
       expect(mapPgError(await planted)).toBeInstanceOf(NamespaceShredded);
     } finally {

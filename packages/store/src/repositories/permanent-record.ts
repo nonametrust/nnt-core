@@ -138,6 +138,19 @@ export class PermanentRecordRepository {
             sql<string>`${input.namespaceId}::uuid::text`.as("canonical_namespace_id"),
           ])
           .where("observation.observation_id", "=", input.observationId)
+          // The namespace row is LOCKED, not merely read. `key_shredded_at`
+          // below is a check, and a check without a lock is a window: review
+          // committed an erasure between this read and the insert and got a
+          // permanent copy of an erased counterparty's evidence, with no
+          // refusal and no block. A second check after the write would have
+          // the same window one statement further along.
+          //
+          // `for no key update` is the mode `shred` itself takes, so the two
+          // serialise; the observation's own row is deliberately left
+          // unlocked (`of namespace`), because it is append-only and nothing
+          // may move it anyway. The foreign key does not close this: its
+          // FOR KEY SHARE does not conflict with FOR NO KEY UPDATE.
+          .modifyEnd(sql`for no key update of namespace`)
           .executeTakeFirst();
         if (!source) throw new ObservationNotFound(`no observation ${input.observationId} to promote`);
         if (source.key_shredded_at !== null) {

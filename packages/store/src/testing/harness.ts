@@ -67,9 +67,41 @@ export async function withSchema(name: string): Promise<{ db: Db; done: () => Pr
  * per killed run. Measured: eight had built up before this existed.
  */
 export function sweepTempDirs(prefix: string): number {
-  const stale = readdirSync(tmpdir()).filter((n) => n.startsWith(prefix));
+  const stale = readdirSync(tmpdir())
+    .filter((n) => n.startsWith(prefix))
+    .filter((n) => !isLiveRun(n.slice(prefix.length)));
   for (const name of stale) rmSync(join(tmpdir(), name), { recursive: true, force: true });
   return stale.length;
+}
+
+/**
+ * Whether a directory name's leading `<pid>-` belongs to a process that is
+ * still running.
+ *
+ * The prefix alone is not ownership. The temp directory is per MACHINE while
+ * the test databases are per run, so two concurrent runs of the same file --
+ * two review agents, or a shard -- swept each other's LIVE working directory
+ * on entry. Measured: three of three concurrent pairs failed before this
+ * predicate and three of three passed after. It is the same shape as the
+ * `pg_locks` filter that had to be scoped to `current_database()`, and the
+ * same lesson: anything machine-wide or cluster-wide needs a predicate that
+ * names US.
+ *
+ * `kill(pid, 0)` signals nothing and only asks whether the pid exists. EPERM
+ * means it exists and belongs to another user, which is still alive. A name
+ * with no leading pid is a leftover from before this rule and is swept, or
+ * the old directories would never go away. A recycled pid makes a dead run's
+ * directory survive one sweep longer, which is the harmless direction.
+ */
+function isLiveRun(suffix: string): boolean {
+  const pid = Number(suffix.split("-")[0]);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as { code?: string }).code === "EPERM";
+  }
 }
 
 /**

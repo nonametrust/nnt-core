@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdtempSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -28,7 +29,7 @@ beforeAll(async () => {
   // they accumulate; the schema harness drops on ENTRY for the same reason,
   // so nothing depends on teardown having happened.
   sweepTempDirs(PREFIX);
-  dir = mkdtempSync(join(tmpdir(), PREFIX));
+  dir = mkdtempSync(join(tmpdir(), `${PREFIX}${process.pid}-`));
 });
 
 afterAll(async () => {
@@ -163,5 +164,36 @@ describe("the suite's own leftovers", () => {
     expect(readdirSync(tmpdir()).filter((n) => n.startsWith(PREFIX)).length).toBeGreaterThan(0);
     sweepTempDirs(`${PREFIX}stale-probe`);
     expect(readdirSync(tmpdir()).filter((n) => n.startsWith(`${PREFIX}stale-probe`))).toEqual([]);
+  });
+});
+
+// `sweepTempDirs` removes leftovers by PREFIX on entry, and until the branch
+// review that was every directory carrying the prefix, with no ownership
+// check: two concurrent runs of this file -- two review agents, or a shard --
+// deleted each other's LIVE working directory, and the suite could not tell
+// the correct behaviour from the broken one. Per-database isolation does not
+// cover it, because the temp directory is per MACHINE. The directory name now
+// carries the pid that made it and the sweep leaves a living process's
+// directory alone.
+describe("the temp-directory sweep", () => {
+  it("removes a dead run's directory and leaves a living one's alone", () => {
+    const probe = `nnt-sweepprobe-${randomUUID().slice(0, 8)}-`;
+    // A pid that is certainly gone: a child run to completion.
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid!;
+    expect(dead).toBeGreaterThan(0);
+    const mine = join(tmpdir(), `${probe}${process.pid}-live`);
+    const theirs = join(tmpdir(), `${probe}${dead}-stale`);
+    // A name with no pid at all is a leftover from before this rule, and is
+    // swept: otherwise the old directories never go away.
+    const nameless = join(tmpdir(), `${probe}leftover`);
+    for (const d of [mine, theirs, nameless]) mkdirSync(d, { recursive: true });
+    try {
+      const swept = sweepTempDirs(probe);
+      const left = readdirSync(tmpdir()).filter((n) => n.startsWith(probe));
+      expect(left).toEqual([`${probe}${process.pid}-live`]);
+      expect(swept).toBe(2);
+    } finally {
+      for (const d of [mine, theirs, nameless]) rmSync(d, { recursive: true, force: true });
+    }
   });
 });

@@ -480,6 +480,82 @@ describe("the permanent copy outlives its month", () => {
     expect((refused as Error).constructor.name).toBe("ZodError");
   });
 
+  // The erasure gate section 6 gives `observation` has no counterpart on
+  // `permanent_record`, and `promote` reads `key_shredded_at` without
+  // locking the row it read it from. An erasure committing in that window
+  // wrote a permanent copy of an erased counterparty's evidence: measured,
+  // no refusal and no block, one row committed. The FK's FOR KEY SHARE does
+  // not conflict with the shred's FOR NO KEY UPDATE, so the foreign key does
+  // not close it either.
+  //
+  // The fix is the lock, not a second check: a check re-read after the write
+  // would still have a window. `for no key update of namespace` on the
+  // source SELECT makes the read and the write one serialised unit against
+  // `shred`, which takes the same mode.
+  it("refuses a promotion whose namespace is erased between its read and its write", async () => {
+    const other = new Kysely<Schema>({
+      dialect: new PostgresDialect({
+        pool: new pg.Pool({ connectionString: withIsoDates(urlForSchema(requireTestUrl(), "permrec_test")), max: 2 }),
+      }),
+    });
+    try {
+      const c = fixedClock(new Date("2027-04-02T00:00:00.000Z"));
+      const nsRepo = new NamespaceRepository(db, ring, c, grace7);
+      const obs = new ObservationRepository(db, nsRepo, c, grace7);
+      const o = storedObservation(await obs.append(anEventFor("PERMRACE", "op:perm:race")));
+      const nsId = (await nsRepo.find("wallet", "PERMRACE"))!.namespaceId;
+
+      // An erasure holding its lock, released only once the promotion is
+      // demonstrably queued behind it.
+      let go!: () => void, took!: () => void;
+      const held = new Promise<void>((r) => { go = r; });
+      // The HOLDER signals, so this half needs no poll at all. Polling
+      // `pg_stat_activity` for "something is idle in transaction" was the
+      // first version and it is wrong for a reason worth keeping: vitest runs
+      // test FILES in parallel against one database, so a sibling file's
+      // backend satisfied the predicate, the promotion fired before the shred
+      // had its lock, and the promotion won. `datname = current_database()`
+      // is not enough when the siblings share the database -- one level
+      // deeper than the `pg_locks` lesson, same shape.
+      const lockTaken = new Promise<void>((r) => { took = r; });
+      const erasing = other.transaction().execute(async (trx) => {
+        await new NamespaceRepository(trx, ring, c, grace7).shred(nsId);
+        took();
+        await held;
+      });
+      await lockTaken;
+      const promoting = new PermanentRecordRepository(db, ring, c, grace7).promote({
+        observationId: o.observationId!, namespaceId: nsId, rescuedBy: null, confidence: 0.7,
+      }).then(() => null, (e: unknown) => e);
+
+      let blocked = false;
+      try {
+        for (let i = 0; i < 60 && !blocked; i++) {
+          const waiting = await sql<{ n: string }>`
+            select count(*)::text as n from pg_stat_activity
+            where datname = current_database() and wait_event_type = 'Lock'
+              -- This exact clause appears in promote's source SELECT and
+              -- nowhere else, so a sibling file cannot satisfy it.
+              and query ilike '%for no key update of namespace%'`.execute(db);
+          blocked = waiting.rows[0]!.n !== "0";
+          if (!blocked) await new Promise((r) => setTimeout(r, 50));
+        }
+      } finally {
+        go();
+      }
+      await erasing;
+      // Non-vacuous: if the promotion never queued, what follows proves
+      // nothing about ordering.
+      expect(blocked, "the promotion never queued behind the erasure's lock").toBe(true);
+      expect(await promoting).toBeInstanceOf(NamespaceShredded);
+      const rows = await sql<{ n: string }>`
+        select count(*)::text as n from permanent_record where namespace_id = ${nsId}`.execute(db);
+      expect(rows.rows[0]!.n).toBe("0");
+    } finally {
+      await other.destroy();
+    }
+  }, 20_000);
+
   it("reads the observation on its OWN transaction, not on the pool", async () => {
     // R21's point, and the only thing that can see it. Under READ COMMITTED
     // a pool read returns the same committed rows, so swapping `trx` for the
