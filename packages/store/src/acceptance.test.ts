@@ -541,9 +541,27 @@ describe("4. the audit chain verifies", () => {
 // that hold in isolation and not in composition.
 describe("5. retention runs, and the rescue survives it", () => {
   // Day 0 is 31 August and day 12 is 12 September, so this story spans two
-  // calendar months and therefore two month keys per namespace. Both are past
-  // a three-day grace by now: August closed on 1 September and expired on the
-  // 4th, September closes on 1 October and expires on the 4th.
+  // calendar months and therefore two month keys per namespace. August closed
+  // on 1 September and expired on the 4th; September closes on 1 October and
+  // expires on the 4th.
+  //
+  // The sweep therefore runs TWICE, and the two days are the point. On day
+  // thirty-three August is past its grace and September has a day left, so a
+  // sweep that ignored `expires_at` would be visible here and nowhere else in
+  // this file. On day thirty-five September's grace has run out, and a sweep
+  // that ignored `key_wrapped is not null` would hand August back a second
+  // time. A single sweep on day thirty-five proves neither, because by then
+  // every month in the database is expired -- which is what stood here, with
+  // a name that claimed both rules. Both mutants die in the unit suite too;
+  // this file is where they have to die in COMPOSITION.
+  //
+  // Note what the gap between the two days means and does not mean: from day
+  // four to day thirty-three August is expired and still readable, because
+  // `openPeriodKey` asks whether the key was shredded and never asks the
+  // clock. Expiry is what the sweep acts on, not a state the store enforces
+  // on read; the sweep is the caller's to run, and until it runs nothing has
+  // happened.
+  const FIRST_SWEEP_DAY = 33; // 3 October 2026, one day inside September's grace
   const SWEEP_DAY = 35; // 5 October 2026
 
   it("holds two months for each namespace before anything is swept", async () => {
@@ -561,28 +579,40 @@ describe("5. retention runs, and the rescue survives it", () => {
     expect(await namespaces.periodsOf(wallet)).toEqual(["2026-08-01"]);
   });
 
-  it("day thirty-five: the sweep expires every month past its grace, and says which", async () => {
-    advanceTo(day(SWEEP_DAY, "03:00"));
+  it("day thirty-three: takes the two Augusts and leaves September standing, with a day of its grace to run", async () => {
+    advanceTo(day(FIRST_SWEEP_DAY, "03:00"));
     const wallet = (await namespaces.find(WALLET.kind, WALLET.id))!.namespaceId;
-    // Captured here, one line before the sweep, rather than at the end of
-    // criterion four: the tag assertion two tests below has to compare
-    // against the instant before expiry, and reading it from another
-    // describe block made that depend on the order of two blocks instead of
-    // on one line.
+    // Captured here, one line before the FIRST sweep, rather than at the end
+    // of criterion four: the tag assertion below has to compare against the
+    // instant before expiry, and reading it from another describe block made
+    // that depend on the order of two blocks instead of on one line.
     tagVersionsBeforeSweep = await tagRowVersions();
     const { shredded } = await namespaces.expirePeriods();
-    // The whole list, per row, sorted as the repository sorts it. Three rows:
-    // the provider's two months and the wallet's one. Neither namespace was erased on
-    // request, so every one of them is a retention expiry and the flag says
-    // so -- the mixed case is exercised in the unit suite.
     expect(shredded).toEqual([
       { namespaceId: provider, period: "2026-08-01", namespaceErasedAtSweep: false },
-      { namespaceId: provider, period: "2026-09-01", namespaceErasedAtSweep: false },
       { namespaceId: wallet, period: "2026-08-01", namespaceErasedAtSweep: false },
-    ].sort((a, b) => (a.namespaceId === b.namespaceId
-      ? a.period.localeCompare(b.period)
-      : a.namespaceId.localeCompare(b.namespaceId))));
-    // The store wrote no audit row for any of it. The nightly job's
+    ].sort((a, b) => a.namespaceId.localeCompare(b.namespaceId)));
+    // And the day-twelve observations still read, which is the other half of
+    // "leaves September standing": the grace is a promise about readability,
+    // so asserting only the sweep's return would let a sweep that shredded
+    // September and forgot to mention it pass.
+    for (const name of ["movedAway", "movedBack", "largeQuote"] as const) {
+      const still = await observations.get(idOf(stored[name]!));
+      expect(still.observationId, name).toBe(idOf(stored[name]!));
+      expect("observedAt" in still ? still.observedAt : "", name).toMatch(/^2026-09-/);
+    }
+  });
+
+  it("day thirty-five: September's grace runs out, the sweep takes it and hands back no August twice", async () => {
+    advanceTo(day(SWEEP_DAY, "03:00"));
+    const { shredded } = await namespaces.expirePeriods();
+    // One row, and the two Augusts are NOT in it. Neither namespace was
+    // erased on request, so this is a retention expiry and the flag says so
+    // -- the mixed case is exercised in the unit suite.
+    expect(shredded).toEqual([
+      { namespaceId: provider, period: "2026-09-01", namespaceErasedAtSweep: false },
+    ]);
+    // The store wrote no audit row for either sweep. The nightly job's
     // `periods.expired` entry is M4's to write from exactly this return
     // value, which is why the sweep returns it at all.
     expect(journal.filter((j) => j.kind.startsWith("periods"))).toEqual([]);
@@ -611,11 +641,26 @@ describe("5. retention runs, and the rescue survives it", () => {
     // not, because a promotion re-sealed them under the namespace key while
     // the month keys were what expired.
     expect(promoted).toHaveLength(2);
+    // Read out of the RESCUE after the sweep, not off the array criterion
+    // three filled before it. The previous version of this test checked only
+    // `observationId` and then asserted the date from `promoted`, so a
+    // `read` that returned any date at all passed: measured with a `read`
+    // stamping 2099, twenty of twenty green. "Dated day twelve" is the
+    // card's sentence, so it is the half that has to come back from disk.
+    const rescuedDates: (string | null)[] = [];
+    const recordDates: string[] = [];
     for (const record of promoted) {
       const rescued = await records.read(record.recordId);
       expect(rescued.observationId).toBe(record.observationId);
+      rescuedDates.push("observedAt" in rescued ? rescued.observedAt : null);
+      // And the metadata row, re-read after the sweep rather than
+      // remembered from before it.
+      recordDates.push((await records.get(record.recordId)).originalDatedAt.toISOString());
       await expect(observations.get(record.observationId)).rejects.toBeInstanceOf(PayloadExpired);
     }
+    const dayTwelve = ["2026-09-12T08:14:00.000Z", "2026-09-12T16:47:00.000Z"];
+    expect(rescuedDates).toEqual(dayTwelve);
+    expect(recordDates).toEqual(dayTwelve);
     expect(promoted.map((r) => r.originalDatedAt.toISOString().slice(0, 10)))
       .toEqual(["2026-09-12", "2026-09-12"]);
   });
@@ -627,12 +672,21 @@ describe("5. retention runs, and the rescue survives it", () => {
     expect(await tags.listLive(provider)).toHaveLength(1);
   });
 
-  it("verifies the chain and re-verifies every seal", async () => {
+  it("verifies the chain, and re-sealing every day after the sweep moves nothing", async () => {
     expect(await chain.verify()).toEqual({ ok: true });
     // Sealing a day that is already sealed is a no-op rather than an error,
     // so the nightly job can re-run over a range it has seen. Re-sealed
     // here across the whole scenario, after the sweep, to show that expiry
     // moved no seal.
+    //
+    // What this does NOT prove, and used to claim by its name: that the
+    // re-seal VERIFIES anything. `sealDay`'s existing-seal branch checks the
+    // sealed entry's hash and the seal's HMAC, and replacing both checks
+    // with `true` leaves every test in this file green -- the branch is
+    // taken, but nothing here can tell a check from a skip. Those two rules
+    // are held in `chain.test.ts` by "refuses to re-seal a day whose sealed
+    // entry was rewritten" and "...whose seal no longer verifies", which is
+    // where a corrupted seal can be planted. Measured, both directions.
     const before = await db.selectFrom("audit_day").select(["day", "terminal_seq"])
       .orderBy("day").execute();
     for (let n = 0; n <= 21; n++) await chain.sealDay(dayString(n));
@@ -668,5 +722,17 @@ describe("5. retention runs, and the rescue survives it", () => {
       "observation.appended", "brief.read",
       "trigger.recorded", "record.promoted", "record.promoted",
     ]);
+    // And the DATABASE agrees with the journal, which is the half that
+    // carries the claim. `journal` grows only when this file calls
+    // `audit()`, so a store method that appended an entry of its own would
+    // leave the array untouched and the assertion above green. Measured
+    // rather than reasoned: an `AuditChain.append` planted at the top of
+    // `expirePeriods` passed 462 of 463 tests, and the one that went red did
+    // so because it happened to call the sweep inside a transaction and
+    // R21's guard fired -- a test of another rule entirely, which is not
+    // evidence for this one. This comparison is what refuses the plant.
+    const entries = await sql<{ kind: string }>`
+      select kind from audit_entry order by seq`.execute(db);
+    expect(entries.rows.map((r) => r.kind)).toEqual(journal.map((j) => j.kind));
   });
 });

@@ -1249,13 +1249,22 @@ describe("expirePeriods: expiry is unreadability and nothing else", () => {
     // swept by now: without this the sweep below returns nothing and the
     // assertion that it reached something would be the only thing failing.
     await at("2027-08-08T00:00:00.000Z").observations.append(anEvent("SWEEPCHAIN", "op:sweep:chain"));
+    // The whole table before the sweep, so that "alone" can mean the same
+    // rows and not merely "some rows". `toBeGreaterThan(0)` was what stood
+    // here, and it accepts a row the sweep wrote itself: an
+    // `AuditChain.append` planted at the top of `expirePeriods` survived all
+    // 463 tests but one, and that one went red for an unrelated reason.
+    const before = await sdb.selectFrom("audit_entry")
+      .select(["seq", "kind", "entry_sha256"]).orderBy("seq").execute();
     const swept = await at("2028-01-01T00:00:00.000Z").namespaces.expirePeriods();
     // Non-vacuous in both directions: the chain has entries, and the sweep
     // reached something. A verify() over an empty chain is ok and proves
     // nothing.
     expect(swept.shredded.length).toBeGreaterThan(0);
-    const entries = await sdb.selectFrom("audit_entry").select(["seq"]).execute();
-    expect(entries.length).toBeGreaterThan(0);
+    expect(before.length).toBeGreaterThan(0);
+    const after = await sdb.selectFrom("audit_entry")
+      .select(["seq", "kind", "entry_sha256"]).orderBy("seq").execute();
+    expect(after).toEqual(before);
     expect(await chain.verify()).toEqual({ ok: true });
   });
 });
