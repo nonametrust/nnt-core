@@ -76,6 +76,13 @@ function advanceTo(instant: Date): void {
 const POLICY = "v0";
 // The calibration input M2 owns. A week, as tag.test.ts and strength.test.ts
 // assume, so that the day-twelve tag has halved once by day nineteen.
+//
+// NOT the product's number: `CALIBRATION_V0.halfLifeMs` in the tagging package
+// is fourteen days. The store may not import tagging, so this file chooses its
+// own and the choice is legitimate -- but anyone reading this story as THE
+// scenario is reading a seven-day half-life that the engine does not use, and
+// "halved once by day nineteen" is a property of this test and not of the
+// product. M3's acceptance scenario has to pick one of the two and say which.
 const HALF_LIFE = 7 * DAY;
 
 // The provider is an endpoint, as in the fixtures. Its payment wallet is a

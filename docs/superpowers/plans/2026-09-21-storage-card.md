@@ -843,12 +843,22 @@ had, which is the failure this section exists to avoid.
   conflict with each other so concurrent appends to one namespace do not
   queue -- a property only a timing test could see, and a timing test for a
   performance property is how flaky suites start. Left unheld and said so.
-- **`index.ts` exports more than its own stated rule allows.** Its header says
-  "Repositories and errors are exported; the Kysely instance, the connection
-  and the SQL are not", and `export *` carries `Schema`, `Db` and `withIsoDates`
-  out with them. Either the sentence or the exports should change; which one is
-  M3's to say, because M3 is the first consumer and the answer depends on what
-  it needs.
+- **`index.ts` exports LESS than a consumer needs, and the entry that stood
+  here said the opposite.** It claimed `export *` carries `Schema`, `Db` and
+  `withIsoDates` out past the header's rule. Measured on the BUILT package
+  during M3's survey: `dist/index.d.ts` contains none of those four names.
+  `db.js` is not exported at all, and every repository constructor takes a
+  `Db` — so the first consumer cannot construct a repository through the
+  declared surface, which is the reverse problem. Two real facts sit under the
+  wrong one: `package.json` has no `exports` field, so
+  `@nonametrust/store/dist/db.js` is deep-importable and the surface is a
+  convention rather than a boundary; and `retention.ts` is already exported
+  with a comment explaining that without it "the package's public surface
+  cannot construct its own repository", which is the same argument one value
+  short of its conclusion. M3 decides: export `openDb` and the `Db` type, or
+  deep-import and record it. **The lesson is the entry itself** -- it was
+  written from reading `index.ts` and not from reading what shipped, on a card
+  whose whole method is the opposite.
 - **`expiresAt` is exported and validates nothing.** Reachable from outside
   the store, where no constructor has asserted the policy. The docstring already
   admits this and explains why it is safe INSIDE the store; what it does not
@@ -857,6 +867,29 @@ had, which is the failure this section exists to avoid.
   and `migrate`'s own key live in one 64-bit space with nothing recording the
   allocation. No collision is reachable today; the prose that implies the space
   is owned is what is wrong.
+- **`BaselineRepository.upsert` loses a concurrent fold, silently, and this is
+  measured rather than suspected.** It is `insert ... on conflict do update set`
+  with no predicate, so it is last-writer-wins. Measured during M3's survey on
+  its own database: two writers each read `count = 10`, each folded one
+  observation and upserted `count = 11` with a different mean, both statements
+  succeeded, and the row ended at `count = 11` with one observation's
+  contribution gone and no error anywhere. A lost fold is the duplicated-trace
+  defect pointing the other way.
+  NOT FIXED HERE, and the reason is that it is latent rather than live:
+  nothing in `packages/*/src` outside tests calls `upsert` or constructs this
+  repository, so no shipped caller can reach it. It becomes reachable the
+  moment M3's engine folds two observations on one `(namespace, channel,
+  aspect)` pair concurrently, which is the ordinary case, so **it is M3's to
+  fix and not M3's to discover.** Three options with different prices: a
+  per-pair advisory lock around read-decide-write in the engine (but the
+  advisory key space is shared and unallocated, see the entry above, and R20
+  measured deadlocks there); an optimistic `n` on `upsert` raising a
+  `BaselineStale` class, symmetric with `TagRefreshStale` -- a store change, and
+  the retry loop then has two stale signals to handle; or accepting the loss,
+  which is not acceptable. Note the interaction with the tag's own retry: a
+  retry that re-reads the live tag but not the baseline folds the same
+  observation in twice.
+
 - **`AppendResult` types the observation's identity differently in each arm.**
   The unreadable arm declares `observationId: string`; the readable arms carry
   an `Observation` whose `observationId` is optional. A caller narrowing on

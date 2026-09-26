@@ -260,13 +260,6 @@ export class TagRepository {
   }
 
   /**
-   * The namespace's tags, newest first, optionally only those tagged at or
-   * after `since`. In this milestone every stored tag is live, because
-   * nothing retires one: expiry from the bounded window is the nightly job's
-   * operation and arrives with it. The name says what the nightly job will
-   * ask for, so its call site does not change when retirement exists.
-   */
-  /**
    * The live tag on a pair, or null. This is the read M2 needs: its
    * `tagObservation` takes `LiveTagInput | null` for a (namespace, channel,
    * aspect), and without this a caller would pull every live tag in the
@@ -285,6 +278,26 @@ export class TagRepository {
     return row === undefined ? null : toStored(row);
   }
 
+  /**
+   * The namespace's live tags, newest first, optionally only those tagged at
+   * or after `since`. Live means `retired_at is null`, which is what both
+   * readers filter on.
+   *
+   * The docstring that stood here said "in this milestone every stored tag is
+   * live, because nothing retires one". It was true when written, stopped
+   * being true when the storage card added `retired_at` and both readers
+   * began filtering on it, and had drifted up above `findLive` in the
+   * meantime, so it was describing the wrong method as well as the wrong
+   * milestone. What is still true: nothing in this package RETIRES a tag, and
+   * that operation is the nightly job's.
+   *
+   * `since` is owed a decision that is not this milestone's. `tagged_at` now
+   * moves on every refresh, so a window asking "tagged at or after" gets the
+   * LAST refresh and not the opening instant, and the opening instant is
+   * stored nowhere once a tag has been refreshed. Whether a nightly window
+   * wants one or the other is M4's to rule; if it wants the opening instant,
+   * that is a column and therefore a migration.
+   */
   async listLive(namespaceId: string, since?: Date): Promise<StoredTag[]> {
     let q = this.db
       .selectFrom("tag")
