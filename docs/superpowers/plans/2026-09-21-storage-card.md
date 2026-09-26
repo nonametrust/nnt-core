@@ -665,8 +665,18 @@ and the divergence survives review -- this branch already recorded that pair
 as an equivalent mutant. `PERIOD_TEXT` in `namespace.ts` is the shared form.
 
 **Task 7 owed a ruling on already-shredded namespaces. R18 makes it:** the
-sweep reaches them and returns them under `reason: "erased-namespace"` rather
-than filtering them or calling them retention.
+sweep reaches them rather than filtering them, and flags each row with
+`namespaceErasedAtSweep: boolean`.
+
+This line said `reason: "erased-namespace"` until the fourteenth review. That
+is what R18 first proposed and not what it ended up ruling: a union asserts an
+exclusivity the data lacks, and a month whose grace ran out BEFORE its
+namespace was erased is both, so it came back as `erased-namespace` and
+vanished from the retention count. §2b:256-282 records the replacement. Worth
+naming rather than quietly fixing, because §2d is the list that wins over the
+task texts -- so a stale line here outranks the correct one everywhere else,
+which is the failure mode this section exists to prevent, reproduced inside
+the section itself.
 
 **Task 7's first planted violation is already shipped, and the plan names the
 wrong refusal for it.** Task 7's text says a raw early shred is
@@ -747,6 +757,36 @@ and Task 5 say `period` is typed `ColumnType<string, string, never>`; it ships
 as `ColumnType<never, string, never>`, because the read side must not claim a
 type the driver does not return.
 
+**What the close-out review found still stale, after the card shipped.** These
+are corrections to this document, not to the code; the code is what the entry
+describes.
+
+- **The envelope has nine parts, not eight.** R15 added `observationId`. The
+  Goal, F5, the file-structure table, Task 4's "Does", Task 6's title and its
+  acceptance clause all still say eight. R15 acknowledges the change; the task
+  texts were never revisited, which is what §2d is for.
+- **Task 10's "exempting `clock.ts` alone", and F11's "one exemption", are
+  both wrong.** The shipped gate exempts two files by name, `clock.ts` and
+  `migrate.ts`, and the README says two. `migrate.ts` reads the wall clock to
+  stamp a ledger row; exempting it was a decision, and the plan records the
+  count from before that decision.
+- **Task 7's and Task 8's return shapes are superseded.** Task 7 says
+  `{ namespaceId, period }`; R18 added `namespaceErasedAtSweep`. Task 8 says
+  an expired re-delivery answers `expired: true`; R19 made `AppendResult` a
+  three-shape union whose unreadable shape carries `periodExpired` and
+  `namespaceErased` as two independent booleans, for the same reason R18
+  stopped being a union.
+- **Line references that have moved.** Task 11's "the eleven journal kinds at
+  `acceptance.test.ts:392-401`" is now `:664` and the test also compares the
+  `audit_entry` table (fourteenth review). §5's G3 `tag.test.ts:98-121` is
+  `:100-129`; G9's `observation.test.ts:297` is `:340-410`. Every line number
+  in this plan was true when written and none is load-bearing: the names are.
+- **§1 has fourteen findings, and the executor notes say eleven.** F12-F14
+  were added after the notes were written.
+- **§3's "no line in `packages/store/src` names `observedAt`"** is imprecise
+  rather than false: test files name them as fixtures, and the gate exempts
+  tests.
+
 ## 3. Global constraints for every task
 
 - Everything M1 and M2 fixed: Node 22, pnpm, strict TS, `tsconfig.test.json` with `"exclude": []`, build before typecheck, Apache-2.0, English in code, Turkish on the board, no Stellar-shaped id in a tracked file.
@@ -765,16 +805,25 @@ type the driver does not return.
 | `NNT06` | `PeriodKeyAltered` | the `namespace_key` guard |
 | `NNT07` | `TagAltered` | the `tag` guard |
 | `NNT08` | `NamespaceShredded` | the `observation` insert gate (Task 8) |
+| `40P01` | `Deadlocked` | Postgres itself, on any path the store opens a transaction |
 
-Raised in TypeScript, no SQLSTATE: `PayloadExpired`, `SourceRateExceeded`, `TagRefreshStale`.
+`40P01` is not ours to allocate and is in the table because the mapping is:
+the erasure gate of section 6 takes a row lock, so two callers erasing and
+appending in opposite orders can deadlock through the store's own API, and an
+unmapped deadlock surfaces as a driver error with no class. Added by R20/R21's
+round.
+
+Raised in TypeScript, no SQLSTATE: `PayloadExpired`, `SourceRateExceeded`,
+`TagRefreshStale`, and `WriteInsideTransaction` (R21's refusal, raised before
+any statement is sent).
 
 ## File structure
 
 | Path | Responsibility |
 |---|---|
-| `packages/store/migrations/0007_retention_aspect_and_checks.sql` | one file, grown by Tasks 1, 2, 5, 6, 9 in named sections |
+| `packages/store/migrations/0007_retention_aspect_and_baseline_shape.sql` | one file, seven sections, grown by Tasks 1, 2, 4b, 5, 6, 8, 9 |
 | `packages/store/src/retention.ts` (+ test) | `RetentionPolicy`, `RETENTION_V0`, `periodOf`, `periodCloses`, `expiresAt`, `assertRetentionPolicy` |
-| `packages/store/src/crypto.ts` | `wrapUnder`/`unwrapUnder` (the ring's layout under a data key), eight-part `payloadAad`, `permanentAad` |
+| `packages/store/src/crypto.ts` | `wrapUnder`/`unwrapUnder` (the ring's layout under a data key), nine-part `payloadAad` (R15), `permanentAad` |
 | `packages/store/src/repositories/namespace.ts` | `periodKey`, `openPeriodKey`, `expirePeriods` |
 | `packages/store/src/repositories/observation.ts` | producer, period, AAD, `PayloadExpired`, the cap, expired re-delivery |
 | `packages/store/src/repositories/tag.ts` | aspect, `retiredAt`, `open` with `taggedAt`, `findLive`, `refresh(TagRefresh)` |
@@ -963,7 +1012,23 @@ None block the plan. Two rulings above rest on the weakest sources and are the o
 - **R3, the cap's scope** (per producer, on ingest time, sized to the A1 delivery). The alternative, per `(producer, namespace)`, defends a counterparty's competition better and the indexer's delivery worse. Veto before Task 8.
 - **R2, `expires_at` fixed at mint.** The alternative, re-deriving expiry from the policy at each `expirePeriods`, lets a shortened grace apply to old months but puts the number in two places. Veto before Task 5.
 
-One outward-facing item is not a question but must not be forgotten: after this card the whitepaper's "per-source rate limit ... designed and scheduled rather than built" (line 145) is false in the built direction; it belongs on the whitepaper card, not here.
+**Closed on 26 September, and not the way the rule says to close things.** Both
+windows passed without a veto: Task 5 and Task 8 shipped, and a search of this
+repository's documents, all commit messages on the branch and the board found
+no mention of either question outside this plan. Both rulings therefore stand
+as shipped, R3 per producer and R2 fixed at mint.
+
+What went wrong is the asking, not the answer. This section named two windows
+and never said what silence would mean or by when, so nothing distinguishes
+"considered and accepted" from "never read" — and the honest reading is the
+second. Our own rule is that every request states its deadline and what
+silence means; it was followed for the auditor and not here, on our own work,
+where there is no counterparty to keep us to it. Re-derivable if wanted: R3's
+scope changes the cap's binding figure from 646,890 to the busiest single
+account's 187,313 (recorded in `retention.ts` for exactly this purpose), and
+R2 would move `expires_at` out of the table and into `expirePeriods`.
+
+One outward-facing item is not a question but must not be forgotten: after this card the whitepaper's "per-source rate limit ... designed and scheduled rather than built" (line 145) is false in the built direction; it belongs on the whitepaper card, not here. **Still open on 26 September:** `whitepaper-source` HEAD still carries the pre-build sentence, and the 24 September commit that narrowed §6's erasure sentence did not touch line 145.
 
 ---
 
@@ -988,4 +1053,18 @@ One outward-facing item is not a question but must not be forgotten: after this 
 1. Cluster up from Task 1, every task; the M2 constraint does not apply and its absence is not an excuse.
 2. `0007` is one file grown in seven named sections; Task 10's reviewer reads it whole. Never split it into `0008`.
 3. Two board updates during execution, not after: after Task 3 (the refresh and `open` findings, F1 and F2, with the acceptance numbers) and after Task 9 (the retention gate results), and the M3 card's list "carried from M2" gets the F2 line, because M3's engine must pass the decision's `taggedAt` to `open`.
-4. The ledger for this card records R1-R8 with their costs, the eleven findings, and whatever the implementers find that this plan did not; M2's ledger found seven hollow plan tests in eleven tasks and this plan expects the same.
+4. The ledger for this card records R1-R8 with their costs, the fourteen findings, and whatever the implementers find that this plan did not; M2's ledger found seven hollow plan tests in eleven tasks and this plan expects the same.
+
+**What actually happened against notes 3 and 4, recorded 26 September.** Note
+3 is half done: the after-Task-3 board update exists (22 September, F1 and F2
+with the acceptance numbers); the after-Task-9 update was never written, the
+card still reads "Ready" with a cap note saying "real margin 1.55" that the
+code contradicts, and the M3 card never received its F2 line. Note 4 is done
+in the wrong file: `docs/superpowers/ledgers/` holds M0, M1 and M2 and no
+entry for this card, because §2b, §2c and §2d were written as the card ran and
+absorbed what a ledger would have carried. That is a defensible place for the
+reasoning and an indefensible place to look for it — every other milestone has
+a ledger and a reader of this repository will look there. The ledger is
+written at `2026-09-26-storage-card-decisions.md` and points back here rather
+than restating; these two paragraphs are what a close-out review found, not
+what the executor reported, which is the point.
