@@ -69,8 +69,17 @@ const CLOCK_FORMS: ReadonlyArray<readonly [string, (line: string, inSql: boolean
   // `current_timestamp`.
   [
     "SQL clock keyword",
-    (l) => /(?<![.\w])(current_timestamp|clock_timestamp|current_date|localtimestamp)\b/i.test(l),
+    (l) =>
+      /(?<![.\w])(current_timestamp|clock_timestamp|transaction_timestamp|statement_timestamp|current_date|localtimestamp)\b/i.test(l),
   ],
+  // `age(x)` with ONE argument is `current_date - x`: the wall clock wearing
+  // a subtraction, and the only server clock on this list that does not have
+  // "timestamp" or "date" in its name. Two arguments is a difference between
+  // two given instants and reads no clock, so the pattern insists there is no
+  // comma before the closing parenthesis -- which also means it does not fire
+  // on `age(` at the end of a line, and a multi-line `age(` is a form this
+  // package does not write. Said here rather than left to be discovered.
+  ["one-argument SQL age", (l) => /(?<![.\w])age\s*\([^(),]*\)/i.test(l)],
   // A bare `now()` is NOT unambiguous, and the first version of this pattern
   // was wrong about that in a way that made another test vacuous: `now():
   // Date;` in the `Clock` interface matched it, so `clock.ts` always looked
@@ -124,7 +133,38 @@ function sourceFiles(): SourceFile[] {
 function code(text: string): string {
   return text
     .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
-    .replace(/\/\/[^\n]*/g, "");
+    .split("\n")
+    .map(stripLineComment)
+    .join("\n");
+}
+
+/**
+ * The line with its `//` comment removed -- where `//` means a comment and
+ * not two characters inside a string.
+ *
+ * A plain regex replace of everything from the first `//` to the end of the
+ * line cut it wherever it was, so `const u = "https://x"; const t = Date.now();`
+ * arrived at the predicate as `const u = "https:` and the clock read was
+ * gone. Review planted exactly that and the gate stayed green. A url in a
+ * string is not a contrived line in a package that talks to a database over
+ * one.
+ *
+ * Quotes are tracked rather than parsed: single, double and backtick, with
+ * backslash escapes skipped. That is enough for this file's job and stops
+ * short of being a scanner -- a `//` inside a template SUBSTITUTION would
+ * still be treated as code, which errs toward refusing and never toward
+ * missing a clock read.
+ */
+function stripLineComment(line: string): string {
+  let quote: string | null = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!;
+    if (c === "\\") { i++; continue; }
+    if (quote !== null) { if (c === quote) quote = null; continue; }
+    if (c === "'" || c === '"' || c === "`") { quote = c; continue; }
+    if (c === "/" && line[i + 1] === "/") return line.slice(0, i);
+  }
+  return line;
 }
 
 function clockReads(text: string): string[] {
@@ -222,6 +262,19 @@ describe("the store reads no clock but its own", () => {
       ["current_timestamp in SQL", "const q = sql`where t < current_timestamp`;"],
       ["current_date outside a template", "const q = \"select current_date\";"],
       ["clock_timestamp in SQL", "const q = sql`select clock_timestamp()`;"],
+      // Three more server clocks the first list did not name. A closed set of
+      // keywords is only as good as the set, and these three read a clock in
+      // exactly the way `current_timestamp` does -- `age(x)` with one
+      // argument is `current_date - x`, which is the wall clock wearing a
+      // subtraction.
+      ["transaction_timestamp in SQL", "const q = sql`select transaction_timestamp()`;"],
+      ["statement_timestamp in SQL", "const q = sql`select statement_timestamp()`;"],
+      ["one-argument age in SQL", "const q = sql`select age(created_at)`;"],
+      // And a clock read on the same line as a string that happens to hold a
+      // `//`. The comment blanker cut everything after the first `//` on a
+      // line, wherever it was, so a url in a string swallowed the rest of
+      // that line before the predicate ever saw it.
+      ["a clock read after a url in a string", 'const u = "https://x/y"; const t = Date.now();'],
     ])("refuses %s", (_form, line) => {
       expect(clockReads(line)).toHaveLength(1);
     });
@@ -238,6 +291,9 @@ describe("the store reads no clock but its own", () => {
       ["a method named now in an interface", "  now(): Date;"],
       ["a method named now being implemented", "  now() { return this.at; }"],
       ["a comment mentioning the clock", "// Date.now() is refused in this package."],
+      ["a trailing comment mentioning the clock", "const t = at; // not Date.now()"],
+      ["a url in a string, with no clock after it", 'const u = "https://x/now()";'],
+      ["age with two arguments, which reads no clock", "const q = sql`select age(a, b)`;"],
     ])("allows %s", (_form, line) => {
       expect(clockReads(line)).toEqual([]);
     });
