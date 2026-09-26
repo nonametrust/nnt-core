@@ -168,26 +168,65 @@ function stripLineComment(line: string): string {
 }
 
 function clockReads(text: string): string[] {
-  const found: string[] = [];
+  const lines = code(text).split("\n");
   // Backtick parity, so a `now()` on its own line inside a multi-line sql
   // template is still seen as SQL. Every query this package writes spans
   // lines, so a per-line "does this line hold a backtick" test missed all of
   // them -- including `migrate.ts`'s own `default now()`, which is how the
   // omission was found. Comments are blanked before this runs, so a backtick
   // in prose cannot skew the parity.
+  const inSqlAt: boolean[] = [];
   let inSql = false;
-  code(text)
-    .split("\n")
-    .forEach((line, i) => {
-      for (const [name, matches] of CLOCK_FORMS) {
-        if (matches(line, inSql)) {
-          found.push(`${i + 1}: ${name}: ${line.trim()}`);
-          break;
-        }
-      }
-      const ticks = (line.match(/`/g) ?? []).length;
-      if (ticks % 2 === 1) inSql = !inSql;
-    });
+  for (const line of lines) {
+    inSqlAt.push(inSql);
+    const ticks = (line.match(/`/g) ?? []).length;
+    if (ticks % 2 === 1) inSql = !inSql;
+  }
+
+  const firstForm = (text_: string, sql: boolean): string | null => {
+    for (const [name, matches] of CLOCK_FORMS) if (matches(text_, sql)) return name;
+    return null;
+  };
+
+  const perLine = lines.map((line, i) => firstForm(line, inSqlAt[i]!));
+  const found: string[] = [];
+  lines.forEach((line, i) => {
+    const own = perLine[i];
+    if (own !== null) {
+      found.push(`${i + 1}: ${own}: ${line.trim()}`);
+      return;
+    }
+    // Nothing on this line alone. Try the line JOINED WITH THE NEXT ONE, but
+    // only when the next line is clean too -- otherwise the offender is
+    // reported twice, once on its own line and once on the window above it.
+    //
+    // The scanner was per-line, and a clock read split across two lines
+    // therefore matched nothing:
+    //
+    //   const now = new Date(Date
+    //     .now());
+    //
+    // `new Date(Date` fails "new Date with no argument" because a `(D`
+    // follows, and fails "Date() as a call" because the only `Date` before a
+    // parenthesis is the one `new ` excludes. `.now())` alone carries no
+    // `Date`. Planted inside `expirePeriods`: the gate stayed GREEN and
+    // sixteen FIXTURE tests went red instead -- tests of retention, not of
+    // this rule -- so the gate was being credited for a kill it did not make.
+    // The commit that listed this among nine caught plants was wrong about it,
+    // and re-running every mutant the branch claims is what found that out.
+    //
+    // Two lines and not a whole-file join, because joining everything would
+    // let any `Date` anywhere pair with any `.now()` anywhere. Two is what a
+    // hand-split expression needs and what a formatter produces. A THREE-line
+    // split still walks past, and saying so is the point: this is a lexical
+    // gate and its reach is exactly its patterns.
+    const next = lines[i + 1];
+    if (next === undefined || perLine[i + 1] !== null) return;
+    const spanning = firstForm(`${line} ${next}`, inSqlAt[i]!);
+    if (spanning !== null) {
+      found.push(`${i + 1}: ${spanning} (across two lines): ${`${line} ${next}`.trim()}`);
+    }
+  });
   return found;
 }
 
@@ -296,6 +335,32 @@ describe("the store reads no clock but its own", () => {
       ["age with two arguments, which reads no clock", "const q = sql`select age(a, b)`;"],
     ])("allows %s", (_form, line) => {
       expect(clockReads(line)).toEqual([]);
+    });
+
+    it("sees a clock read split across two lines, which a per-line scan cannot", () => {
+      // The plant, verbatim. `new Date(Date` matches no pattern on its own
+      // and `.now())` carries no `Date`, so before the two-line window this
+      // form walked past the gate and was caught only by sixteen fixture
+      // tests -- tests of retention, not of this rule.
+      const split = ["  const now = new Date(Date", "    .now());"].join("\n");
+      expect(clockReads(split)).toHaveLength(1);
+      expect(clockReads(split)[0]).toMatch(/across two lines/);
+      // And the line number is the FIRST of the two, which is where a reader
+      // starts looking.
+      expect(clockReads(split)[0]).toMatch(/^1:/);
+    });
+
+    it("does not invent a split out of two innocent lines", () => {
+      // The window's own cost, pinned: a line ending in a `Date` TYPE next to
+      // a line that reads the injected clock is the shape most likely to be
+      // mistaken for a split, and it is what this package actually writes.
+      expect(clockReads(["function next(at: Date): Date {", "  return this.clock.now();"].join("\n")))
+        .toEqual([]);
+      expect(clockReads(["const seen: Map<string, Date> = new Map();", "  const t = clock.now();"].join("\n")))
+        .toEqual([]);
+      // Nor is an offender reported twice, once on its own line and once on
+      // the window above it.
+      expect(clockReads(["const a = 1;", "const t = Date.now();"].join("\n"))).toHaveLength(1);
     });
 
     it("sees the database's clock on its own line inside a multi-line query", () => {

@@ -222,21 +222,42 @@ describe("0007 over stored observations", () => {
         .where("filename", "=", seventh).executeTakeFirst();
       expect(row).toBeDefined();
 
-      // Section 8, and the "EVERY trigger function" half of it specifically.
-      // The guards read their tables unqualified, so an unpinned one resolves
-      // `namespace` through the session's `search_path` -- whose implicit
-      // `pg_temp` comes FIRST -- and a temp table of that name answers the
-      // gate instead of the real one. Pinning the function 0007 added and
-      // leaving `0001`-`0006`'s eight alone would read as done and close
-      // nothing, so what is asserted here is that NONE is left unpinned, and
-      // that the count is not zero, which is what makes the first half mean
-      // anything.
+    } finally {
+      await freshDb.destroy();
+      const cleanup = openDb(url);
+      await sql.raw(`drop schema if exists ${fresh} cascade`).execute(cleanup);
+      await cleanup.destroy();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  });
+
+  // Section 8's own claim, in a test named for it. The assertions lived inside
+  // the test above, whose name is about the preamble, so the mutant that pins
+  // only the function this card added died at a test about another rule -- and
+  // the commit that added section 8 named a killer "every trigger function is
+  // pinned, and there are at least nine" that had never existed. Re-running
+  // the branch's own mutant claims is what found that out, and the fix is the
+  // test the message described.
+  it("pins search_path on every trigger function in the schema, and there are at least nine", async () => {
+    const fresh = `${schemaName}_pins`;
+    const freshDir = mkdtempSync(join(tmpdir(), `${PREFIX}${process.pid}-pins-`));
+    const admin = openDb(url);
+    await sql.raw(`drop schema if exists ${fresh} cascade`).execute(admin);
+    await sql.raw(`create schema ${fresh}`).execute(admin);
+    await admin.destroy();
+    const freshDb = openDb(urlForSchema(url, fresh));
+    try {
+      const names = readdirSync(MIGRATIONS).filter((n) => n.endsWith(".sql")).sort();
+      for (const n of names) copyFileSync(join(MIGRATIONS, n), join(freshDir, n));
+      await migrate(freshDb, freshDir);
       const fns = await sql<{ name: string; config: string[] | null }>`
         select p.proname as name, p.proconfig as config
           from pg_proc p join pg_namespace n on n.oid = p.pronamespace
          where n.nspname = ${fresh}
            and p.prorettype = 'pg_catalog.trigger'::regtype
          order by p.proname`.execute(freshDb);
+      // The count first, because "none is unpinned" is vacuous over an empty
+      // list and this schema's guards live in 0001-0007.
       expect(fns.rows.length).toBeGreaterThanOrEqual(9);
       const unpinned = fns.rows.filter(
         (f) => !(f.config ?? []).some((c) => c.startsWith("search_path=")),
@@ -255,7 +276,7 @@ describe("0007 over stored observations", () => {
       await cleanup.destroy();
       rmSync(freshDir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 });
 
 // A killed run leaves its temp directory behind, so the sweep is what stops

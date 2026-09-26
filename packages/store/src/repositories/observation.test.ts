@@ -1362,6 +1362,89 @@ describe("a re-delivery whose payload cannot be opened", () => {
     expect(rows.rows[0]!.n).toBe("0");
   });
 
+  // The `for share` on the MONTH KEY row, which is the half of section 6 that
+  // its own commit claimed a killer for and did not have. Re-running every
+  // mutant the branch's messages claim found it: dropping ` for share` from
+  // the month lookup left all 498 tests green, and the commit that added the
+  // branch said "four mutants, four killers, each naming its own rule" while
+  // adding three tests. This is the fourth.
+  //
+  // What the lock buys: a sweep in flight and an insert in flight serialise.
+  // Without it the insert reads the key row unlocked, its READ COMMITTED
+  // snapshot cannot see the uncommitted shred, and it commits an observation
+  // under a month whose key is being destroyed in the next transaction over.
+  // The namespace half has exactly this test; the month half did not.
+  //
+  // The lock is held with the sweep's OWN update statement, scoped to one row,
+  // rather than with `expirePeriods` -- which is table-wide and would expire
+  // every month this file has minted and break its siblings.
+  it("queues an insert behind a month key being shredded, and sees the shred when it lands", async () => {
+    const other = openDb(urlForSchema(requireTestUrl(), "obs_test"));
+    try {
+      const jun = at("2027-06-03T00:00:00.000Z");
+      await jun.obs.append(anEvent({ namespace: { kind: "wallet", id: "MONTHRACE" },
+        source: { ...src, ref: "op:monthrace:1" } }));
+      const nsId = (await jun.ns.find("wallet", "MONTHRACE"))!.namespaceId;
+
+      let release!: () => void, took!: () => void;
+      const held = new Promise<void>((r) => { release = r; });
+      const taken = new Promise<void>((r) => { took = r; });
+      const shredding = other.transaction().execute(async (trx) => {
+        const swept = await sql<{ n: string }>`
+          update namespace_key set key_wrapped = null,
+                 shredded_at = ${new Date("2027-10-01T00:00:00.000Z")}
+           where namespace_id = ${nsId} and period = '2027-06-01'::date
+             and key_wrapped is not null
+          returning 1 as n`.execute(trx);
+        expect(swept.rows).toHaveLength(1);
+        took();
+        await held;
+      });
+      // The holder signals once its UPDATE has returned, so no poll is needed
+      // for this half.
+      await taken;
+
+      const planted = sql`
+        insert into observation (
+          observation_id, idempotency_key, namespace_id, channel, kind, evidence_kind,
+          dated_at, ingested_at, producer, period, payload_nonce, payload_tag, payload_ciphertext
+        ) values (
+          ${randomUUID()}, ${randomUUID()}, ${nsId}, 'protocol', 'raw', 'state',
+          null, ${new Date("2027-06-20T00:00:00.000Z")}, 'month-racer', '2027-06-01'::date,
+          decode('00', 'hex'), decode('00', 'hex'), decode('00', 'hex')
+        )`.execute(db).then(() => null, (e: unknown) => e);
+
+      // Sixty polls of fifty milliseconds, inside this test's timeout, with
+      // the release in a `finally` so a failed handshake fails this test and
+      // nothing after it. The predicate names the month lookup's own clause,
+      // which appears in no other query, because `pg_stat_activity` spans the
+      // database and vitest runs test files in parallel against one.
+      let blocked = false;
+      try {
+        for (let i = 0; i < 60 && !blocked; i++) {
+          const waiting = await sql<{ n: string }>`
+            select count(*)::text as n from pg_stat_activity
+            where datname = current_database() and wait_event_type = 'Lock'
+              and query ilike '%insert into observation%'`.execute(db);
+          blocked = waiting.rows[0]!.n !== "0";
+          if (!blocked) await new Promise((r) => setTimeout(r, 50));
+        }
+      } finally {
+        release();
+      }
+      await shredding;
+      // Non-vacuous: if the insert never queued, what follows says nothing
+      // about ordering.
+      expect(blocked, "the insert never queued behind the month key's shred").toBe(true);
+      expect(mapPgError(await planted)).toBeInstanceOf(PayloadExpired);
+      const rows = await sql<{ n: string }>`
+        select count(*)::text as n from observation where producer = 'month-racer'`.execute(db);
+      expect(rows.rows[0]!.n).toBe("0");
+    } finally {
+      await other.destroy();
+    }
+  }, 20_000);
+
   // Both at once, which is the ordering the trigger states. A namespace
   // erased on request whose months the sweep then took is reported as
   // ERASED, because that is the fact an operator needs: the retention clock
@@ -1613,10 +1696,22 @@ describe("a re-delivery whose payload cannot be opened", () => {
 
   it("answers rather than throws when the writer that won the race left an unreadable row", async () => {
     // The duplicate-retry path goes through the skeleton for the same reason
-    // the pre-read does. Reached by blinding the skeleton once, so this
-    // append inserts, collides, and re-reads -- with the stored row already
-    // expired. Through byIdempotencyKey that re-read throws, which is the
-    // R19 defect surviving in the one path R19 did not name.
+    // the pre-read does. Reached by blinding the skeleton so this append
+    // inserts, collides, and re-reads -- with the stored row already expired.
+    // Through byIdempotencyKey that re-read throws, which is the R19 defect
+    // surviving in the one path R19 did not name.
+    //
+    // TWICE, and the number is the whole test. `append` read the skeleton
+    // ONCE when this was written, so blinding it once reached the collision.
+    // The producer cap then added a SECOND skeleton read under the advisory
+    // lock, and the unblinded second call began answering the row before any
+    // insert -- so the branch under test stopped being reached and the mutant
+    // it was written to kill (the retry re-reading through
+    // `byIdempotencyKey`) went green and stayed green for two reviews. Its
+    // sibling "does not report a failed insert as already stored" was fixed
+    // for exactly this and this one was not. Found by re-running every mutant
+    // the branch's own commit messages claim: 139 of 145 still died, and this
+    // was one of the ones that had quietly stopped.
     const mar = at("2027-03-05T00:00:00.000Z");
     const wire = anEvent({ namespace: { kind: "wallet", id: "R19DUP" },
       source: { ...src, ref: "op:r19:dup" } });
@@ -1627,15 +1722,19 @@ describe("a re-delivery whose payload cannot be opened", () => {
     const loser = at("2027-05-01T00:00:00.000Z");
     const priv = loser.obs as unknown as { skeleton: (k: string) => Promise<unknown> };
     const real = priv.skeleton.bind(loser.obs);
-    let blind = true;
+    let blind = 2;
     priv.skeleton = async (k: string) => {
-      if (blind) { blind = false; return null; }
+      if (blind > 0) { blind -= 1; return null; }
       return real(k);
     };
     expect(await loser.obs.append(wire)).toMatchObject({
       created: false, readable: false, periodExpired: true,
       observationId: storedObservation(first).observationId!,
     });
+    // Non-vacuous: both blinded reads were consumed, so the append really did
+    // reach the insert and collide. With one left over, the collision never
+    // happened and the assertion above would be about the pre-read instead.
+    expect(blind).toBe(0);
   });
 
   // The skeleton read's whole point: it must not decrypt. If it still opened
