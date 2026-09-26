@@ -1,10 +1,11 @@
 # Storage card decision ledger (migration `0007`)
 
-**Card:** "Depo kartı (migration 0007)". Branch `storage-card-0007`, 35 commits
-from `6a95e25`, eleven tasks and fourteen review rounds, awaiting merge.
+**Card:** "Depo kartı (migration 0007)". Branch `storage-card-0007`, 50 commits
+from `6a95e25`, eleven tasks, fourteen review rounds and three close-out
+audits, awaiting merge.
 **Plan:** `docs/superpowers/plans/2026-09-21-storage-card.md`
 **Code:** `packages/store` and `packages/store/migrations/0007_retention_aspect_and_baseline_shape.sql`
-(seven named sections), plus one root gate under `gates/`.
+(eight named sections), plus one root gate under `gates/`.
 
 This file is short on purpose. M0, M1 and M2 each have a ledger that carries
 the reasoning the commits do not; this card put that reasoning in the plan
@@ -117,17 +118,23 @@ typecheck for several steps.
   windows, both passed, both tasks shipped. §7 now records them as accepted by
   silence and says plainly that the asking was the part that failed: no
   deadline, no stated meaning for silence, on our own work.
-- **The whitepaper's line 145** still says the per-source rate limit is
-  "designed and scheduled rather than built". It is built. That belongs to the
-  whitepaper card and has not moved there.
+- **The whitepaper's line 145** said the per-source rate limit was "designed
+  and scheduled rather than built". It is built, and the sentence was corrected
+  on `whitepaper-source` (`3a0eba9`) in both languages -- with the clause R3's
+  own reasoning demands: until sources are authenticated the cap bounds volume
+  per DECLARED source and an attacker rotates names past it, so Section 7 does
+  not get to call it an attack counter. Source only; the built PDFs are still
+  the stale ones.
 
 ## Where the numbers stand at close
 
-`packages/store` 464 tests over 15 files, `packages/schema` 105,
+`packages/store` 508 tests over 15 files, `packages/schema` 105,
 `packages/tagging` 329, root gates 18. Green under process timezones
-`Pacific/Kiritimati` (+14) and `Pacific/Midway` (-11); the suite carries its
-own coverage of a changed database session timezone and DateStyle rather than
-those being run by hand at close.
+`Pacific/Kiritimati` (+14) and `Pacific/Midway` (-11), and green with
+`extra_float_digits=0`, `timezone=Pacific/Pago_Pago` and `datestyle='German,
+DMY'` set at the DATABASE level all at once -- which is the measurement the
+three connection pins exist for, and which nothing had ever run before the
+close-out audits.
 
 All twelve gates of §5 were re-measured at close against planted violations,
 one per rule, each going red at a test naming the rule it holds. That
