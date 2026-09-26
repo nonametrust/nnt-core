@@ -1,6 +1,6 @@
 /**
  * Every invariant the database holds maps to a class here. The triggers this
- * package writes raise their own SQLSTATEs, NNT01 to NNT05, and each maps to
+ * package writes raise their own SQLSTATEs, NNT01 to NNT08, and each maps to
  * a class of its own; the constraints Postgres names for itself, the foreign
  * keys, unique keys and check constraints, arrive as 23503, 23505 and 23514
  * and map to one class carrying the SQLSTATE and the constraint's name. Tests
@@ -69,7 +69,9 @@ export class WriteInsideTransaction extends StoreError {}
 // constraint and retry, which is the correct response to 40P01 and the
 // wrong one to almost everything else this store raises.
 export class Deadlocked extends StoreError {}
-// Raised in TypeScript, like NamespaceShredded, so it carries no SQLSTATE. It
+// Raised in TypeScript, so it carries no SQLSTATE. (NamespaceShredded used
+// to be the comparison here and no longer is: NNT08 maps to it since the
+// erasure gate, so it arrives both ways.) It
 // exists because an erasure request naming a subject that has no row must not
 // resolve as success: nothing was examined, and "the data is gone" would be
 // reported to an operator about data that was never looked for.

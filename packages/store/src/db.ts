@@ -36,7 +36,7 @@ export interface Schema {
     namespace_id: string;
     // `never` on the SELECT side, not `string`: the driver returns a Date for
     // a `date` column, so typing the read as string would compile and lie.
-    // The only readable form is sql`period::text`, which is what R8 requires
+    // The readable form is PERIOD_TEXT's `to_char` (R17), never `period::text`, which is what R8 requires
     // anyway -- the driver parses a date at LOCAL midnight, so east of UTC a
     // round-tripped 2026-09-01 comes back as 2026-08-31T21:00Z.
     period: ColumnType<never, string, never>;

@@ -15,18 +15,25 @@
 -- every section says what it holds AND what it deliberately leaves open:
 --   1. baseline: the two shapes M2's arithmetic refuses (Task 1)
 --   2. tag: the aspect it was always keyed on, retirement, the guard (Task 2)
---   3. observation: the producer column, the payload layout that moved (Task 4b)
+--   3. observation: the producer column and the payload layout (Task 4b)
 --   4. namespace_key: the month key, its guard, what expiry may not do (Task 5)
 --   5. observation: the period it is keyed on, the key row it needs (Task 6)
 --   6. observation: no counterparty is observed after its erasure (Task 8)
 --   7. permanent_record: the payload a rescue keeps (Task 9)
 
--- Before anything else: this migration moves the byte layout of the payload
--- envelope, and a stored payload is sealed under the layout that was in force
--- when it was written. Adding `producer` and `ingested_at` to that envelope
--- makes every existing ciphertext fail to open, and it would fail to open
--- silently -- at the first read, far from here, as a CiphertextRejected that
--- names a tamper rather than a migration.
+-- Before anything else: this migration re-keys the payload envelope, in two
+-- ways that each make every stored ciphertext unopenable, and a stored
+-- payload is sealed under the layout AND the key that were in force when it
+-- was written.
+--
+-- Section 3 adds `producer` and `ingested_at` to the envelope's associated
+-- data, so the bytes a read rebuilds no longer match the bytes a write
+-- bound. Section 5 then moves the seal itself from the namespace key to the
+-- month key, which is the larger of the two and was not in this paragraph
+-- while only section 3 existed. Either alone would do it; both are here.
+--
+-- And it would fail SILENTLY -- at the first read, far from here, as a
+-- CiphertextRejected that names a tamper rather than a migration.
 --
 -- Nothing has been deployed, so today this refusal never fires and the layout
 -- is free. It is written anyway, because "nothing is deployed" is a belief
@@ -51,10 +58,16 @@ end $$;
 -- estimate and the mean. The first is NOT decided here: the arithmetic does
 -- not refuse a zero count beside a positive m2 either, so there is nothing to
 -- hold, and inventing a rule the arithmetic does not have would be a decision
--- this card has no authority to make. What the arithmetic refuses, the database must refuse too:
+-- this card has no authority to make. What the arithmetic refuses, the
+-- database must refuse too:
 -- otherwise the store can write a row that M3's read path throws on, which is
 -- a refusal on the pipeline rather than on an observation, and it surfaces far
 -- from the writer that caused it.
+--
+-- The table is empty here and that is why these can be added as checks at
+-- all; over rows either would fail, loudly, and the failure would be the
+-- 23514 naming the constraint rather than the preamble's refusal -- which
+-- covers the payload envelope only and says nothing about baselines.
 --
 -- The robust pair arrives together or not at all, and it is present exactly
 -- when the counter is not zero. A row with a positive count and an empty pair
@@ -96,6 +109,15 @@ alter table tag alter column aspect set not null;
 alter table tag add constraint tag_aspect_nonempty check (length(aspect) > 0);
 
 
+-- WHAT THIS SECTION LEAVES OPEN, and it is more than the retirement job.
+-- The guard below holds the direction of `tagged_at` and the shape of a
+-- count move, and it holds neither of these: a live tag's `g0` may be
+-- rewritten to anything by any writer, and a tag may move from `open` to
+-- `saturated` with its count unchanged. Nothing in M2's arithmetic produces
+-- the second and nothing refuses it; both belong on M4's card beside
+-- retirement rather than being invented here. INSERT is unguarded too, as
+-- everywhere in this schema -- the checks are what cover it.
+--
 -- Retirement is named in the M0 spec, the M1 spec and the repository's own
 -- docstring, and existed nowhere. The column lands here because the unique
 -- index below is partial on it; the nightly operation that sets it is M4's.
@@ -209,6 +231,14 @@ create trigger tag_guarded
 
 -- === 3. observation: the producer column and the payload layout (Task 4b) ===
 --
+-- WHAT THIS SECTION LEAVES OPEN. The column is a name and nothing more. The
+-- cap on how fast one producer may deliver is counted in a repository, under
+-- an advisory lock, and not by this table: no constraint here bounds a rate,
+-- and none could without a clock the database is not allowed to read. And
+-- nothing binds a producer to a namespace or to anything else -- the name is
+-- free text until deliveries are signed, which is why R3 rules the cap a
+-- tripwire for our own indexer rather than a defence against an attacker.
+--
 -- `producer` is the bare name of the component that delivered the
 -- observation, and it is derived by `append` from the source the observation
 -- carries -- never passed in beside it. That is the rule the table has held
@@ -285,8 +315,8 @@ alter table observation
 -- Three things that migration must do, all measured on 17.7 rather than
 -- assumed.
 --
--- ALL THREE STATEMENTS IN ONE TRANSACTION. This is the one that matters and
--- an earlier version of this comment did not say it. `alter table ... disable
+-- ALL THREE STATEMENTS IN ONE TRANSACTION. This is the one that matters.
+-- `alter table ... disable
 -- trigger` is transactional, so inside a transaction it takes
 -- ShareRowExclusiveLock and every other writer blocks until commit -- the
 -- guard is never off for anyone else, and a rollback restores it. Run as
@@ -305,8 +335,11 @@ alter table observation
 -- Set a lock_timeout. The ALTER queues behind every in-flight writer and
 -- every writer queues behind it; without a timeout it waits indefinitely,
 -- with one it fails cleanly as 55P03.
--- Without that sentence written down, the guard below reads as "expiry can
--- never change", which is not what is meant.
+--
+-- All of which is written down because without the sanctioned path above --
+-- the migration that disables this trigger, moves `expires_at` and puts it
+-- back -- the guard below reads as "expiry can never change", and that is
+-- not what is meant.
 --
 -- Note the asymmetry that makes fixing expiry at mint safe: a shred cannot be
 -- undone, so re-deriving expiry at each sweep could only ever matter in the
@@ -341,13 +374,11 @@ create table namespace_key (
   -- A month cannot expire before it has closed, where "closed" means the UTC
   -- close and not the server's.
   --
-  -- An earlier version of this comment said Postgres refuses a bare
-  -- timestamptz comparison in a check because it is only stable. That is
-  -- FALSE and review caught it: Postgres enforces immutability for index
-  -- expressions and generated columns, never for CHECK, and
-  -- `check (expires_at >= period + interval '1 month')` is accepted. The form
-  -- below is still the right one, for the reason that actually holds --
-  -- measured on the 17.7 cluster rather than reasoned about:
+  -- Immutability is NOT why the form below is the right one, though it is
+  -- the first reason anyone reaches for. Postgres enforces immutability for
+  -- index expressions and generated columns and never for CHECK, so
+  -- `check (expires_at >= period + interval '1 month')` is accepted --
+  -- measured on the 17.7 cluster. The reason that actually holds is:
   --
   --   the naive form casts a plain timestamp to timestamptz using the
   --   SESSION's TimeZone, so for period 2026-03-01 it demands
@@ -436,10 +467,12 @@ begin
   -- row still says the month is live -- and the read reports it as a tamper,
   -- naming the ciphertext rather than the write that caused it.
   --
-  -- Review found this hole by noticing that the row-copy test depended on
-  -- it: the test moved a wrapped key between live rows and read the refusal
-  -- from the cipher. That test now disables this trigger, which is honest,
-  -- because the envelope's threat model assumes exactly that.
+  -- The row-copy test moves a wrapped key between live rows and reads the
+  -- refusal from the cipher, so it disables this trigger to get there --
+  -- honest, because the envelope's threat model assumes exactly that. It
+  -- does so as three autocommit statements and is therefore NOT an example
+  -- of the sanctioned migration path described above; in a single-session
+  -- test nothing else can reach the table in between.
   if old.key_wrapped is not null
      and new.key_wrapped is not null
      and new.key_wrapped is distinct from old.key_wrapped then
@@ -457,9 +490,10 @@ create trigger namespace_key_guarded
 
 
 -- === 5. observation: the period and the key row it requires (Task 6) =======
--- (Task 6. Sections 1 and 2 were Task 1 and 2, section 3 Task 4b, section 4
--- Task 5. `observation` is altered here a second time because this section
--- needs `namespace_key` to exist and that arrives in section 4.)
+-- `observation` is altered here a second time, and the order is a
+-- dependency rather than an accident: this section needs `namespace_key`,
+-- which section 4 creates. The per-section task attributions live in the
+-- table of contents at the top of this file and are not repeated here.
 --
 -- The month an observation's payload is keyed under, derived from INGEST time
 -- and not from the event's own instant. A state has no dated instant at all,
@@ -470,7 +504,8 @@ create trigger namespace_key_guarded
 --
 -- A new observation therefore lands in the month it is written in, and under
 -- the shipped ninety-day grace that month cannot already be expired. Not
--- "never", which is what this comment used to say: with a zero grace -- a
+-- "never", and the difference is a policy this schema admits: with a zero
+-- grace -- a
 -- policy the arithmetic admits -- a month expires at its own close, and a
 -- sweep at 00:00 on the first can shred the month an append captured its
 -- instant in moments earlier. Measured, not supposed. The plan's §2c records
@@ -509,9 +544,13 @@ alter table observation
 -- For the per-producer cap in Task 8, which counts
 -- `where producer = ? and ingested_at > now - window`. Descending on the
 -- instant because the count always looks at the recent end. Without it every
--- append scans the table; the index is added here, with the column, rather
--- than in the task that first reads it, so the column and its access path
--- arrive together.
+-- append scans the table. It sits in THIS section and not beside the
+-- `producer` column two sections up, which is where an earlier version of
+-- this comment claimed it was: the column arrived with Task 4b and the
+-- access path with Task 6, 270 lines apart. Worth saying plainly rather than
+-- claiming a tidiness the file does not have -- a column and its index
+-- landing in different sections is the kind of thing the next reader should
+-- be told, not reassured about.
 create index observation_by_producer_ingested on observation (producer, ingested_at desc);
 
 
@@ -592,13 +631,14 @@ create trigger observation_namespace_live_on_insert
   for each row execute function observation_namespace_live();
 
 
--- === 7. permanent_record: the payload a rescue keeps (Task 9) =================
+-- === 7. permanent_record: the payload a rescue keeps (Task 9) ===============
 --
 -- The card's whole sentence is that a captured trace outlives its month. Until
 -- this section `promote` copied metadata and never opened the observation, so a
 -- promotion after a month expired SUCCEEDED and rescued nothing: the
 -- retroactive-rescue mechanism quietly producing an empty rescue, with no error
--- anywhere and a record that looks complete. §1 of the plan found it by reading
+-- anywhere and a record that looks complete. §1 of the plan found it by
+-- reading
 -- the shipped code rather than the design.
 --
 -- The three columns hold the observation re-sealed under the NAMESPACE key,
@@ -616,6 +656,23 @@ create trigger observation_namespace_live_on_insert
 -- The append-only trigger from 0004 stays and now covers these too: a record
 -- is written once, and the payload bound into it cannot be swapped afterwards
 -- without the trigger being disabled.
+--
+-- WHAT THIS SECTION LEAVES OPEN, three things.
+--
+-- The database cannot tell a namespace-sealed payload from a month-sealed
+-- one copied across: both are bytea of the same shape, and the rule that a
+-- rescue must be re-sealed under the outer key lives in TypeScript alone.
+-- The expire-then-read test is what holds it.
+--
+-- There is no header-length check on these three columns, where
+-- `namespace_key_wrapped_present` has one. A zero-length ciphertext is
+-- refused by NOT NULL and by nothing else.
+--
+-- And 0004's own open item has changed shape rather than closed: it asks
+-- what promotion into a shredded namespace should do, and `promote` now
+-- opens the observation before writing, so the refusal arrives from the
+-- payload path as well as from the early check. Which of the two should own
+-- it is M4's to settle.
 alter table permanent_record add column payload_nonce bytea not null;
 alter table permanent_record add column payload_tag bytea not null;
 alter table permanent_record add column payload_ciphertext bytea not null;
