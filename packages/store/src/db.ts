@@ -227,30 +227,61 @@ const PINS = [
   "-c default_transaction_isolation=read\\ committed",
 ] as const;
 
+/**
+ * The last `-c <name>=` in an `options` string, as libpq resolves it, or null
+ * when the setting is not mentioned. Tokens are split on whitespace that is
+ * not backslash-escaped, which is libpq's own escaping rule and the reason
+ * `read\ committed` is written the way it is.
+ */
+function lastSetting(options: string, name: string): string | null {
+  const tokens = options.split(/(?<!\\)\s+/).filter(Boolean);
+  let found: string | null = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    const setting = token === "-c" ? tokens[++i] : token.startsWith("-c") ? token.slice(2) : undefined;
+    if (setting !== undefined && setting.toLowerCase().startsWith(`${name}=`)) found = setting;
+  }
+  return found;
+}
+
 export function withIsoDates(url: string): string {
   const parsed = new URL(url);
-  const existing = parsed.searchParams.get("options") ?? "";
-  // Idempotent PER PIN, and matched on this package's own fragment rather
-  // than on the setting's name.
+  // getAll, not get: `urlForSchema` appends its search_path by string
+  // concatenation, so a base url that already carries `options` arrives here
+  // with TWO of them. `get` read the first and `set` below then deleted the
+  // rest, so the schema confinement was silently dropped -- and in the other
+  // order, both pins were. Collapsing them into one parameter is also what
+  // the driver wants: `options` is a single connection parameter, and a url
+  // carrying two of them has no defined meaning.
+  const existing = parsed.searchParams.getAll("options").join(" ");
+  // Decided on the LAST `-c` for each setting rather than on whether our own
+  // fragment appears anywhere, because `includes` is a substring test and
+  // "appears somewhere" is not "takes effect". An options string that carried
+  // our pin and then a contrary one after it reported both pins present while
+  // neither was in force.
   //
-  // It used to return early whenever `options` mentioned `datestyle=` at
-  // all. That was written when DateStyle was the only pin and it survived
-  // the commit that added the isolation one, so a URL already carrying a
-  // DateStyle -- an operator following the older advice, or a pooler adding
-  // it -- got NO isolation pin at all. Review reproduced the whole defect
-  // through that hole: twenty concurrent appends under a cap of five stored
-  // fourteen rows, which is the exact number the fix was written against.
+  // The history is worth keeping because it is the same mistake three times
+  // in this one function. First it returned early whenever `options`
+  // mentioned `datestyle=` at all -- written when DateStyle was the only pin,
+  // and it survived the commit that added the isolation one, so a url already
+  // carrying a DateStyle got NO isolation pin: twenty concurrent appends
+  // under a cap of five stored fourteen rows. The fix for that matched the
+  // fragment instead, and inherited the two holes above.
   //
-  // Matching the fragment also settles what happens to a caller who asks for
-  // something else: ours is appended after theirs and the last `-c` wins.
-  // Neither of these is negotiable -- a non-ISO DateStyle makes every
-  // timestamp column arrive null, and REPEATABLE READ makes the producer cap
-  // count against a stale snapshot -- so honouring a contrary choice would
-  // mean handing back a store that is silently wrong rather than one that
-  // refuses.
-  const missing = PINS.filter((pin) => !existing.includes(pin));
-  if (missing.length === 0) return url;
-  parsed.searchParams.set("options", [existing, ...missing].filter(Boolean).join(" "));
+  // What happens to a caller who asks for something contrary is settled here:
+  // ours is appended after theirs and wins. Neither pin is negotiable -- a
+  // non-ISO DateStyle makes every timestamp column arrive null, and
+  // REPEATABLE READ makes the producer cap count against a stale snapshot --
+  // so honouring a contrary choice would mean handing back a store that is
+  // silently wrong rather than one that refuses. Settings we do not pin are
+  // carried through untouched.
+  const missing = PINS.filter((pin) => {
+    const name = pin.slice("-c ".length).split("=")[0]!;
+    return lastSetting(existing, name)?.toLowerCase() !== pin.slice("-c ".length).toLowerCase();
+  });
+  const options = [existing, ...missing].filter(Boolean).join(" ");
+  if (options === existing && parsed.searchParams.getAll("options").length <= 1) return url;
+  parsed.searchParams.set("options", options);
   return parsed.toString();
 }
 

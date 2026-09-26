@@ -646,6 +646,59 @@ describe("the period column under a skewed zone", () => {
     expect(withIsoDates(both)).toBe(both);
   });
 
+  // The three holes the branch review measured in this one function, each of
+  // which silently returns a url whose pins never reach the server. The
+  // oracle is libpq's own rule -- `options` is ONE parameter and the LAST
+  // `-c` for a setting wins -- so these assert on the string we hand the
+  // driver rather than on the driver's internals.
+  const optionsOf = (url: string): string[] =>
+    new URL(url).searchParams.getAll("options");
+
+  it("collapses several options parameters into one, because the driver reads one", () => {
+    // `urlForSchema` appends its search_path by string concatenation, so a
+    // base url that already carries `options` produces two of them. The old
+    // code read the FIRST with `.get` and then wrote with `.set`, which
+    // deletes every other occurrence -- so the search_path was dropped on the
+    // floor and nothing said so.
+    const two = withIsoDates(
+      urlForSchema("postgres://h/db?options=-c%20statement_timeout%3D5000", "some_schema"),
+    );
+    expect(optionsOf(two)).toHaveLength(1);
+    const opts = optionsOf(two)[0]!;
+    expect(opts).toContain("search_path=some_schema");
+    expect(opts).toContain("statement_timeout=5000");
+    expect(opts).toContain("datestyle=ISO");
+    expect(opts).toContain("default_transaction_isolation=read\\ committed");
+  });
+
+  it("puts its pin after a contrary setting, because the last -c is the one that takes", () => {
+    // `existing.includes(pin)` is a substring test, not a test of which `-c`
+    // is effective: a caller whose options happen to contain our fragment AND
+    // a contrary setting after it was told the pin was already there. Both
+    // pins were defeated this way, and a non-ISO DateStyle makes every
+    // timestamp column arrive null.
+    const hostile = withIsoDates(
+      "postgres://h/db?options=" +
+        encodeURIComponent(
+          "-c datestyle=ISO -c default_transaction_isolation=read\\ committed" +
+            " -c datestyle=German -c default_transaction_isolation=repeatable\\ read",
+        ),
+    );
+    const opts = optionsOf(hostile)[0]!;
+    expect(opts.lastIndexOf("datestyle=ISO")).toBeGreaterThan(opts.lastIndexOf("datestyle=German"));
+    expect(opts.lastIndexOf("default_transaction_isolation=read\\ committed"))
+      .toBeGreaterThan(opts.lastIndexOf("default_transaction_isolation=repeatable\\ read"));
+  });
+
+  it("re-pins a setting a caller overrode, and leaves a setting it does not own alone", () => {
+    const one = withIsoDates("postgres://h/db?options=" + encodeURIComponent("-c datestyle=German"));
+    const opts = optionsOf(one)[0]!;
+    expect(opts.lastIndexOf("datestyle=ISO")).toBeGreaterThan(opts.lastIndexOf("datestyle=German"));
+    // Untouched: we pin two settings and claim nothing about the rest.
+    expect(withIsoDates("postgres://h/db?options=" + encodeURIComponent("-c lock_timeout=1000")))
+      .toContain("lock_timeout%3D1000");
+  });
+
   it("round-trips the same month in every zone the process might run in", async () => {
     const was = process.env.TZ;
     try {
