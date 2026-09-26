@@ -241,4 +241,20 @@ describe("assertRetentionPolicy", () => {
   it("accepts a zero grace, because expiring at the month's close is a policy and not a defect", () => {
     expect(() => assertRetentionPolicy(aPolicy({ graceDays: 0 }))).not.toThrow();
   });
+  // The floor was held and the ceiling was not: `graceDays: 2 ** 40` passed
+  // this assertion, passed the constructor whose comment says a policy is
+  // refused where it enters, and then failed at the first mint with an error
+  // that never named the field. The table decides what a grace may BE; this
+  // bound is only the line past which the arithmetic stops producing a
+  // representable instant.
+  it("refuses a grace so long the expiry is not an instant, by field name", () => {
+    expect(() => assertRetentionPolicy({ ...RETENTION_V0, graceDays: 2 ** 40 })).toThrow(/graceDays/);
+    expect(Number.isNaN(expiresAt("2026-09-01", { ...RETENTION_V0, graceDays: 2 ** 40 }).getTime())).toBe(true);
+    // And the bound itself is admissible, so the refusal is a line and not a
+    // ban: a century of grace is storable arithmetic even though the table
+    // refuses it for its own reason.
+    expect(() => assertRetentionPolicy({ ...RETENTION_V0, graceDays: 36_500 })).not.toThrow();
+    expect(Number.isNaN(expiresAt("2026-09-01", { ...RETENTION_V0, graceDays: 36_500 }).getTime())).toBe(false);
+  });
+
 });

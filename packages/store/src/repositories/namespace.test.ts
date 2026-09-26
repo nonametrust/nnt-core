@@ -13,7 +13,7 @@ import {
   PayloadExpired, PeriodKeyAltered, StoreError, mapPgError,
 } from "../errors.js";
 import { RETENTION_V0, expiresAt, type RetentionPolicy } from "../retention.js";
-import { NamespaceRepository } from "./namespace.js";
+import { NamespaceRepository, sweepOrder } from "./namespace.js";
 import { ObservationRepository } from "./observation.js";
 import { AuditChain } from "../audit/chain.js";
 
@@ -756,6 +756,37 @@ describe("what the namespace_key table refuses to hold", () => {
   // makes `expiresAt`'s docstring true -- it says an unvalidated policy
   // cannot reach it from inside the store, which is a claim about all three
   // sites and not about one.
+  // The sweep's order was `localeCompare` with no locale, so it was a
+  // property of the RUNTIME's `LANG` and not of the data. This host runs
+  // `tr_TR.UTF-8`; another would have sorted the same rows differently, and
+  // an M4 audit body built from an array that reorders itself between HOSTS
+  // is the same defect the sort exists to prevent, with a longer fuse.
+  //
+  // Pinned at the comparator and not through a sweep, and saying why is the
+  // point: Postgres renders a uuid as lowercase hex and a period as an ISO
+  // date, and every collation agrees on those, so no sweep this store can
+  // produce could ever tell the two rules apart. The rule is "this order does
+  // not depend on the host", and only data where the two DISAGREE can state
+  // it.
+  it("orders a sweep by code point, so the same rows sort the same way on any host", () => {
+    // "B" is 0x42 and "a" is 0x61, so code point puts "B" first; every
+    // locale-aware collation puts "a" first.
+    const rows = [
+      { namespaceId: "a", period: "2026-01-01" },
+      { namespaceId: "B", period: "2026-01-01" },
+    ];
+    expect([...rows].sort(sweepOrder).map((r) => r.namespaceId)).toEqual(["B", "a"]);
+    expect("a".localeCompare("B")).toBeLessThan(0);
+
+    // And the period is the tiebreak, by code point too.
+    const months = [
+      { namespaceId: "n", period: "b" },
+      { namespaceId: "n", period: "A" },
+    ];
+    expect([...months].sort(sweepOrder).map((r) => r.period)).toEqual(["A", "b"]);
+    expect(sweepOrder({ namespaceId: "n", period: "x" }, { namespaceId: "n", period: "x" })).toBe(0);
+  });
+
   // Two rules of this repository that read as obvious and were held by
   // nothing: both mutants left the whole suite green.
   //
@@ -802,6 +833,25 @@ describe("what the namespace_key table refuses to hold", () => {
     expect(raised).toBeInstanceOf(StoreError);
     expect(raised).toBeInstanceOf(ConstraintViolation);
     expect((raised as ConstraintViolation).constraint).toBe("namespace_key_expires_in_range");
+  });
+
+  // The access path the sweep needs, held as a catalogue pin rather than as a
+  // plan assertion: "the planner chose it today" is not a rule, and a test
+  // that asserted it would fail on the first table small enough to seq-scan.
+  // What this holds is that the path exists and is the partial one -- over
+  // the LIVE months, so it shrinks as retention works rather than growing
+  // with a table whose shredded rows only accumulate.
+  it("indexes the month keys the sweep can still shred, and only those", async () => {
+    const idx = await sql<{ indexdef: string }>`
+      select indexdef from pg_indexes
+       -- Scoped to OUR schema: pg_indexes spans the database, and the other
+       -- test files' schemas hold an index of the same name. The same trap
+       -- as pg_locks being cluster-wide, one level in.
+       where schemaname = current_schema()
+         and tablename = 'namespace_key' and indexname = 'namespace_key_due'`.execute(db);
+    expect(idx.rows).toHaveLength(1);
+    expect(idx.rows[0]!.indexdef).toMatch(/\(expires_at\)/);
+    expect(idx.rows[0]!.indexdef).toMatch(/WHERE \(?key_wrapped IS NOT NULL\)?/i);
   });
 
   it("refuses an infinite period, which every other check on this table admits", async () => {

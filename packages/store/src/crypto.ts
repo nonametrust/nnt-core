@@ -178,6 +178,15 @@ export interface PermanentBinding {
   recordId: string;
   observationId: string;
   namespaceId: string;
+  /**
+   * The trigger the rescue was taken for, or null for a rescue taken without
+   * one. Null is a VALUE here and not an absence: a record rescued by no
+   * trigger must not open under a binding that names one, which is the
+   * direction that matters -- a rewrite that invents a justification.
+   */
+  rescuedBy: string | null;
+  /** The confidence AT promotion, a historical fact and not a cached strength. */
+  confidence: number;
   originalDatedAt: Date;
   promotedAt: Date;
 }
@@ -190,9 +199,30 @@ export function permanentAad(b: PermanentBinding): Buffer {
     b.recordId,
     b.observationId,
     b.namespaceId,
+    // Empty for null, the same rendering `payloadAad` gives an absent
+    // `datedAt`: a uuid cannot be empty, so the two cases stay distinct.
+    b.rescuedBy ?? "",
+    numberPart("confidence", b.confidence),
+    // The instants stay last, as they do in `payloadAad`. Convention, not
+    // necessity -- with a fixed part count and a separator no part may
+    // contain, an empty part is unambiguous anywhere.
     instantPart("originalDatedAt", b.originalDatedAt),
     instantPart("promotedAt", b.promotedAt),
   ]);
+}
+
+/**
+ * A number as a bound part. `double precision` round-trips through a JS
+ * number exactly and `String` is deterministic for a given double, so the
+ * value written and the value read back render the same bytes. Refused
+ * rather than rendered when it is not finite, because `"NaN"` and
+ * `"Infinity"` are strings two different bindings could both produce.
+ */
+function numberPart(name: string, value: number): string {
+  if (!Number.isFinite(value)) {
+    throw new RangeError(`${name} must be a finite number, got ${String(value)}`);
+  }
+  return String(value);
 }
 
 /**

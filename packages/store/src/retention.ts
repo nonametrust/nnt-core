@@ -117,6 +117,7 @@ export const RETENTION_V0: RetentionPolicy = Object.freeze({
 });
 
 const DAY_MS = 86_400_000;
+const MAX_GRACE_DAYS = 36_500;
 // Anchored, four digits and two digits exactly, and the day is literally 01.
 // Unanchored it would read a year out of "12026-09-01"; loose on width it
 // would accept "2026-9-01". The month range is checked below rather than in
@@ -142,6 +143,20 @@ export function assertRetentionPolicy(policy: RetentionPolicy): void {
   }
   // Zero grace is a policy, not a defect: it expires a month at its close.
   requirePositiveInteger("graceDays", policy.graceDays, 0);
+  // And an upper bound, which the floor alone does not give. Past a certain
+  // size `expiresAt` produces an Invalid Date, and what refused it then was
+  // the driver, with a message about a parameter rather than about a field.
+  // A century is not a policy judgement -- the table's own
+  // `namespace_key_expires_in_range` decides what a grace may actually be,
+  // and now names itself when it refuses one, because every write in that
+  // repository maps its errors. This bound is only the line past which the
+  // arithmetic stops being arithmetic, so the refusal can say `graceDays`.
+  if (policy.graceDays > MAX_GRACE_DAYS) {
+    throw new RangeError(
+      `graceDays must be no more than ${MAX_GRACE_DAYS}, a century, past which ` +
+        `the computed expiry is not a representable instant; got ${policy.graceDays}`,
+    );
+  }
   requirePositiveInteger("producerWindowMs", policy.producerWindowMs, 1);
   requirePositiveInteger("producerMaxObservations", policy.producerMaxObservations, 1);
 }

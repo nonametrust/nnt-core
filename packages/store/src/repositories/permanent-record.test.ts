@@ -247,8 +247,8 @@ describe("the invariant the table holds on its own", () => {
     });
   });
 
-  it("holds confidence to the unit interval, NaN included", async () => {
-    for (const confidence of [-0.1, 1.1, Number.NaN, Number.POSITIVE_INFINITY]) {
+  it("holds confidence to the unit interval", async () => {
+    for (const confidence of [-0.1, 1.1]) {
       const observation = storedObservation(await observations.append(anEventOn("2026-09-17T09:00:00.000Z")));
       const promoted = records.promote({
         observationId: observation.observationId!, namespaceId: ns,
@@ -257,6 +257,46 @@ describe("the invariant the table holds on its own", () => {
       await expect(promoted).rejects.toBeInstanceOf(ConstraintViolation);
       await expect(promoted).rejects.toMatchObject({ sqlstate: "23514", constraint: "permanent_record_confidence" });
     }
+  });
+
+  // NaN and the infinities are refused one layer earlier than the other two,
+  // and both layers are asserted because both are rules. `confidence` became
+  // a BOUND part of the permanent envelope in the branch review -- `0004`'s
+  // own comment names it as something a session with write access could
+  // rewrite, and until then a rewritten confidence still opened -- and a
+  // bound part must render deterministically. `"NaN"` is a string two
+  // different bindings could both produce, so it is refused where the field
+  // can be named rather than left to a check constraint that would report a
+  // column and not a reason.
+  it("refuses a confidence that is not a finite number, by field, before the table sees it", async () => {
+    for (const confidence of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const observation = storedObservation(await observations.append(anEventOn("2026-09-17T09:00:00.000Z")));
+      await expect(records.promote({
+        observationId: observation.observationId!, namespaceId: ns,
+        rescuedBy: null, confidence,
+      })).rejects.toThrow(/confidence must be a finite number/);
+    }
+  });
+
+  // And the table still holds it on its own, which is what the layer above
+  // is allowed to assume and not allowed to replace.
+  it("still refuses a NaN confidence from a raw writer", async () => {
+    const observation = storedObservation(await observations.append(anEventOn("2026-09-17T09:05:00.000Z")));
+    // `original_dated_at` copied from the observation itself, because
+    // `permanent_record_keeps_its_date` refuses anything else and would be
+    // the constraint that fired -- a test of another rule.
+    await expect(sql`
+      insert into permanent_record (
+        record_id, observation_id, namespace_id, original_dated_at, promoted_at,
+        rescued_by, confidence, payload_nonce, payload_tag, payload_ciphertext
+      )
+      select ${randomUUID()}, o.observation_id, o.namespace_id, o.dated_at,
+             ${new Date("2026-09-20T09:00:00.000Z")}, null, 'NaN'::double precision,
+             decode('00','hex'), decode('00','hex'), decode('00','hex')
+        from observation o where o.observation_id = ${observation.observationId!}
+      `.execute(db)).rejects.toMatchObject({
+        code: "23514", constraint: "permanent_record_confidence",
+      });
   });
 });
 
@@ -420,6 +460,11 @@ describe("the permanent copy outlives its month", () => {
       await at("2027-03-15T00:00:00.000Z").obs.append(anEventFor("PERM4", "op:perm:4b")),
     );
     expect(nsId).toBeDefined();
+    const trigger = randomUUID();
+    await sql`
+      insert into trigger_event (trigger_id, namespace_id, observation_id, status, tier, cluster_id, surprise, created_at)
+      values (${trigger}, ${nsId}, ${sibling.observationId!}, 'candidate', null, null, 4.5,
+              ${new Date("2027-03-16T00:00:00.000Z")})`.execute(db);
     const moves = {
       // record_id is part of the binding and was the one part nothing moved:
       // the pair mutant that dropped it from BOTH sides died only by
@@ -429,6 +474,18 @@ describe("the permanent copy outlives its month", () => {
       observation_id: sql`observation_id = ${sibling.observationId!}`,
       original_dated_at: sql`original_dated_at = original_dated_at + interval '1 day'`,
       promoted_at: sql`promoted_at = promoted_at + interval '1 day'`,
+      // The two the branch review found outside the envelope. Measured
+      // through this very bypass: before they were bound, a rewritten
+      // confidence and a record repointed at a sibling trigger both still
+      // opened and still returned the rescued observation, while the comment
+      // beside `permanentAad` said every column beside the payload was
+      // inside it.
+      confidence: sql`confidence = 0.01`,
+      // Moved from null TO a real trigger, which is the direction that
+      // matters: a rewrite that invents a justification for a rescue nobody
+      // asked for. The trigger row exists so the foreign key is satisfied
+      // and the binding is what refuses, not the key.
+      rescued_by: sql`rescued_by = ${trigger}`,
     };
     for (const [column, move] of Object.entries(moves)) {
       const ROLLBACK = Symbol("rollback");
@@ -471,7 +528,8 @@ describe("the permanent copy outlives its month", () => {
       JSON.stringify({ notAnObservation: true }),
       permanentAad({
         recordId: row.recordId, observationId: row.observationId,
-        namespaceId: row.namespaceId, originalDatedAt: row.originalDatedAt,
+        namespaceId: row.namespaceId, rescuedBy: row.rescuedBy,
+        confidence: row.confidence, originalDatedAt: row.originalDatedAt,
         promotedAt: row.promotedAt,
       }),
     );

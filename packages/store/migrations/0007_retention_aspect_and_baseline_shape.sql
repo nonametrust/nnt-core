@@ -436,6 +436,21 @@ create table namespace_key (
     check (shredded_at is null or shredded_at >= expires_at)
 );
 
+-- The sweep's access path. `expirePeriods` selects `key_wrapped is not null
+-- and expires_at <= now`, which without this is a sequential scan over every
+-- month key the store has ever minted -- including the shredded ones, which
+-- only ever accumulate and are exactly the rows it can never act on again.
+-- The partial predicate is the point: the index holds the live months, so it
+-- shrinks as retention does its work rather than growing with the table.
+--
+-- Recorded as unmeasured. No cardinality here justifies an index yet, and a
+-- planner on a small table will ignore it; it is the shape of the query that
+-- justifies it, and the shape is fixed by R18. What the test beside it holds
+-- is that the access path EXISTS, not that it is used, because "the planner
+-- chose it today" is not a rule and a test that asserted it would fail on the
+-- first table small enough to seq-scan.
+create index namespace_key_due on namespace_key (expires_at) where key_wrapped is not null;
+
 -- Mirrors namespace_guard in 0001 and raises its own SQLSTATE, NNT06, for the
 -- reason that one does not reuse NNT01: this table is MEANT to be updated
 -- (that is what expiry is), so a refusal here says an update broke a rule,

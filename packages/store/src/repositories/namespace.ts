@@ -85,6 +85,35 @@ export interface StoredNamespace {
   shreddedAt: Date | null;
 }
 
+/**
+ * The order `expirePeriods` reports its rows in: namespace, then period, both
+ * by CODE POINT.
+ *
+ * Not `localeCompare`, which is what stood here. `localeCompare` with no
+ * locale argument uses the RUNTIME's default, so the order of a sweep was a
+ * property of `LANG` rather than of the data -- and this machine runs
+ * `tr_TR.UTF-8`, one of the few collations that reorders letters outright.
+ * The comment below the sort says an M4 audit body built from an array that
+ * reorders itself between runs is not reproducible; an array that reorders
+ * itself between HOSTS is the same defect with a longer fuse, and it would
+ * have shown up as two operators disagreeing about a row neither could
+ * reproduce.
+ *
+ * Today's ids cannot expose the difference -- Postgres renders a uuid as
+ * lowercase hex and a period as an ISO date, and every collation agrees on
+ * those -- so this is pinned at the comparator rather than through a sweep.
+ * That is the point: the rule is "this order does not depend on the host",
+ * and a test that can only use data where the two agree cannot state it.
+ */
+export function sweepOrder(
+  a: { namespaceId: string; period: string },
+  b: { namespaceId: string; period: string },
+): number {
+  if (a.namespaceId !== b.namespaceId) return a.namespaceId < b.namespaceId ? -1 : 1;
+  if (a.period === b.period) return 0;
+  return a.period < b.period ? -1 : 1;
+}
+
 export class NamespaceRepository {
   constructor(
     private readonly db: Db,
@@ -461,10 +490,7 @@ export class NamespaceRepository {
         // restore. An M4 audit body built from an array that reorders itself
         // between runs is not reproducible, and reproducibility is the whole
         // point of the row it will write.
-        .sort((a, b) =>
-          a.namespaceId === b.namespaceId
-            ? a.period.localeCompare(b.period)
-            : a.namespaceId.localeCompare(b.namespaceId)),
+        .sort(sweepOrder),
     };
   }
 

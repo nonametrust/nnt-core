@@ -40,7 +40,7 @@ import { RETENTION_V0 } from "./retention.js";
 import {
   AppendOnlyViolation, DayNotClosed, TimestampAltered, mapPgError, PayloadExpired,
 } from "./errors.js";
-import { NamespaceRepository } from "./repositories/namespace.js";
+import { NamespaceRepository, sweepOrder } from "./repositories/namespace.js";
 import { ObservationRepository } from "./repositories/observation.js";
 import { TagRepository, type StoredTag } from "./repositories/tag.js";
 import { TriggerEventRepository, type StoredTriggerEvent } from "./repositories/trigger-event.js";
@@ -591,7 +591,9 @@ describe("5. retention runs, and the rescue survives it", () => {
     expect(shredded).toEqual([
       { namespaceId: provider, period: "2026-08-01", namespaceErasedAtSweep: false },
       { namespaceId: wallet, period: "2026-08-01", namespaceErasedAtSweep: false },
-    ].sort((a, b) => a.namespaceId.localeCompare(b.namespaceId)));
+    // The repository's own comparator, so the test states the same rule the
+    // code does rather than a locale-dependent approximation of it.
+    ].sort(sweepOrder));
     // And the day-twelve observations still read, which is the other half of
     // "leaves September standing": the grace is a promise about readability,
     // so asserting only the sweep's return would let a sweep that shredded

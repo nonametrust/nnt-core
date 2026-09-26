@@ -136,6 +136,12 @@ export class PermanentRecordRepository {
             // bind to what the database reports, never to what was passed.
             sql<string>`observation.observation_id::text`.as("canonical_observation_id"),
             sql<string>`${input.namespaceId}::uuid::text`.as("canonical_namespace_id"),
+            // Canonical for the same reason as the two above: a uuid column
+            // accepts any case and brace form, so the caller's spelling and
+            // the string `read` rebuilds from the row are not always the
+            // same bytes -- which is exactly the defect that produced a
+            // complete-looking record whose payload never opened.
+            sql<string | null>`${input.rescuedBy}::uuid::text`.as("canonical_rescued_by"),
           ])
           .where("observation.observation_id", "=", input.observationId)
           // The namespace row is LOCKED, not merely read. `key_shredded_at`
@@ -190,6 +196,8 @@ export class PermanentRecordRepository {
             recordId,
             observationId: source.canonical_observation_id,
             namespaceId: source.canonical_namespace_id,
+            rescuedBy: source.canonical_rescued_by,
+            confidence: input.confidence,
             originalDatedAt: source.dated_at,
             promotedAt,
           }),
@@ -212,7 +220,9 @@ export class PermanentRecordRepository {
                 eb.val(source.canonical_namespace_id).as("namespace_id"),
                 "dated_at as original_dated_at",
                 eb.val(promotedAt).as("promoted_at"),
-                eb.val(input.rescuedBy).as("rescued_by"),
+                // The canonical spelling, so the column and the binding hold
+                // the same bytes.
+                eb.val(source.canonical_rescued_by).as("rescued_by"),
                 eb.val(input.confidence).as("confidence"),
                 eb.val(sealed.nonce).as("payload_nonce"),
                 eb.val(sealed.tag).as("payload_tag"),
@@ -257,6 +267,8 @@ export class PermanentRecordRepository {
         recordId: row.record_id,
         observationId: row.observation_id,
         namespaceId: row.namespace_id,
+        rescuedBy: row.rescued_by,
+        confidence: row.confidence,
         originalDatedAt: row.original_dated_at,
         promotedAt: row.promoted_at,
       }),

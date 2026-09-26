@@ -55,6 +55,9 @@ function binding(over: Partial<PayloadBinding> = {}): PayloadBinding {
 
 // Promoted eight days after the observation it rescues: a permanent record is
 // written when a trigger fires, not when the evidence arrived.
+const TRIGGER = "9f1f4b0e-0f7a-4a1a-9b3e-2c5d7e8f0a11";
+const OTHER_TRIGGER = "9f1f4b0e-0f7a-4a1a-9b3e-2c5d7e8f0a22";
+
 function record(over: Partial<PermanentBinding> = {}): PermanentBinding {
   return {
     recordId: RECORD,
@@ -62,6 +65,8 @@ function record(over: Partial<PermanentBinding> = {}): PermanentBinding {
     namespaceId: NS,
     originalDatedAt: new Date("2026-09-12T09:00:00.000Z"),
     promotedAt: new Date("2026-09-20T11:00:00.000Z"),
+    confidence: 0.7,
+    rescuedBy: TRIGGER,
     ...over,
   };
 }
@@ -455,21 +460,29 @@ describe("permanentAad", () => {
     const impostor = payloadAad(binding({ namespaceId: "permanent" }));
     expect(impostor.equals(permanentAad(record()))).toBe(false);
     // What actually holds it: the two carry a different number of parts, and
-    // no part may contain the separator, so one join has five separators and
-    // the other eight. They cannot be equal for any inputs at all.
-    expect(permanentAad(record()).toString("utf8").split("\u0000").length).toBe(6);
+    // no part may contain the separator, so one join has seven separators and
+    // the other eight. They cannot be equal for any inputs at all. The two
+    // counts are asserted rather than their difference, because the day they
+    // become equal is the day this reason stops being true and the test has
+    // to say so out loud.
+    expect(permanentAad(record()).toString("utf8").split("\u0000").length).toBe(8);
     expect(impostor.toString("utf8").split("\u0000").length).toBe(9);
   });
 
-  it("renders the six parts in one fixed order, the domain literal first", () => {
+  it("renders the eight parts in one fixed order, the domain literal first and the instants last", () => {
     expect(permanentAad(record()).toString("utf8").split("\u0000")).toEqual([
       "permanent",
       RECORD,
       OBSERVATION,
       NS,
+      TRIGGER,
+      "0.7",
       "2026-09-12T09:00:00.000Z",
       "2026-09-20T11:00:00.000Z",
     ]);
+    // Null renders empty, the same way an absent `datedAt` does in the
+    // payload binding. A uuid cannot be empty, so the two stay distinct.
+    expect(permanentAad(record({ rescuedBy: null })).toString("utf8").split("\u0000")[4]).toBe("");
   });
 
   // Every column the record keeps beside its payload is inside the envelope,
@@ -478,6 +491,15 @@ describe("permanentAad", () => {
   // opens. `original_dated_at` is the one the promotion trigger measures the
   // record against, and it is not nullable -- a state has no instant to
   // preserve and `promote` refuses one before it reaches here.
+  //
+  // That sentence was false when it was written and the branch review
+  // measured it: `confidence` and `rescued_by` were NOT in the envelope, and
+  // with the append-only trigger disabled -- the same bypass this test's
+  // sibling already sets up -- a rewritten confidence and a record repointed
+  // at a sibling trigger both still opened and still returned the rescued
+  // observation. `0004`'s own comment names both as exactly what a session
+  // with write access would rewrite. R15's precedent settled which way to
+  // fix it: add the missing part, do not soften the sentence.
   it("refuses a permanent payload whose bound columns were rewritten, one at a time", () => {
     const dk = newDataKey();
     const s = seal(dk, '{"a":1}', permanentAad(record()));
@@ -487,6 +509,18 @@ describe("permanentAad", () => {
       { namespaceId: OTHER_NS },
       { originalDatedAt: new Date("2026-09-12T09:00:00.001Z") },
       { promotedAt: new Date("2026-09-20T11:00:00.001Z") },
+      // The two the comment above claimed were bound and were not. `0004`'s
+      // own comment names both as things a session with write access could
+      // rewrite, and until the branch review a rewritten `confidence` or a
+      // record repointed at a sibling trigger still opened and still returned
+      // the rescued observation. The comment was the rule and nothing
+      // enforced it.
+      { confidence: 0.01 },
+      { rescuedBy: OTHER_TRIGGER },
+      // Null is a value here, not an absence: a record rescued by no trigger
+      // must not open under a binding that names one, or the field would be
+      // forgeable in the one direction that matters.
+      { rescuedBy: null },
     ];
     for (const move of moves) {
       expect(() => open(dk, s, permanentAad(record(move))), JSON.stringify(move))
