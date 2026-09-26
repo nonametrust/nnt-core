@@ -137,3 +137,47 @@ line afterwards; the four mutants that its sibling reported as surviving WERE
 re-run here against the whole suite, and three of the four turned out to be
 held in a test file the agent had not run. Which is the first lesson above,
 pointed the other way: a mutant that survives a subset proves nothing either.
+
+---
+
+## Three audits after the card was already "finished"
+
+The card was finished twice before it was finished. Each of these ran after a
+commit had said the work was done, and each found something no amount of
+re-reading would have.
+
+**A ten-lens review of the whole diff.** 73 raw findings, 40 after triage, each
+then given three independent refuters with different lenses, and every survivor
+REPRODUCED by running it rather than argued about. 36 reproduced. Most became
+commits; eight are recorded in the plan's §2d as deliberately not fixed, with
+reasons. The ones worth remembering: `withIsoDates` had its third and fourth
+bypass (a pin can be *present* without being *in force*); `promote` read a
+column it did not lock and wrote a permanent copy of an erased counterparty's
+evidence; a foreign key asks whether a row exists and not what is in it, so an
+observation could be written under a month key that had been shredded; a temp
+table called `namespace` answered the erasure gate, needing no privilege a
+plain application role lacks; and the sweep's order was `localeCompare` with no
+locale, which made it a property of `LANG`.
+
+**A run against a differently configured Postgres, and over a non-empty
+database.** Neither had ever been done. It found the one WRONG ANSWER on the
+branch: under `extra_float_digits = 0` the store hands back a float it did not
+store, and M2's read-modify-write of a baseline then turns that into a named
+refusal that reads as impossible on a write that was correct. It also found a
+test that held only EAST of Greenwich -- the mirror of the constraint this
+branch had already found wrong only to the west -- and that `0007` over a
+pre-branch database fails with a constraint name and no remedy, which it now
+refuses by name instead.
+
+**A re-run of the branch's own mutation claims.** ~130 mutant descriptions in
+48 commits, 145 re-run at HEAD. 139 still died. Four had stopped being held,
+in four distinct ways: one killer DISARMED by a later task adding a second
+call the stub did not cover; one rule claimed to have a killer that was never
+written; one plant the gate was credited for catching while sixteen fixture
+tests did the killing; and one killer whose test name was about a different
+rule, named in a commit after a test that had never existed. All four fixed.
+
+The lesson the three share, and it is the card's real one: **every claim on
+this branch that nothing could refuse turned out to be wrong, and the ones that
+survived longest were the ones written most confidently.** The commit messages
+are unusually careful and that is exactly what made them worth auditing.
