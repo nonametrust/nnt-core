@@ -208,8 +208,24 @@ const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreErro
   NNT09: PayloadExpired,
   "55P03": Cancelled,
   "57014": Cancelled,
-  // Postgres's own, not one this schema allocated.
+  // Postgres's own, not ones this schema allocated.
   "40P01": Deadlocked,
+  // 40001, serialization_failure. The same shape as 40P01 -- the transaction did
+  // not commit, nothing was written wrongly, and the correct response is to retry
+  // the whole thing -- so it maps to the same class rather than to a fourth one a
+  // caller would have to learn.
+  //
+  // WHY IT IS HERE NOW. Review ran `upsert` inside a REPEATABLE READ transaction
+  // whose read had gone stale and the write came back as a RAW driver error:
+  // `code: '40001'`, `isStoreError: false`, unmapped. R28 bounds a retry over
+  // `BaselineStale`, `TagRefreshStale`, 23505 on the live-tag pair and
+  // `Deadlocked`; an unmapped 40001 falls through all of them, so M3's ingest
+  // path would have surfaced a driver error from a condition whose entire meaning
+  // is "retry me". Reachable only under an isolation level the store does not
+  // itself request, which is why it was never hit -- and R10 puts the fold and the
+  // tag write in one transaction, so a caller choosing that level is exactly the
+  // caller this now protects.
+  "40001": Deadlocked,
 };
 
 /**

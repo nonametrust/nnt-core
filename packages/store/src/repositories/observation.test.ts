@@ -475,6 +475,59 @@ describe("the columns beside the payload", () => {
   // forge a consistent id too -- so this is not a defence against them. It is
   // a defence against us: a future path that seals the wrong object under the
   // right associated data, which is one copy-paste away in promote.
+  it("refuses a payload that opens on this row and names NO observation at all", async () => {
+    // THE OTHER HALF OF THE SAME CHECK, and it was unheld. The sibling test below
+    // forges a payload naming a DIFFERENT observation; nothing covered a payload
+    // naming NONE. Review measured the gap: loosening `read`'s comparison to
+    // tolerate an absent id left all 529 store tests green.
+    //
+    // It matters more than it looks, because that one comparison is what makes
+    // `StoredObservation` HONEST. R32 gives every `AppendResult` arm a required
+    // `observationId` and the store casts to it on this path; the cast is truthful
+    // only because a payload without an id is refused here. Seventy non-null
+    // assertions were removed across this suite on the strength of that type, so
+    // the type had better be earned by a test rather than by one `!==`.
+    const a = await observations.append(anEvent({ source: { ...src, ref: "op:noid:a" } }));
+    const idA = storedObservation(a).observationId;
+    const row = await db.selectFrom("observation")
+      .select(["namespace_id", "idempotency_key", "evidence_kind", "channel", "kind",
+        "dated_at", "ingested_at", "producer"])
+      .where("observation_id", "=", idA).executeTakeFirstOrThrow();
+    const period = periodOf(row.ingested_at);
+    const dataKey = await namespaces.openPeriodKey(row.namespace_id, period);
+    // The id DELETED from an otherwise valid payload, sealed under this row's own
+    // AAD so the envelope opens and only the identity check can refuse it.
+    const withoutId: Record<string, unknown> = { ...storedObservation(a) };
+    delete withoutId["observationId"];
+    const forged = seal(
+      dataKey,
+      JSON.stringify(withoutId),
+      payloadAad({
+        namespaceId: row.namespace_id,
+        observationId: idA,
+        idempotencyKey: row.idempotency_key,
+        evidenceKind: row.evidence_kind,
+        channel: row.channel,
+        kind: row.kind,
+        producer: row.producer,
+        ingestedAt: row.ingested_at,
+        datedAt: row.dated_at,
+      }),
+    );
+    await expect(
+      db.transaction().execute(async (trx) => {
+        await sql`alter table observation disable trigger observation_no_update`.execute(trx);
+        await sql`update observation set payload_nonce = ${forged.nonce},
+            payload_tag = ${forged.tag}, payload_ciphertext = ${forged.ciphertext}
+          where observation_id = ${idA}`.execute(trx);
+        const inside = new ObservationRepository(
+          trx, new NamespaceRepository(trx, ring, clock, RETENTION_V0), clock, RETENTION_V0,
+        );
+        await inside.get(idA);
+      }),
+    ).rejects.toThrow(/carries observation id/);
+  });
+
   it("refuses a payload that opens on this row but names another observation", async () => {
     const a = await observations.append(anEvent({ source: { ...src, ref: "op:forge:a" } }));
     const b = await observations.append(anEvent({ source: { ...src, ref: "op:forge:b" } }));
@@ -2446,7 +2499,17 @@ describe("readClear", () => {
     expect(clear.evidenceKind).toBe(wire.evidenceKind);
     expect(clear.evidenceKind).toBeTypeOf("string");
     expect(clear.producer).toBeTypeOf("string");
-    expect(clear.period).toBeInstanceOf(Date);
+    // THE VALUE, not the type. `period` is a `date` column, and a `date` read
+    // back as a driver Date is LOCAL MIDNIGHT -- which east of UTC is the
+    // previous month's last day. `read` in this same file renders it through
+    // `PERIOD_TEXT` with a comment saying exactly that, and the first version of
+    // `readClear` selected the column raw and asserted only
+    // `toBeInstanceOf(Date)`. Measured on one row whose real period is
+    // 2027-03-01: Europe/Istanbul gave 2027-02-28T21:00Z, Pacific/Kiritimati
+    // 2027-02-28T10:00Z, UTC 2027-03-01T00:00Z. A consumer slicing the ISO string
+    // for a month got FEBRUARY for a March row. An assertion on the type could
+    // not see it; this one can, and the suite already runs under Kiritimati.
+    expect(clear.period).toBe("2027-03-01");
     expect(clear.ingestedAt).toBeInstanceOf(Date);
     expect(clear.datedAt).toBeInstanceOf(Date);
     // The two flags the private skeleton already carries, so Task 5 can decide

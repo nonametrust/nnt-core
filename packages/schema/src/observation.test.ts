@@ -213,10 +213,13 @@ describe("StoredObservation", () => {
     expect(idOf(stored)).toBe("9f1c0f7e-0000-4000-8000-000000000000");
   });
 
-  it("keeps the event/state discrimination, which a non-distributed intersection loses", () => {
-    // The reason `WithRequired` distributes over the union. If it did not, a
-    // narrowing on `evidenceKind` would stop reaching the member's own fields and
-    // `o.observedAt` below would not compile.
+  it("keeps the event/state discrimination, which the intersection must not lose", () => {
+    // TypeScript normalises `(A | B) & C` to `(A & C) | (B & C)` on its own, so no
+    // distribution helper is needed here -- `Omit` needs one because `keyof` of a
+    // union is only its common keys. An earlier version of this comment credited a
+    // `WithRequired` helper that has since been deleted, precisely because
+    // mutation showed it did nothing. What is held below is the property itself: a
+    // narrowing on `evidenceKind` still reaches the member's own fields.
     const dateOf = (o: StoredObservation): string | null =>
       o.evidenceKind === "event" ? o.observedAt : null;
     const state = {

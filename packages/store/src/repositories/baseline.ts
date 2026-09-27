@@ -76,6 +76,25 @@ export class BaselineRepository {
    *
    * Composes on a `Transaction`, and must: R10 makes the fold and the tag write
    * one unit of work, so a stale tag rolls the fold back with it.
+   *
+   * THREE THINGS THIS DOES NOT PROTECT, measured by review and stated rather than
+   * discovered:
+   *
+   * 1. **The token is the COUNT.** Two writers whose folds both leave `n` at the
+   *    same value are last-writer-wins, exactly as before. Unreachable through
+   *    `updateBaseline`, which always advances the count by one, so it is a
+   *    property of this predicate rather than a live defect — but a caller writing
+   *    a non-advancing state is unprotected and should know it.
+   * 2. **A count against NO row inserts.** `expectedCount: 7` on a pair that has
+   *    no row succeeds, because the predicate is only consulted on conflict. The
+   *    refusal of a skipped count is true of an existing row and not of a missing
+   *    one.
+   * 3. **Under REPEATABLE READ this raises 40001, not `BaselineStale`.** The
+   *    transaction did not commit and the cure is the same — retry the whole thing
+   *    — so `errors.ts` maps 40001 to `Deadlocked`, which R28's bounded retry
+   *    already covers. Before that mapping it surfaced as a raw driver error with
+   *    `isStoreError: false`. This store never requests that isolation level; a
+   *    caller may.
    */
   async upsert(state: BaselineState, expectedCount: number | null): Promise<StoredBaseline> {
     const values = {

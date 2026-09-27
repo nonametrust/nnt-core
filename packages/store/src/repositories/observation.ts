@@ -89,7 +89,23 @@ export interface ClearObservation {
   datedAt: Date | null;
   ingestedAt: Date;
   producer: string;
-  period: Date;
+  /**
+   * The retention month, as `YYYY-MM-DD`, and a STRING rather than a `Date` on
+   * purpose.
+   *
+   * `period` is a `date` column, and a `date` read back through the driver is
+   * LOCAL MIDNIGHT -- which east of UTC is the previous month's last day. `read`
+   * in this file renders it through `PERIOD_TEXT` with a comment saying exactly
+   * that, and the first version of this read selected the column raw. Measured on
+   * one row whose real period is 2027-03-01: Istanbul returned
+   * 2027-02-28T21:00Z, Kiritimati 2027-02-28T10:00Z. A caller slicing the ISO
+   * string for a month got FEBRUARY for a March row.
+   *
+   * A month has no time of day, so the honest type is the text. It is pinned by
+   * VALUE in the tests, not by `toBeInstanceOf` -- which is what let the trap
+   * back in.
+   */
+  period: string;
   /** The month key is gone: the payload will not open, and never will again. */
   periodExpired: boolean;
   /** The namespace key is gone: the whole counterparty space was erased. */
@@ -509,11 +525,21 @@ export class ObservationRepository {
    * `(producer, network, ref, channel, kind, namespace id)` where every part but
    * `ref` is already a column in the clear and `ref` is a public-ledger operation
    * id; §2c measured a three-hundred-candidate dictionary recovering 3 of 3
-   * source references of a shredded namespace. Handing it back from a read whose
-   * whole purpose is to answer AFTER erasure would hand out that dictionary. So
-   * the columns returned are exactly the plaintext survivors §2c already lists,
-   * and `source.ref` is not among them because it lives inside the sealed
-   * payload.
+   * source references of a shredded namespace. So the columns returned are exactly
+   * the plaintext survivors §2c already lists, and `source.ref` is not among them
+   * because it lives inside the sealed payload.
+   *
+   * WHAT WITHHOLDING IT BUYS, measured rather than asserted, because an earlier
+   * version of this sentence overstated it. The dictionary attack does not need
+   * this column: review reconstructed 3 of 3 source references of an erased
+   * namespace through the PUBLIC API alone in about 4600 queries, using `find`,
+   * this read, and `byIdempotencyKey` as the oracle — the last throws
+   * `NamespaceShredded` on a hit and answers null on a miss. That oracle
+   * pre-exists and the storage card's §2c records it for `append`; it should name
+   * `byIdempotencyKey` beside it. What this read adds to the attacker's inputs is
+   * `producer` and nothing else. So withholding the key does not close the attack
+   * — it declines to hand over a ready-made index to it, which is worth doing and
+   * is less than the earlier wording claimed.
    *
    * The two state flags come with it, so a caller can decide the reason's code
    * without a decrypt-and-catch: `periodExpired` when the month key is gone,
@@ -525,10 +551,11 @@ export class ObservationRepository {
     const found = await sql<{
       observation_id: string; namespace_id: string; channel: string; kind: string;
       evidence_kind: string; dated_at: Date | null; ingested_at: Date; producer: string;
-      period: Date; period_expired: boolean; ns_erased: boolean;
+      period: string; period_expired: boolean; ns_erased: boolean;
     }>`
       select o.observation_id::text as observation_id, o.namespace_id::text as namespace_id,
-             o.channel, o.kind, o.evidence_kind, o.dated_at, o.ingested_at, o.producer, o.period,
+             o.channel, o.kind, o.evidence_kind, o.dated_at, o.ingested_at, o.producer,
+             ${PERIOD_TEXT(sql`o.period`)} as period,
              (k.key_wrapped is null) as period_expired,
              (n.data_key_wrapped is null) as ns_erased
       from observation o

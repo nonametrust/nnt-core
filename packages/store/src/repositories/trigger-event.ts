@@ -91,6 +91,14 @@ export class TriggerEventRepository {
    * of the same id is 23505 on the primary key, which is how a retry stays one
    * row.
    *
+   * TWO THINGS A RETRY CANNOT TELL YOU, measured and stated. A repeat of the same
+   * id with DIFFERENT contents raises the same 23505 on the same constraint as an
+   * identical repeat, and the FIRST contents stand — so a caller that retried with
+   * a changed body learns only that the id is taken, never that its change was
+   * dropped. And `created_at` has no LOWER bound: `new Date(0)` stores and reads
+   * back as 1970. A bound there would need a rule about how far in the past a
+   * trigger may be recorded, and nobody has one.
+   *
    * Note what this table still lacks and M3 does not add (R31): `0006` puts no
    * append-only trigger on `trigger_event`, so the candidate the brief records --
    * its only durable trace beside the audit row -- is updatable and deletable from

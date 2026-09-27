@@ -48,6 +48,16 @@ describe("mapPgError", () => {
     // 40P01 is to retry -- which is the wrong response to almost every other
     // code in this table, so it has to be tellable apart.
     ["40P01", Deadlocked],
+    // 40001, serialization_failure, mapped to the SAME class and deliberately so:
+    // the transaction did not commit, nothing was written wrongly, and the correct
+    // response is to retry the whole thing -- which is 40P01's answer too, so a
+    // caller learns one class rather than two. Added after review ran `upsert`
+    // inside a REPEATABLE READ transaction whose read had gone stale and got a RAW
+    // driver error with `isStoreError: false`, which R28's bounded retry could not
+    // see. Reachable only under an isolation level this store does not itself
+    // request, and R10 puts the fold and the tag write in one transaction, so the
+    // caller who chooses that level is the one this protects.
+    ["40001", Deadlocked],
     // Also Postgres's own, and also not a defect: an operator's lock_timeout
     // or statement_timeout cancelling a statement this store was waiting on.
     // Mapped because an unmapped one is the worst of the three outcomes:

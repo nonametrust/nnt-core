@@ -189,19 +189,22 @@ export interface BriefPolicy {
    * layer.
    *
    * Strictly below `briefThreshold`, and that rule is the same argument
-   * reaching the ceiling's VALUE rather than only its location. Measured: with
-   * the threshold at 3000, ceilings of 5000, 3000 and 2900 were all accepted,
-   * and at 5000 a medium-risk intent of 4000 PROCEEDS while a store is
-   * unreachable and is HELD when it is reachable. That is the layer bypassed by
-   * making it unavailable, wearing a valid-looking policy.
+   * reaching the ceiling's VALUE rather than only its location. Measured when the
+   * threshold was 3000: ceilings of 5000, 3000 and 2900 were all accepted, and at
+   * 5000 a medium-risk intent of 4000 PROCEEDS while a store is unreachable and
+   * is HELD when it is reachable. That is the layer bypassed by making it
+   * unavailable, wearing a valid-looking policy.
    *
    * NECESSARY AND NOT SUFFICIENT, and the gap is declared rather than implied:
-   * an active tag multiplies the threshold down, so 3000 × 0.8^7 = 629.15 sits
-   * UNDER the shipped ceiling of 750, and a counterparty with seven active tags
-   * is again more permissively treated when a store is down. Nothing in M3
-   * bounds the number of active tags, so no rule over these two numbers can
-   * close it; closing it needs a floor under the lowered threshold, which is a
-   * number nobody has measured.
+   * an active tag multiplies the threshold down, so at the SHIPPED numbers
+   * 600 × 0.8^9 = 80.53 sits under the ceiling of 100, and a counterparty with
+   * nine active tags is again more permissively treated when a store is down.
+   * Nothing in M3 bounds the number of active tags, so no rule over these two
+   * numbers can close it; closing it needs a floor under the lowered threshold,
+   * which is a number nobody has measured. The count is computed by the test
+   * rather than recalled here, because an earlier version of this sentence said
+   * seven -- true of the defaults it was written for and stale the moment they
+   * moved.
    *
    * WHAT WOULD REPLACE IT: a measured loss rate by amount band, which would
    * also give the floor above.
@@ -235,23 +238,35 @@ export interface BriefPolicy {
 export const VERSION_SEPARATOR = "/";
 
 /**
- * v0. Chosen so the section 9 scenario behaves, and that is the whole
- * derivation: a 2500 USDC request on day twenty-one passes the base threshold
- * of 3000 and is held once an active tag has lowered it. Recorded as fitted,
- * because design §8:338-339 admits the same of its own defaults and the failure
- * this project has already paid for is a number chosen to make a test pass and
- * then described as measured.
+ * v0. Fitted so that BOTH scenarios' assertions hold, and that is the whole
+ * derivation. Recorded as fitted, because design §8:338-339 admits the same of
+ * its own defaults and the failure this project has already paid for is a number
+ * chosen to make a test pass and then described as measured.
  *
- * THE FIRST VERSION OF THIS SENTENCE SAID "3000 × 0.8 = 2400 < 2500" AND THAT
- * IS ONE TAG. The factor composes per active tag, and review replayed M2's
- * corpus -- which R15 merges into the acceptance scenario -- through the real
+ * WHAT THE TWO SCENARIOS ASSERT. Design §9:358 says a FIVE HUNDRED unit
+ * authorization is held on day twenty-one and that its reasons include the
+ * day-twelve address change with its own timestamp; R15 rules M3's acceptance
+ * scenario is M1's story at 2500 USDC. F8 records that the two disagree on the
+ * amount. Replaying M2's corpus -- which R15 merges in -- through the real
  * `tagObservation` and the store's real `strengthAt` at the day-twenty-one
- * instant: a `protocol/event/trustline_open` state at strength 0.5197, the
- * `address_integrity/transition` tag at 0.4165, and the `price/quoted/USDC` tag
- * the day-twenty-one quote opens at 0.4151. R22 excludes the last as the
- * intent's own, leaving TWO active tags and a threshold of 3000 × 0.8² = 1920.
- * 2500 is held either way, so §9's outcome survives -- but the arithmetic in the
- * sentence did not, and the measurement is what corrected it.
+ * instant gives a `protocol/event/trustline_open` state at 0.5197, the
+ * `address_integrity/transition` tag at 0.4165 and the `price/quoted/USDC` tag
+ * the quote opens at 0.4151. R22 excludes the last as the intent's own, so TWO
+ * tags are active and the threshold is 600 × 0.8² = 384. Both 500 and 2500 are
+ * held there.
+ *
+ * TWO VERSIONS OF THIS SENTENCE HAVE BEEN WRONG, both corrected by replaying the
+ * corpus rather than by rereading the prose, and both are recorded because the
+ * cause was the same each time. The first said "3000 × 0.8 = 2400 < 2500", which
+ * is one tag where there are two. The second said a 500 request passes at zero
+ * active tags and holds at one -- "the tag is what flips it" -- which the corpus
+ * refutes: §9 and R15 share ONE corpus and therefore its active-tag count, the
+ * trustline state is active from day one, and with the address tag filtered out
+ * 500 is STILL held at 480. The day-twelve tag flips nothing at either amount,
+ * and the windows where it would -- base in (625, 781.25] for 500, in
+ * (3125, 3906.25] for 2500 -- are disjoint, so no single base can give both a
+ * flip. §9 asks for a hold and for the address change to be among the reasons;
+ * it says the tag LOWERS the threshold, and lowering is not flipping.
  *
  * WHAT THAT COSTS TASK 9, recorded here because it is where the numbers live:
  * the trustline state is refreshed every morning, so it is active from day ONE

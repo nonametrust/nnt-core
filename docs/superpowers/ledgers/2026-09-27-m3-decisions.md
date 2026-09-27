@@ -163,6 +163,14 @@ wrong-killer — re-run individually, each turns two rows red.
 
 ### The numbers, declared as R5 requires
 
+> **THESE ARE TASK 1'S VALUES AND TWO OF THEM MOVED AT TASK 4.** `briefThreshold`
+> is 600 and `mediumCeiling` is 100 as of `25e038f`, and `crossAspectAffinity`
+> 0.75 was added; see R35-R37 below for the ruling and `policy.ts` for the current
+> list. Left in place rather than edited because this section records what Task 1
+> shipped — but a review found this passage contradicting the code, which is the
+> failure this ledger opens by warning about, so the pointer is here rather than
+> further down.
+
 `briefThreshold: 3000`, `thresholdUnit: "USDC"`, `activeTagFactor: 0.8`,
 `activeFloor: 0.25`, `relatednessFloor: 0.3`, `crossChannelAffinity: 0.55`,
 `mediumCeiling: 750`, `maxRetries: 5`.
@@ -508,6 +516,15 @@ the numbers are NOT being re-fitted now, because re-fitting to a scenario the pl
 set aside is the quiet re-fitting R5 forbids. **§9's story is the whitepaper's
 story, so this is outward-facing and it is Kerem's call**, not Task 9's to
 discover.
+
+> **HE DELEGATED IT, and the delegation belongs here rather than only in a commit
+> message.** Asked to decide, Kerem's answer was to hand all three open decisions
+> back: handle them yourself. R37 below is the ruling that followed, and the
+> numbers moved at `25e038f`. Recorded because a review read this paragraph
+> against the code and could not tell whether the call had been made or taken —
+> "either Kerem ruled it and it was not recorded, or the branch took an
+> outward-facing decision by itself" — and a ledger that cannot answer that
+> question about an outward-facing number is not doing its job.
 
 ---
 
