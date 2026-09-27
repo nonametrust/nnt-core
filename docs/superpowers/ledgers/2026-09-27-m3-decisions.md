@@ -508,3 +508,70 @@ the numbers are NOT being re-fitted now, because re-fitting to a scenario the pl
 set aside is the quiet re-fitting R5 forbids. **§9's story is the whitepaper's
 story, so this is outward-facing and it is Kerem's call**, not Task 9's to
 discover.
+
+---
+
+## Task 2 — the store changes, and one the plan gave to no task
+
+Committed at `f047e44`. Counts: schema 105, store **529**, tagging 329, indexer
+122, engine 151, root gates 64.
+
+R20, R9, R1, R34 and R13 all shipped as the corrected Task 2 text above
+prescribes. What execution added to that:
+
+**R13's read is held twice, because once was not enough.** The returned key set is
+pinned exactly AND the query is asserted not to select `idempotency_key` at all.
+Adding the column to the select alone — without returning it — left every test
+green, which is a latent disclosure waiting for the next reader to spread the row.
+A property stated about a return value does not constrain a query.
+
+**`BaselineStale`'s null case is a false predicate, not an impossible number.**
+`expectedCount === null` means "I read no row", and the conflict path needs a
+predicate nothing satisfies. `where n = -1` would have worked only because `n >= 0`
+is the table's rule, which is not this method's business to depend on.
+
+**R9's concurrency test asserts the MEAN, not only the count.** F14's defect leaves
+the count looking right — both writers write `count = 11` — so the count alone
+cannot witness a lost fold.
+
+**Two mutants needed a second look rather than a second row**, and the distinction
+is worth keeping. Making a clock `private` again is caught by `tsc` (TS2339) and
+not by vitest, so that rule is held by the typechecker; and selecting
+`idempotency_key` without returning it violated no property the tests STATED, so
+the property was widened rather than the mutant excused.
+
+## Task 3 — `holdsAt`, the stored form, and 71 assertions
+
+Committed at `a269316`. Counts: schema **117**, store 529, engine 151, root gates
+64. `@nonametrust/schema` moves 0.2.0 → 0.3.0; the WIRE version stays 0.1.0 and
+now carries a docstring saying why the two move for different reasons.
+
+**R16 needed no gate exemption, which was the whole argument.** Measured both
+ways: the root single-date-reader gate stays green with `holdsAt` in
+`schema/src/timing.ts`, and a copy planted in `packages/engine` turns it red.
+
+**Three decisions the plan's acceptance does not name.** The interval is CLOSED AT
+BOTH ENDS (a state valid until noon holds at noon); BOTH bounds are checked, not
+only `validUntil`, because a state beginning tomorrow does not hold today either;
+and an EVENT always holds, as a choice — a three-valued answer like `datedAt`'s
+was rejected because every caller would collapse it to a boolean and the collapse
+is where the mistake would live. An unparseable instant is refused rather than
+reported as "does not hold", since `NaN` fails every comparison and a silent
+`false` would claim an expiry nobody measured.
+
+**R32 cost more than the plan said, in the good direction.** 71 non-null
+assertions across five store test files became unnecessary once `AppendResult`'s
+arms carried `StoredObservation`, every removal confirmed by `tsc`. The plan
+described R32 as a typing tidy-up; it was 71 places where the tree had been
+asserting a fact the types could have carried.
+
+**And a type helper that could be deleted with nothing failing.** The first
+version of `StoredObservation` wrapped its intersection in
+`T extends unknown ? ... : never` and claimed that distribution was what kept
+`evidenceKind` narrowing. Mutation refused it: removing the conditional produced
+ZERO typecheck errors, because TypeScript already normalises `(A | B) & C` to
+`(A & C) | (B & C)`. `DistributiveOmit` beside it genuinely needs the helper,
+since `keyof` of a union is only its common keys. **A helper that can be deleted
+with nothing failing is a helper whose comment is wrong** — and the only reason
+this one was found is that the mutation step covers type-level rules through
+`tsc`, not only runtime rules through vitest.
