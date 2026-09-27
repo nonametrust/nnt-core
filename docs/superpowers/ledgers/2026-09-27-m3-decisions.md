@@ -343,3 +343,168 @@ databases, and **the same branch ref**. Two consequences, both measured:
 Isolation has three axes, not two: the tree, the database, **and the ref**.
 Reviewer worktrees must be `--detach`ed or on their own throwaway branch. Carried
 into memory as [[mutation-agents-need-isolation]].
+
+## Task 1's second review round, and the two rulings it forced before Task 2
+
+Committed at `168038a`. Counts: schema 105, tagging 329, indexer 122, store
+**512**, engine **151**, root gates **64**.
+
+Three agents again, one lens each, **detached** worktrees this time. The findings
+are written out in `168038a`'s message; what belongs here is the pattern and the
+decisions.
+
+**The pattern: every fix in round one was narrower than its hole, and two of them
+made things worse.** Round one's rewrite of the store's clock gate — a gate
+already hardened by three review rounds — let four clock reads through that the
+old one refused, the most realistic being a URL-scheme regex whose trailing
+`\/\/` read as a comment. Round one's anchoring of the specifier pattern closed a
+false positive by dropping nine real import shapes, including
+`const a = 1; import { POLICY_V0 } from "@nonametrust/tagging";` in the store —
+the M3 headline gate defeated by putting a statement first on the line. Both are
+fixed and both are now rows.
+
+**The lesson, which is not the same as round one's.** Round one learned that a
+rule needs a synthetic violation. Round two learned that **a fix needs a
+regression test against the behaviour it replaced**: both regressions were
+invisible because the suite only ever asked "is the tree clean", never "does this
+still catch what the old version caught". Where a fix replaces a working
+mechanism, the old mechanism's kills are the specification.
+
+### R33. M3's brief reads TAGS only. Permanent records are M4's.
+
+**Closes F6, which no ruling in the plan closed.** Design §6:265's flow includes
+"recent permanent records"; F6 records that no listing by namespace exists, and
+review confirmed no ruling R1-R32 closes it and Task 5 names no source for it.
+
+**Ruled: the brief's reasons come from tags, and from nothing else, in M3.** A
+permanent record is promoted evidence whose reason shape, whose relatedness and
+whose interaction with `SOURCE_UNREADABLE` no ruling here defines. Adding an
+unruled fourth reason source at Task 5 is precisely how a scenario gets closed on
+the last day with an invented constant, which R5 exists to forbid.
+
+**Cost, stated because it is outward-facing:** design §6:265's flow is not fully
+implemented in M3, so the brief can miss evidence that was deliberately promoted
+to outlive its month. That sentence belongs in the README beside R13's and R29's,
+not discovered by a reader of the design. M4 inherits the listing, the indexes the
+M1 ledger already asked for (`ledgers/2026-09-06-m1-decisions.md:246`), and the
+reason shape.
+
+### R34. `TriggerEventRepository` keeps its clock, as a BOUND on the instant it is handed.
+
+R1 gives `record` the trigger id and the instant, which makes its injected clock
+dead — a constructor dependency nothing reads. Review named the choice and left
+it open: drop the clock, or use it.
+
+**Ruled: keep it, and refuse an instant after `clock.now()`**, the way
+`TagRepository` already refuses a `taggedAt` after its clock (M2's R12). Dropping
+it would make this repository the one that cannot be checked for clock identity,
+which is the very property Task 5 is about to gate; and a caller handing a future
+instant is the mistake the bound exists to catch on every other table.
+
+**Cost:** one more refusal path, and a test for it, in Task 2.
+
+### The clock-identity fix goes ENGINE-side, and Task 2 opens the door
+
+§3 requires the engine's `at` to come from the same `Clock` the store holds, and
+§8 claims the store refuses otherwise. **Measured false, and worse than the
+ledger's earlier note said: 7 of 8 repository classes take an unchecked clock.**
+Only `ObservationRepository` checks identity, against its namespace repository
+(`observation.ts:129`); `PermanentRecordRepository` builds its own inner
+repositories from its own clock, so it is unchecked too. Review built an engine
+module giving five repositories a foreign clock: typecheck clean, 143 engine tests
+green, 47 root gates green. Live against the built store, one logical event landed
+with `ingested_at` from one clock, `baseline.updated_at` from a clock twenty days
+behind, `trigger.created_at` from a third and `audit.occurred_at` from a fourth,
+with no error anywhere — and a tag stamped four days in the future returned full
+`g0`, because `strengthAt` returns `g0` for every non-positive elapsed.
+
+A store-side fix was constructed and run: identity checks on four more
+constructors, 510/510 still green. It was rejected on the measurement.
+`AuditChain` is cross-namespace and has nothing to anchor to, so it stays
+unchecked under that design; `tag.test.ts:771` legitimately runs a second clock in
+one process and had to grow a second namespace repository to keep doing it; and
+the check only ever proves "the same clock as the object you handed me", which
+moves the problem rather than closing it.
+
+**Ruled: the composition root is the engine's, and so is the gate.** Task 5 gets
+one module that builds every repository from one clock, a test asserting each
+one's clock is `===` that object, and a lexical rule in the engine's own idiom —
+no `new *Repository(` or `new AuditChain(` outside that module, the same shape as
+`ids.ts`'s exemption. **Task 2's part is five words:** `private readonly clock`
+becomes `readonly clock` on the five classes that hide it, so the test can see
+it. Zero behaviour change, no call-site change; `namespace.ts:127` already does
+exactly this.
+
+One property no identity check reaches, recorded so Task 5 does not assume it:
+the brief's `at` is an INPUT under R1, so `at === clock.now()` is a separate
+claim the wrapper must establish.
+
+### Task 2's text, corrected before it is implemented
+
+- **R13's clear read must NOT return `idempotency_key`.** The storage card's §2c
+  measured a 300-candidate dictionary recovering 3 of 3 source references from
+  it. The columns to return are the ones §2c already lists as plaintext
+  survivors: `namespace_id`, `dated_at`, `channel`, `kind`, `evidence_kind`,
+  `ingested_at`, `producer`, `period` — plus the two state flags the private
+  `skeleton` already carries, so Task 5 need not decrypt-and-catch to decide
+  `SOURCE_UNREADABLE`. The plan's R13 text does not say this and §2c is where it
+  comes from.
+- **R9's expected count is a PARAMETER, never a field on `BaselineState`.**
+  `gates/baseline-shape.test.ts` holds that shape equal field for field between
+  tagging and the store, so a field added for the optimistic predicate would
+  break a shipped gate. `BaselineStale` does not exist in `errors.ts` yet. 15
+  `upsert` call sites change signature.
+- **`upsert` must keep composing on a `Transaction`.** `observation.test.ts:2301`
+  pins the refusing set as exactly `["append", "AuditChain.append", "promote"]`,
+  and R10 needs the fold and the tag write in one transaction — so `upsert` must
+  not join that set.
+- **R20 exports selectively, not `export *`.** `db.ts` also exports `Schema`,
+  `withIsoDates` and `refuseWriteInsideTransaction`; the header sentence promises
+  the connection, not the SQL.
+
+### Owed to a named task, not to Task 2
+
+- **R12 has an unruled FOURTH case:** same namespace, same channel, DIFFERENT
+  aspect — `price/quoted/USDC` against `price/quoted/XLM`, both of which the
+  corpus produces. R12 names three terms and the data model has four, and design
+  §1 puts aspect matching inside `rel()`. **Rule before Task 4.** If that case
+  gets a value below `crossChannelAffinity`, `relatednessFloor` stops being inert.
+- **Task 5 must exclude tags whose `taggedAt` is after the brief's `at`.**
+  `strengthAt` returns `g0` for every non-positive elapsed, and `listLive` has a
+  lower bound on the instant and no upper one, so a replay at a past `at` reports
+  every tag refreshed since at FULL strength. That is a determinism hole in G10
+  independent of any policy number.
+- **`BriefPolicy` will need four more numbers**, and the field pin should move
+  once rather than three times: `timeoutMs` (R7's engine-set timeout), a
+  lock/statement timeout (R7 puts `Cancelled`/55P03 in the unavailable set, and
+  that only fires under a `lock_timeout` the engine sets), **the rule that
+  produces `watch`** — §7 rules the grade vocabulary provisionally and nothing
+  anywhere says what produces the middle value, which is the largest unruled
+  number in the plan — and `maxReasons` if §7's latency measurement needs a cap.
+- **Task 7 must rule the ceiling at equality.** Its acceptance says "passes under,
+  refuses above" and leaves `amount === mediumCeiling` unsaid.
+- **The engine can still write SQL through the public surface**, and the boundary
+  gate cannot hold it lexically: `migrate(db)` leaks the `Db` type, so
+  `db.deleteFrom("tag").execute()` typechecks with every gate green. Named as a
+  stated limit and routed to R20/Task 2, where the engine is actually handed a
+  `Db`.
+
+### A reviewer finding this ledger refuses
+
+Round one reported `tagging/src/policy.ts:11-12` as stale for describing the
+scenario as "a five-hundred-unit request … held", on the grounds that R15 made it
+2500 USDC. **Checked: design §9:358 says "a five hundred unit authorization".**
+The docstring is accurate about the design; the 500-against-2500 disagreement is
+finding F8, which the plan already records. No change.
+
+**But checking it found something in this milestone's own numbers.**
+`BRIEF_POLICY_V0` does not satisfy design §9's assertion. A 500-unit request
+against a lowered threshold of 2400 (one active tag) or 1920 (two) is not held, so
+§9's own scenario test would fail on these defaults. They are fitted to R15's
+2500-USDC story, which the plan chose deliberately to close F8. Both are
+satisfiable at once — a base in `(500, 625]` with a factor of 0.8 makes an
+unlowered 500 pass and a lowered one hold, while 2500 stays held either way — and
+the numbers are NOT being re-fitted now, because re-fitting to a scenario the plan
+set aside is the quiet re-fitting R5 forbids. **§9's story is the whitepaper's
+story, so this is outward-facing and it is Kerem's call**, not Task 9's to
+discover.
