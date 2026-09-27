@@ -4,6 +4,7 @@ import type { WireObservation } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db } from "../db.js";
 import { withSchema, storedObservation } from "../testing/harness.js";
+import { BaselineStale } from "../errors.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import { RETENTION_V0 } from "../retention.js";
@@ -85,16 +86,18 @@ afterAll(async () => { await done(); });
 describe("baseline", () => {
   it("round-trips every column through upsert and forNamespace", async () => {
     const state = aBaseline({ aspect: "roundtrip" });
-    const written = await baselines.upsert(state);
+    const written = await baselines.upsert(state, null);
     expect(written).toEqual({ ...state, updatedAt: clock.now() });
     const read = (await baselines.forNamespace(ns)).filter((b) => b.aspect === "roundtrip");
     expect(read).toEqual([written]);
   });
 
   it("keeps one baseline per namespace, channel and aspect, holding the latest state", async () => {
-    await baselines.upsert(aBaseline({ aspect: "once", count: 1 }));
+    await baselines.upsert(aBaseline({ aspect: "once", count: 1 }), null);
     clock.advance(1000);
-    await baselines.upsert(aBaseline({ aspect: "once", count: 2, mean: 9, medianEst: 9, madEst: 3 }));
+    // The expected count is 1, the row's: R9 makes this write optimistic, so a
+    // second insert claiming to have read nothing is now a stale read.
+    await baselines.upsert(aBaseline({ aspect: "once", count: 2, mean: 9, medianEst: 9, madEst: 3 }), 1);
     const all = (await baselines.forNamespace(ns)).filter((b) => b.aspect === "once");
     expect(all).toHaveLength(1);
     expect(all[0]!.count).toBe(2);
@@ -107,7 +110,7 @@ describe("baseline", () => {
   // the column by name, so a repository that wrote the count somewhere else
   // and read it back from there would not pass by being its own inverse.
   it("stores count in the column named n", async () => {
-    await baselines.upsert(aBaseline({ aspect: "named", count: 41 }));
+    await baselines.upsert(aBaseline({ aspect: "named", count: 41 }), null);
     const row = await sql<{ n: string }>`
       select n from baseline where namespace_id = ${ns} and channel = 'volume' and aspect = 'named'
     `.execute(db);
@@ -173,14 +176,106 @@ describe("baseline", () => {
   // robust pair, and the pair check is an equivalence rather than a ban on
   // nulls. Without this, the check above could be satisfied by refusing every
   // null and nobody would notice until the first observation of a new pair.
+
+  // R9: the fold is optimistic, and F14 is why.
+  //
+  // MEASURED BEFORE THE CHANGE: `upsert` was `on conflict do update` with no
+  // predicate -- last writer wins. Two writers each read `count = 10`, each
+  // folded one observation, each wrote `count = 11` with a different mean, both
+  // statements SUCCEEDED, and the row ended at 11 with one observation's
+  // contribution gone and no error anywhere. It was latent only because nothing
+  // outside tests called `upsert`; M3's engine is what makes it reachable, on the
+  // ordinary path.
+  describe("the optimistic predicate", () => {
+    it("takes the count the caller read and writes over it", async () => {
+      const first = await baselines.upsert(aBaseline({ aspect: "opt-ok", count: 1 }), null);
+      expect(first.count).toBe(1);
+      const second = await baselines.upsert(aBaseline({ aspect: "opt-ok", count: 2, mean: 9, medianEst: 9 }), 1);
+      expect(second.count).toBe(2);
+      expect(second.mean).toBe(9);
+    });
+
+    it("refuses a write built on a count the row has moved past, and changes nothing", async () => {
+      await baselines.upsert(aBaseline({ aspect: "opt-stale", count: 5, mean: 5, medianEst: 5 }), null);
+      // A second writer that read count 5, folded, and lost the race.
+      await baselines.upsert(aBaseline({ aspect: "opt-stale", count: 6, mean: 6, medianEst: 6 }), 5);
+      const loser = baselines.upsert(aBaseline({ aspect: "opt-stale", count: 6, mean: 999, medianEst: 999 }), 5);
+      await expect(loser).rejects.toThrow(BaselineStale);
+      await expect(loser).rejects.toThrow(/is not at count 5/);
+      // And the row is what the winner left, not a blend of the two.
+      const [row] = (await baselines.forNamespace(ns)).filter((b) => b.aspect === "opt-stale");
+      expect(row?.count).toBe(6);
+      expect(row?.mean).toBe(6);
+    });
+
+    it("refuses a first insert when a row is already there", async () => {
+      await baselines.upsert(aBaseline({ aspect: "opt-exists", count: 3 }), null);
+      // `null` is the caller saying "I read no baseline for this pair". If one
+      // exists, that read was stale exactly as a count would have been.
+      await expect(baselines.upsert(aBaseline({ aspect: "opt-exists", count: 1 }), null))
+        .rejects.toThrow(BaselineStale);
+    });
+
+    it("gives one success and one refusal to two concurrent folds on one pair", async () => {
+      // The plan's acceptance criterion for R9, and the shape F14 measured going
+      // wrong. Both writers read the same count and fold one observation each.
+      await baselines.upsert(aBaseline({ aspect: "opt-race", count: 10, mean: 100, medianEst: 100 }), null);
+      const settled = await Promise.allSettled([
+        baselines.upsert(aBaseline({ aspect: "opt-race", count: 11, mean: 101, medianEst: 101 }), 10),
+        baselines.upsert(aBaseline({ aspect: "opt-race", count: 11, mean: 202, medianEst: 202 }), 10),
+      ]);
+      const kept = settled.filter((r) => r.status === "fulfilled");
+      const refused = settled.filter((r) => r.status === "rejected");
+      expect(kept).toHaveLength(1);
+      expect(refused).toHaveLength(1);
+      expect((refused[0] as PromiseRejectedResult).reason).toBeInstanceOf(BaselineStale);
+      // The row is at 11 and carries ONE of the two means, not an average and not
+      // a mean from a state that never existed. The mean is the witness here, not
+      // the count: a lost fold leaves the count looking right.
+      const [row] = (await baselines.forNamespace(ns)).filter((b) => b.aspect === "opt-race");
+      expect(row?.count).toBe(11);
+      expect([101, 202]).toContain(row?.mean);
+    });
+
+    it("composes on a transaction, because R10 needs the fold and the tag write in one", async () => {
+      // `observation.test.ts` pins the set of writes that REFUSE a transaction as
+      // exactly append, AuditChain.append and promote. `upsert` must not join it:
+      // R10 rules that the fold and the tag write are one unit of work, and a
+      // retry re-runs the whole transaction.
+      await db.transaction().execute(async (trx) => {
+        const inTrx = new BaselineRepository(trx, clock);
+        await inTrx.upsert(aBaseline({ aspect: "opt-trx", count: 1 }), null);
+      });
+      const [row] = (await baselines.forNamespace(ns)).filter((b) => b.aspect === "opt-trx");
+      expect(row?.count).toBe(1);
+    });
+
+    it("rolls the fold back when the transaction rolls back", async () => {
+      // The other half of R10: a stale tag write must undo a committed fold.
+      await baselines.upsert(aBaseline({ aspect: "opt-rollback", count: 4, mean: 40, medianEst: 40 }), null);
+      await expect(
+        db.transaction().execute(async (trx) => {
+          const inTrx = new BaselineRepository(trx, clock);
+          await inTrx.upsert(aBaseline({ aspect: "opt-rollback", count: 5, mean: 50, medianEst: 50 }), 4);
+          throw new Error("the tag write failed");
+        }),
+      ).rejects.toThrow("the tag write failed");
+      const [row] = (await baselines.forNamespace(ns)).filter((b) => b.aspect === "opt-rollback");
+      expect(row?.count, "the fold must not survive its transaction").toBe(4);
+      expect(row?.mean).toBe(40);
+    });
+  });
+
   // An upsert writes what it is handed and does not coalesce: a baseline
   // moving back to an empty pair must clear both estimates rather than keep
   // the old ones under a new count. Held by an upsert over an existing row,
   // because a fresh insert cannot see the difference.
   it("clears the robust pair on upsert rather than keeping the old one", async () => {
-    await baselines.upsert(aBaseline({ aspect: "cleared", count: 3, mean: 4, medianEst: 4, madEst: 2 }));
+    await baselines.upsert(aBaseline({ aspect: "cleared", count: 3, mean: 4, medianEst: 4, madEst: 2 }), null);
     const back = await baselines.upsert(
+      // Over the row written just above at count 3.
       aBaseline({ aspect: "cleared", count: 0, mean: 0, m2: 0, medianEst: null, madEst: null }),
+      3,
     );
     expect(back).toMatchObject({ count: 0, medianEst: null, madEst: null });
   });
@@ -188,12 +283,13 @@ describe("baseline", () => {
   it("writes the empty baseline: zero count, no robust pair", async () => {
     const empty = await baselines.upsert(
       aBaseline({ aspect: "empty", count: 0, mean: 0, m2: 0, medianEst: null, madEst: null }),
+      null,
     );
     expect(empty).toMatchObject({ count: 0, medianEst: null, madEst: null });
   });
 
   it("refuses a negative count, by class", async () => {
-    const written = baselines.upsert(aBaseline({ aspect: "neg", count: -1 }));
+    const written = baselines.upsert(aBaseline({ aspect: "neg", count: -1 }), null);
     await expect(written).rejects.toBeInstanceOf(ConstraintViolation);
     await expect(written).rejects.toMatchObject({ sqlstate: "23514", constraint: "baseline_n_check" });
   });
@@ -223,18 +319,18 @@ describe("baseline", () => {
     }
     // A signed column takes a negative, so the sign checks are on the right
     // columns and not on all of them.
-    await expect(baselines.upsert(aBaseline({ aspect: "signed", mean: -3, medianEst: -3, fastMean: -1, slowMean: -0.5 })))
+    await expect(baselines.upsert(aBaseline({ aspect: "signed", mean: -3, medianEst: -3, fastMean: -1, slowMean: -0.5 }), null))
       .resolves.toMatchObject({ mean: -3 });
   });
 
   it("refuses the same through the repository, and leaves the stored state as it was", async () => {
-    await baselines.upsert(aBaseline({ aspect: "poison", mean: 1, medianEst: 1 }));
+    await baselines.upsert(aBaseline({ aspect: "poison", mean: 1, medianEst: 1 }), null);
     // Each poison is refused for its own reason rather than incidentally by
     // the location check: the NaN row carries NaN in both estimates, so what
     // stops it is the finiteness check 0006 added, not the equality this
     // migration added.
     for (const poison of [{ mean: Number.NaN, medianEst: Number.NaN }, { m2: -1 }]) {
-      const written = baselines.upsert(aBaseline({ aspect: "poison", ...poison }));
+      const written = baselines.upsert(aBaseline({ aspect: "poison", ...poison }), null);
       await expect(written).rejects.toBeInstanceOf(ConstraintViolation);
       await expect(written).rejects.toMatchObject({ sqlstate: "23514" });
       // Named, so the comment above is a claim the test holds: each poison is
@@ -251,11 +347,12 @@ describe("baseline", () => {
 describe("trigger_event", () => {
   it("round-trips every column through record and get", async () => {
     const cluster = randomUUID();
+    const triggerId = randomUUID();
     const t = await triggers.record({
-      namespaceId: ns, observationId: obs, status: "harm_confirmed",
+      triggerId, at: clock.now(), namespaceId: ns, observationId: obs, status: "harm_confirmed",
       tier: "B", clusterId: cluster, surprise: 9.1,
     });
-    expect(t.triggerId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(t.triggerId).toBe(triggerId);
     expect(t).toEqual({
       triggerId: t.triggerId, namespaceId: ns, observationId: obs, status: "harm_confirmed",
       tier: "B", clusterId: cluster, surprise: 9.1, createdAt: clock.now(),
@@ -264,11 +361,86 @@ describe("trigger_event", () => {
   });
 
   it("carries an omitted tier and cluster back as null", async () => {
-    const t = await triggers.record({ namespaceId: ns, observationId: obs, status: "candidate", surprise: 3.2 });
+    const t = await triggers.record({
+      triggerId: randomUUID(), at: clock.now(), namespaceId: ns, observationId: obs,
+      status: "candidate", surprise: 3.2,
+    });
     const read = await triggers.get(t.triggerId);
     expect(read.tier).toBeNull();
     expect(read.clusterId).toBeNull();
     expect(read.status).toBe("candidate");
+  });
+
+
+  // R1: the id and the instant are the CALLER's, and R34: the clock stays, as a
+  // bound on the instant it is handed.
+  //
+  // Why R1 needs this. The brief is a pure function returning a value and a list
+  // of effects, and its audit body names the trigger id -- so the id must be an
+  // INPUT the core was given, not one the writer mints. As shipped, `record`
+  // called `randomUUID()` itself and stamped `created_at` from its own clock, so
+  // the row's id was never the id in the audit body, and a RETRIED `record` wrote
+  // a second row for one logical trigger.
+  describe("the id and the instant are the caller's", () => {
+    it("writes the id it was handed, so an audit body can name it in advance", async () => {
+      const triggerId = randomUUID();
+      // Before the fixed test clock: R34 refuses an instant after it.
+      const at = new Date(clock.now().getTime() - 60_000);
+      const t = await triggers.record({
+        triggerId, at, namespaceId: ns, observationId: obs, status: "candidate", surprise: 4.5,
+      });
+      expect(t.triggerId).toBe(triggerId);
+      expect(t.createdAt).toEqual(at);
+      expect(await triggers.get(triggerId)).toEqual(t);
+    });
+
+    it("collides on the primary key instead of writing a second row for one trigger", async () => {
+      // The retry path, which is what R1 is for: an engine that recorded the
+      // trigger and then failed before committing its audit row retries with the
+      // SAME id, and must not end with two candidates for one brief.
+      const triggerId = randomUUID();
+      const at = new Date(clock.now().getTime() - 120_000);
+      const input = {
+        triggerId, at, namespaceId: ns, observationId: obs, status: "candidate" as const, surprise: 1.25,
+      };
+      await triggers.record(input);
+      const again = triggers.record(input);
+      await expect(again).rejects.toBeInstanceOf(ConstraintViolation);
+      await expect(again).rejects.toMatchObject({ sqlstate: "23505" });
+      const rows = await db
+        .selectFrom("trigger_event").select("trigger_id").where("trigger_id", "=", triggerId).execute();
+      expect(rows, "one logical trigger must be one row").toHaveLength(1);
+    });
+
+    it("refuses an instant after its clock, which is what the clock is still for", async () => {
+      // R34. R1 makes the instant an input, which leaves the injected clock with
+      // nothing to do -- a constructor dependency nothing reads. Rather than drop
+      // it, it becomes the bound, exactly as `TagRepository` refuses a `taggedAt`
+      // after its own clock. Dropping it would have made this the one repository
+      // whose clock a composition root cannot check, which is the property Task 5
+      // is about to gate.
+      const future = new Date(clock.now().getTime() + 1);
+      const recorded = triggers.record({
+        triggerId: randomUUID(), at: future, namespaceId: ns, observationId: obs,
+        status: "candidate", surprise: 2,
+      });
+      await expect(recorded).rejects.toBeInstanceOf(RangeError);
+      await expect(recorded).rejects.toThrow(/is after the clock/);
+      // The instant of the clock itself is admissible; only after it is not.
+      const atNow = await triggers.record({
+        triggerId: randomUUID(), at: clock.now(), namespaceId: ns, observationId: obs,
+        status: "candidate", surprise: 2,
+      });
+      expect(atNow.createdAt).toEqual(clock.now());
+    });
+
+    it("refuses an invalid instant rather than storing one", async () => {
+      const recorded = triggers.record({
+        triggerId: randomUUID(), at: new Date("not a date"), namespaceId: ns, observationId: obs,
+        status: "candidate", surprise: 2,
+      });
+      await expect(recorded).rejects.toBeInstanceOf(RangeError);
+    });
   });
 
   // A tier is the evidence grade of a harm-confirmed trigger and of nothing
@@ -276,7 +448,8 @@ describe("trigger_event", () => {
   it("refuses a tier on a status that is not harm-confirmed", async () => {
     for (const status of ["candidate", "verified"] as const) {
       const recorded = triggers.record({
-        namespaceId: ns, observationId: obs, status, tier: "high", surprise: 3.2,
+        triggerId: randomUUID(), at: clock.now(), namespaceId: ns, observationId: obs,
+        status, tier: "high", surprise: 3.2,
       });
       await expect(recorded).rejects.toBeInstanceOf(ConstraintViolation);
       await expect(recorded).rejects.toMatchObject({ sqlstate: "23514", constraint: "trigger_event_tier_needs_harm" });
@@ -285,7 +458,7 @@ describe("trigger_event", () => {
 
   it("accepts a tier on a harm-confirmed status", async () => {
     const t = await triggers.record({
-      namespaceId: ns, observationId: obs, status: "harm_confirmed", tier: "high", surprise: 9.1,
+      triggerId: randomUUID(), at: clock.now(), namespaceId: ns, observationId: obs, status: "harm_confirmed", tier: "high", surprise: 9.1,
     });
     expect((await triggers.get(t.triggerId)).tier).toBe("high");
   });
@@ -299,7 +472,7 @@ describe("trigger_event", () => {
 
   it("refuses a surprise that is NaN or infinite", async () => {
     for (const surprise of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
-      const recorded = triggers.record({ namespaceId: ns, observationId: obs, status: "candidate", surprise });
+      const recorded = triggers.record({ triggerId: randomUUID(), at: clock.now(), namespaceId: ns, observationId: obs, status: "candidate", surprise });
       await expect(recorded).rejects.toBeInstanceOf(ConstraintViolation);
       await expect(recorded).rejects.toMatchObject({ sqlstate: "23514" });
     }
@@ -310,7 +483,7 @@ describe("trigger_event", () => {
   // the nightly job would then scale the wrong counterparty's window.
   it("refuses a trigger filed under a namespace its observation does not belong to", async () => {
     const other = (await namespaces.ensure({ kind: "wallet", id: "SOMEONEELSE" })).namespaceId;
-    const recorded = triggers.record({ namespaceId: other, observationId: obs, status: "candidate", surprise: 1 });
+    const recorded = triggers.record({ triggerId: randomUUID(), at: clock.now(), namespaceId: other, observationId: obs, status: "candidate", surprise: 1 });
     await expect(recorded).rejects.toBeInstanceOf(ConstraintViolation);
     await expect(recorded).rejects.toMatchObject({ sqlstate: "23503", constraint: "trigger_event_observation_in_namespace" });
   });
@@ -354,7 +527,7 @@ describe("volatility", () => {
 describe("hot_window", () => {
   let trig: string;
   beforeAll(async () => {
-    trig = (await triggers.record({ namespaceId: ns, observationId: obs, status: "verified", surprise: 4 })).triggerId;
+    trig = (await triggers.record({ triggerId: randomUUID(), at: clock.now(), namespaceId: ns, observationId: obs, status: "verified", surprise: 4 })).triggerId;
   });
 
   it("round-trips every column through open and get", async () => {
@@ -461,7 +634,7 @@ describe("the columns, in the catalogue", () => {
 describe("permanent_record.rescued_by, now that trigger_event exists", () => {
   it("survives a promotion that names a real trigger", async () => {
     const source = await appendUnder("GOLDADDRESS");
-    const trig = (await triggers.record({ namespaceId: ns, observationId: obs, status: "verified", surprise: 5 })).triggerId;
+    const trig = (await triggers.record({ triggerId: randomUUID(), at: clock.now(), namespaceId: ns, observationId: obs, status: "verified", surprise: 5 })).triggerId;
     const record = await records.promote({
       observationId: source, namespaceId: ns, rescuedBy: trig, confidence: 0.7,
     });
@@ -478,7 +651,7 @@ describe("permanent_record.rescued_by, now that trigger_event exists", () => {
     const other = (await namespaces.ensure({ kind: "wallet", id: "SOMEONEELSE" })).namespaceId;
     const theirs = await appendUnder("SOMEONEELSE");
     const theirTrigger = (await triggers.record({
-      namespaceId: other, observationId: theirs, status: "verified", surprise: 5,
+      triggerId: randomUUID(), at: clock.now(), namespaceId: other, observationId: theirs, status: "verified", surprise: 5,
     })).triggerId;
     const source = await appendUnder("GOLDADDRESS");
     const promoted = records.promote({

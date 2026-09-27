@@ -22,7 +22,10 @@ const COLUMNS = ["namespace_id", "q_hat", "updated_at"] as const;
 export class VolatilityRepository {
   constructor(
     private readonly db: Db,
-    private readonly clock: Clock,
+    // Public and readonly so a composition root can assert every repository
+    // shares one clock -- see `surface.test.ts`. Exposing it is not a check: a
+    // reader of one repository still cannot tell whose clock this is.
+    readonly clock: Clock,
   ) {}
 
   /**

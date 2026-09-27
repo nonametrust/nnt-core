@@ -37,6 +37,22 @@ export class TagAltered extends StoreError {}
 // nothing was refused by the database, the caller's read is simply older than
 // the row. The cure is to read the live tag again and decide again, which is
 // a different instruction from "this tag does not exist".
+/**
+ * A baseline write built on a count the row has moved past.
+ *
+ * R9, closing F14. `upsert` was `on conflict do update` with no predicate --
+ * last writer wins -- and that was MEASURED losing a fold: two writers each read
+ * `count = 10`, each folded one observation, each wrote `count = 11` with a
+ * different mean, both statements succeeded, and the row ended at 11 with one
+ * observation's contribution gone and no error anywhere.
+ *
+ * The caller's cure is the same as `TagRefreshStale`'s: re-read the baseline and
+ * decide again. Under R10 both writes live in one transaction, so a stale
+ * baseline rolls the tag write back with it and the retry re-decides from a
+ * state containing neither.
+ */
+export class BaselineStale extends StoreError {}
+
 export class TagRefreshStale extends StoreError {}
 
 // Raised in TypeScript, so it carries no SQLSTATE: the database refused

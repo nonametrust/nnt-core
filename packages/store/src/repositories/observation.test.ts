@@ -1,4 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { deriveIdempotencyKey, type WireObservation } from "@nonametrust/schema";
 import { sql, Kysely, PostgresDialect } from "kysely";
@@ -2377,5 +2379,148 @@ describe("composing on a transaction", () => {
       expect((await obs.get(stored.observationId!)).channel).toBe("volume");
       expect(await ns.find("wallet", "GOLDADDRESS")).not.toBeNull();
     });
+  });
+});
+
+// R13: a public read by observation id that returns the columns surviving in the
+// clear and opens no payload.
+//
+// WHY IT HAS TO EXIST. The brief keeps a reason whose evidence is unreadable,
+// with a code, rather than dropping it -- because omitting it would make the
+// brief's answer change as retention runs, so the output would depend on the
+// calendar rather than on the evidence. To build such a reason the engine needs
+// the clear columns of an observation whose month key is gone, and every public
+// path to an observation DECRYPTS: `get` goes through `read`, and the
+// non-decrypting `skeleton` is private AND keyed on the idempotency key, which
+// the engine does not hold.
+describe("readClear", () => {
+  const grace90 = RETENTION_V0;
+
+  /** Repositories on one policy object at one instant (§2d, R16). */
+  function at(iso: string) {
+    const c = fixedClock(new Date(iso));
+    const ns = new NamespaceRepository(db, ring, c, grace90);
+    return { ns, obs: new ObservationRepository(db, ns, c, grace90) };
+  }
+
+  it("returns the clear columns for a row whose month has been swept, where get refuses", async () => {
+    const mar = at("2027-03-09T00:00:00.000Z");
+    const wire = anEvent({
+      namespace: { kind: "wallet", id: "CLEARREAD" },
+      source: { ...src, ref: "op:clearread:1" },
+    });
+    const appended = await mar.obs.append(wire);
+    // The `!` is R32 biting where the plan predicted it: `AppendResult`'s
+    // readable arms carry an `Observation` whose `observationId` is OPTIONAL while
+    // its unreadable arm declares it required, so a caller narrowing on `created`
+    // gets a different type for the same field. Task 3 gives `@nonametrust/schema`
+    // a stored-observation type with the id required and this assertion goes away.
+    const observationId = storedObservation(appended).observationId!;
+    const nsId = (await mar.ns.find("wallet", "CLEARREAD"))!.namespaceId;
+
+    // Before the sweep both reads work, so what changes below is the sweep and
+    // not the row.
+    await expect(mar.obs.get(observationId)).resolves.toBeDefined();
+    const before = await mar.obs.readClear(observationId);
+    expect(before.periodExpired).toBe(false);
+
+    // The sweep's own UPDATE, scoped to this month, for the reason the sibling
+    // test above gives: `expirePeriods` is table-wide and would expire every
+    // month this file has minted.
+    const swept = await sql<{ n: string }>`
+      update namespace_key set key_wrapped = null, shredded_at = ${new Date("2027-08-01T00:00:00.000Z")}
+       where namespace_id = ${nsId} and period = '2027-03-01'::date and key_wrapped is not null
+      returning 1 as n`.execute(db);
+    expect(swept.rows).toHaveLength(1);
+
+    // `get` refuses the same row, which is the contrast the ruling rests on.
+    await expect(mar.obs.get(observationId)).rejects.toBeInstanceOf(PayloadExpired);
+
+    const clear = await mar.obs.readClear(observationId);
+    expect(clear.observationId).toBe(observationId);
+    expect(clear.namespaceId).toBe(nsId);
+    // Asserted against the WIRE rather than a literal: a hard-coded channel here
+    // is a guess about the fixture, and the property is that the read reports what
+    // was stored.
+    expect(clear.channel).toBe(wire.channel);
+    expect(clear.kind).toBe(wire.kind);
+    expect(clear.evidenceKind).toBe(wire.evidenceKind);
+    expect(clear.evidenceKind).toBeTypeOf("string");
+    expect(clear.producer).toBeTypeOf("string");
+    expect(clear.period).toBeInstanceOf(Date);
+    expect(clear.ingestedAt).toBeInstanceOf(Date);
+    expect(clear.datedAt).toBeInstanceOf(Date);
+    // The two flags the private skeleton already carries, so Task 5 can decide
+    // SOURCE_UNREADABLE without a decrypt-and-catch.
+    expect(clear.periodExpired).toBe(true);
+    expect(clear.namespaceErased).toBe(false);
+  });
+
+  it("returns NO idempotency key, because that column survives erasure as a source reference", async () => {
+    // THE ONE COLUMN THIS READ MUST NOT CARRY, and the plan's R13 does not say so
+    // -- the storage card's §2c does. `idempotency_key` is an unkeyed SHA-256 over
+    // `(producer, network, ref, channel, kind, namespace id)` where every part but
+    // `ref` is already a column in the clear and `ref` is a public-ledger
+    // operation id: §2c measured a three-hundred-candidate dictionary recovering
+    // 3 of 3 source references of a shredded namespace. Returning it here would
+    // hand that dictionary to any caller of a read whose whole purpose is to work
+    // AFTER erasure.
+    const apr = at("2027-04-09T00:00:00.000Z");
+    const appended = await apr.obs.append(
+      anEvent({
+        namespace: { kind: "wallet", id: "NOIDEMKEY" },
+        source: { ...src, ref: "op:noidemkey:1" },
+      }),
+    );
+    const clear = await apr.obs.readClear(storedObservation(appended).observationId!); // R32, see above
+    for (const forbidden of ["idempotencyKey", "idempotency_key", "payload", "source", "ref"]) {
+      expect(Object.keys(clear), `${forbidden} must not be in a clear read`).not.toContain(forbidden);
+    }
+    // AND THE QUERY DOES NOT EVEN SELECT IT. The assertion above holds the
+    // returned object, which is the property that matters -- but selecting the
+    // column and not returning it is a latent hazard: the next reader spreads the
+    // row and the disclosure arrives with no test failing. Measured: adding
+    // `o.idempotency_key` to the select alone left every test green. So the
+    // absence is held lexically too, at the one place it could be reintroduced.
+    const readClearSql = readFileSync(
+      fileURLToPath(new URL("./observation.ts", import.meta.url).href.replace(/\.js$/, ".ts")),
+      "utf8",
+    ).slice(0);
+    const body = readClearSql.slice(readClearSql.indexOf("async readClear("));
+    const query = body.slice(0, body.indexOf("`.execute(this.db)"));
+    expect(query, "readClear must not select idempotency_key").not.toMatch(/idempotency_key/);
+
+    // Pinned as an exact set, so a column added later is a decision and not a
+    // side effect.
+    expect(Object.keys(clear).sort()).toEqual([
+      "channel", "datedAt", "evidenceKind", "ingestedAt", "kind",
+      "namespaceErased", "namespaceId", "observationId", "period", "periodExpired", "producer",
+    ]);
+  });
+
+  it("refuses an observation id that is not there, by name", async () => {
+    const may = at("2027-05-09T00:00:00.000Z");
+    await expect(may.obs.readClear("00000000-0000-4000-8000-000000000000"))
+      .rejects.toBeInstanceOf(ObservationNotFound);
+  });
+
+  it("reads an erased namespace's row, which is the case it exists for", async () => {
+    // A brief refuses an erased namespace before it reads a tag (R14), but a
+    // reason built from a tag opened BEFORE erasure still needs its clear
+    // columns. `get` raises NamespaceShredded here; this read answers.
+    const jun = at("2027-06-09T00:00:00.000Z");
+    const appended = await jun.obs.append(
+      anEvent({
+        namespace: { kind: "wallet", id: "ERASEDCLEAR" },
+        source: { ...src, ref: "op:erasedclear:1" },
+      }),
+    );
+    const observationId = storedObservation(appended).observationId!; // R32, see above
+    const erasedNs = (await jun.ns.find("wallet", "ERASEDCLEAR"))!.namespaceId;
+    await jun.ns.shred(erasedNs);
+    await expect(jun.obs.get(observationId)).rejects.toBeInstanceOf(NamespaceShredded);
+    const clear = await jun.obs.readClear(observationId);
+    expect(clear.namespaceErased).toBe(true);
+    expect(clear.observationId).toBe(observationId);
   });
 });

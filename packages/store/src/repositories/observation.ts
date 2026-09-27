@@ -73,11 +73,37 @@ function isDuplicateKey(e: unknown): boolean {
   return code === UNIQUE_VIOLATION && constraint === IDEMPOTENCY_CONSTRAINT;
 }
 
+/**
+ * The columns of an observation that survive in the clear, and nothing else.
+ *
+ * `datedAt` is nullable because a STATE has no dated instant -- `0002` allows a
+ * null there, and R19 makes the brief's reason shape admit a reason with no
+ * instant for exactly this reason.
+ */
+export interface ClearObservation {
+  observationId: string;
+  namespaceId: string;
+  channel: string;
+  kind: string;
+  evidenceKind: string;
+  datedAt: Date | null;
+  ingestedAt: Date;
+  producer: string;
+  period: Date;
+  /** The month key is gone: the payload will not open, and never will again. */
+  periodExpired: boolean;
+  /** The namespace key is gone: the whole counterparty space was erased. */
+  namespaceErased: boolean;
+}
+
 export class ObservationRepository {
   constructor(
     private readonly db: Db,
     private readonly namespaces: NamespaceRepository,
-    private readonly clock: Clock,
+    // Public and readonly so a composition root can assert every repository
+    // shares one clock -- see `surface.test.ts`. Exposing it is not a check: a
+    // reader of one repository still cannot tell whose clock this is.
+    readonly clock: Clock,
     // R16's sibling. Required rather than defaulted because a default is a
     // policy that reaches production, which is the argument the key ring's
     // missing default master key already made.
@@ -459,6 +485,70 @@ export class ObservationRepository {
           namespaceErased: row.ns_erased,
         }
       : null;
+  }
+
+  /**
+   * An observation's columns that survive in the clear, by observation id, with
+   * NO payload opened and none returned.
+   *
+   * R13, and the reason it is a public method rather than a use of an existing
+   * one: the brief KEEPS a reason whose evidence is unreadable, carrying a code,
+   * because omitting it would make the brief's answer change as retention runs --
+   * the output would then depend on the calendar rather than on the evidence,
+   * which is the worst of the three options. Building such a reason needs these
+   * columns, and every other public path here decrypts: `get` goes through
+   * `read`, and the non-decrypting `skeleton` is private and keyed on the
+   * idempotency key, which a caller holding an observation id does not have.
+   *
+   * WHAT IT DELIBERATELY DOES NOT RETURN, and this is not in the plan's R13 --
+   * it is in the storage card's §2c. `idempotency_key` is an unkeyed SHA-256 over
+   * `(producer, network, ref, channel, kind, namespace id)` where every part but
+   * `ref` is already a column in the clear and `ref` is a public-ledger operation
+   * id; §2c measured a three-hundred-candidate dictionary recovering 3 of 3
+   * source references of a shredded namespace. Handing it back from a read whose
+   * whole purpose is to answer AFTER erasure would hand out that dictionary. So
+   * the columns returned are exactly the plaintext survivors §2c already lists,
+   * and `source.ref` is not among them because it lives inside the sealed
+   * payload.
+   *
+   * The two state flags come with it, so a caller can decide the reason's code
+   * without a decrypt-and-catch: `periodExpired` when the month key is gone,
+   * `namespaceErased` when the namespace key is. Both are the same booleans the
+   * private skeleton reads, and they are independent -- R18's lesson applied
+   * rather than relearned.
+   */
+  async readClear(observationId: string): Promise<ClearObservation> {
+    const found = await sql<{
+      observation_id: string; namespace_id: string; channel: string; kind: string;
+      evidence_kind: string; dated_at: Date | null; ingested_at: Date; producer: string;
+      period: Date; period_expired: boolean; ns_erased: boolean;
+    }>`
+      select o.observation_id::text as observation_id, o.namespace_id::text as namespace_id,
+             o.channel, o.kind, o.evidence_kind, o.dated_at, o.ingested_at, o.producer, o.period,
+             (k.key_wrapped is null) as period_expired,
+             (n.data_key_wrapped is null) as ns_erased
+      from observation o
+      join namespace n on n.namespace_id = o.namespace_id
+      join namespace_key k
+        on k.namespace_id = o.namespace_id and k.period = o.period
+      where o.observation_id = ${observationId}`.execute(this.db);
+    const row = found.rows[0];
+    if (row === undefined) {
+      throw new ObservationNotFound(`no observation ${observationId}`);
+    }
+    return {
+      observationId: row.observation_id,
+      namespaceId: row.namespace_id,
+      channel: row.channel,
+      kind: row.kind,
+      evidenceKind: row.evidence_kind,
+      datedAt: row.dated_at,
+      ingestedAt: row.ingested_at,
+      producer: row.producer,
+      period: row.period,
+      periodExpired: row.period_expired,
+      namespaceErased: row.ns_erased,
+    };
   }
 
   async get(observationId: string): Promise<Observation> {

@@ -61,7 +61,10 @@ export class PermanentRecordRepository {
     // depends on, and it is why "inside the same transaction" in Task 9's
     // text is true rather than aspirational.
     private readonly ring: KeyRing,
-    private readonly clock: Clock,
+    // Public and readonly so a composition root can assert every repository
+    // shares one clock -- see `surface.test.ts`. Exposing it is not a check: a
+    // reader of one repository still cannot tell whose clock this is.
+    readonly clock: Clock,
     private readonly policy: RetentionPolicy,
   ) {
     assertRetentionPolicy(policy);

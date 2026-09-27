@@ -25,7 +25,7 @@
 // criterion verifies the chain over all of them, so a break anywhere in the
 // sequence is caught there as well as where it happened.
 
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -420,6 +420,10 @@ describe("3. a promotion preserves the original timestamp", () => {
     // holds is that a rescuer belongs to the same counterparty as the record
     // it rescues.
     quoteTrigger = await triggers.record({
+      // R1: the id and the instant are the caller's, so an audit body can name
+      // the id before the row exists and a retry collides instead of duplicating.
+      triggerId: randomUUID(),
+      at: clock.now(),
       namespaceId: provider, observationId: idOf(stored.largeQuote!),
       status: "verified", surprise: 4.2,
     });
