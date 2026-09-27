@@ -256,12 +256,30 @@ function nondeterminismReads(text: string, forms: ReadonlyArray<Form> = ALL_FORM
  * The prohibition above does NOT use this: importing `randomUUID` into a
  * non-exempt module is an offence worth refusing on the import line alone,
  * because the call is then one edit away and in the same file.
+ *
+ * STATEMENTS, not lines, and that distinction is the second bug in this
+ * function rather than a nicety. The first version tested each line for
+ * `import ... from`, which blanks a one-line import and misses this:
+ *
+ *   import {
+ *     randomUUID,
+ *   } from "node:crypto";
+ *
+ * The middle line is not an import by that test, so `randomUUID` on it kept the
+ * exemption alive exactly as the single-line import had. Measured: with
+ * `ids.ts` reformatted that way and its call replaced by a constant, all fifty
+ * tests in this file passed. A fix checked only against the mutant it was
+ * written for is the shape of the defect it was fixing.
+ *
+ * The span is bounded by `[^;]*?` rather than `[\s\S]*?`, so a match cannot
+ * run from an `export const` through the rest of the file to some later
+ * `from`: a multi-line import contains no semicolon before its own end.
  */
 function withoutImports(text: string): string {
-  return text
-    .split("\n")
-    .map((line) => (/^\s*(import|export)\b[^;]*\bfrom\b|^\s*import\s*["']/.test(line) ? "" : line))
-    .join("\n");
+  const IMPORT_STATEMENT =
+    /^[ \t]*(?:import|export)[^;]*?\bfrom[ \t]*(["'])[^"']*\1[ \t]*;?|^[ \t]*import[ \t]*(["'])[^"']*\2[ \t]*;?/gm;
+  // Blanked, not deleted, so line numbers still point at the source.
+  return text.replace(IMPORT_STATEMENT, (m) => m.replace(/[^\n]/g, " "));
 }
 
 /**
