@@ -1,0 +1,22 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  // Every extension the compiler admits and both suffixes vitest collects, so
+  // a test file cannot reach dist by renaming. CI proves the property after
+  // each build: no dist file matches *.test.* or *.spec.*. tsconfig.test.json
+  // resets this list to typecheck the tests.
+  "exclude": [
+    "src/**/*.test.ts",
+    "src/**/*.test.mts",
+    "src/**/*.test.cts",
+    "src/**/*.test.tsx",
+    "src/**/*.spec.ts",
+    "src/**/*.spec.mts",
+    "src/**/*.spec.cts",
+    "src/**/*.spec.tsx"
+  ]
+}
