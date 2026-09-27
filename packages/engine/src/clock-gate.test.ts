@@ -162,34 +162,84 @@ function sourceFiles(): SourceFile[] {
   return out;
 }
 
+// The characters after which a `/` begins a REGEX LITERAL rather than a
+// division, plus the keywords that do the same. Needed because a regex's
+// contents must never be read as code: a `//` inside one starts no comment, a
+// quote inside one opens no string, and a `/*` inside one opens no block.
+const REGEX_MAY_FOLLOW = "([{,;:=!&|?+-~^<>*%";
+const KEYWORDS_BEFORE_REGEX = new Set([
+  "return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "case",
+  "do", "else", "yield", "await",
+]);
+
+/**
+ * The end of the regex literal starting at `start`, or null when what starts
+ * there is not one. Handles `\` escapes and `[...]` classes, inside which a `/`
+ * does not close the literal. A newline before the close means it was a
+ * division, not a regex.
+ */
+function endOfRegex(text: string, start: number): number | null {
+  let i = start + 1;
+  let inClass = false;
+  while (i < text.length) {
+    const c = text[i]!;
+    if (c === "\\") { i += 2; continue; }
+    if (c === "\n") return null;
+    if (c === "[") inClass = true;
+    else if (c === "]") inClass = false;
+    else if (c === "/" && !inClass) {
+      i += 1;
+      while (i < text.length && /[a-z]/.test(text[i]!)) i += 1;
+      return i;
+    }
+    i += 1;
+  }
+  return null;
+}
+
 /**
  * The module with its COMMENTS removed and everything else kept, line count
  * preserved so line numbers still point at the source. String contents are
  * KEPT on purpose: `const q = "select current_date"` is a clock read this gate
  * refuses, and blanking strings would lose every SQL form on the list.
  *
- * ONE PASS, tracking strings and both comment kinds together, and that is a
- * measured fix rather than a tidy-up. The previous version ran the
- * block-comment regex FIRST and the quote tracker second:
+ * THREE THINGS THIS HANDLES, EACH BECAUSE A VERSION WITHOUT IT LOST A RULE.
  *
- *   const glob = "dist/*";
- *   export const t = Date.now();
- *   export const re = /x*\/;
+ * 1. A comment opener inside a STRING. The first version ran the block-comment
+ *    regex before tracking quotes, so `const glob = "dist/*"` opened a comment
+ *    that the next `*\/` -- a regex, or any later doc comment -- closed, and
+ *    every clock read between them vanished.
  *
- * `"dist/*"` opened a "block comment" that the next `*\/` -- a regex, or any
- * later doc comment -- closed, blanking every line between them. The clock read
- * in the middle vanished and the gate stayed GREEN. Measured in both this gate
- * and the engine's copy of it.
+ * 2. A comment opener inside a REGEX. `const re = /^https?:\/\//;` ends in
+ *    `\/\/`; with `\` treated as an escape only inside quotes, that `//` read
+ *    as a line comment and blanked the rest of its line -- so
+ *    `const re = /^https?:\/\//; const t = Date.now();` walked past. A URL
+ *    scheme regex is ordinary code, and this was the most realistic of the four
+ *    regressions a second review measured. Regex literals are now skipped
+ *    whole, so nothing inside one is interpreted.
  *
- * What it still does not parse: a comment inside a template-literal
- * substitution, and a regex literal containing an unbalanced quote. Both err
- * toward treating text as code, which refuses rather than misses.
+ * 3. A DESYNC bounded to one line. A single- or double-quoted string cannot
+ *    span a line in JavaScript, so a quote still open at a newline means the
+ *    scanner was wrong -- and carrying that state onward INVERTS the parse:
+ *    string contents get read as code, and a `//` inside a real string then
+ *    blanks real code. That is how `/["]/` followed by a line holding a url and
+ *    a clock read walked past. Such a quote is dropped at the newline, so the
+ *    damage cannot leave the line it started on. A backtick is NOT dropped,
+ *    because a template legitimately spans lines.
+ *
+ * What it still does not do: a regex is only recognised where one may begin, by
+ * the character or keyword before it, so `/` after an identifier is a division.
+ * A regex containing `current_date` would be read as a clock read. Both err
+ * toward REFUSING, which is the direction this gate should fail in -- unlike the
+ * inversion above, which erred toward missing.
  */
 function code(text: string): string {
   let out = "";
   let i = 0;
   let quote: string | null = null;
   let inBlock = false;
+  let lastChar = "";
+  let lastWord = "";
   while (i < text.length) {
     const c = text[i]!;
     const next = text[i + 1];
@@ -200,9 +250,14 @@ function code(text: string): string {
       continue;
     }
     if (quote !== null) {
-      // An escape consumes the next character, so a `\"` does not close.
       if (c === "\\") { out += text.slice(i, i + 2); i += 2; continue; }
       if (c === quote) { quote = null; out += c; i += 1; continue; }
+      if (c === "\n") {
+        if (quote !== "`") quote = null;
+        out += "\n";
+        i += 1;
+        continue;
+      }
       out += c;
       i += 1;
       continue;
@@ -212,8 +267,27 @@ function code(text: string): string {
       while (i < text.length && text[i] !== "\n") { out += " "; i += 1; }
       continue;
     }
+    if (c === "/") {
+      const mayStart =
+        lastChar === "" || REGEX_MAY_FOLLOW.includes(lastChar) ||
+        (/[A-Za-z]/.test(lastChar) && KEYWORDS_BEFORE_REGEX.has(lastWord));
+      const end = mayStart ? endOfRegex(text, i) : null;
+      if (end !== null) {
+        out += text.slice(i, end);
+        lastChar = "/";
+        lastWord = "";
+        i = end;
+        continue;
+      }
+    }
+    if (c === "\\") { out += text.slice(i, i + 2); i += 2; continue; }
     if (c === "'" || c === '"' || c === "`") { quote = c; out += c; i += 1; continue; }
     out += c;
+    if (!/\s/.test(c)) {
+      if (/[A-Za-z0-9_$]/.test(c)) lastWord = /[A-Za-z0-9_$]/.test(lastChar) ? lastWord + c : c;
+      else lastWord = "";
+      lastChar = c;
+    }
     i += 1;
   }
   return out;
@@ -335,6 +409,21 @@ function withoutImports(text: string): string {
  * worse.
  */
 const STORE_CLOCK_FORMS_SHA256 = "b29de15e07833b2da6d27c2ab63c77c43feb0356f5d76737e70aec6959368699";
+
+/**
+ * The form-list identifiers a gate's source declares. A named function because
+ * the drift test's inline version could be replaced by a hard-coded
+ * `["CLOCK_FORMS"]` with nothing noticing -- the real store file has exactly one
+ * list, so the rule was held by the tree being clean.
+ */
+function formListsIn(text: string): string[] {
+  return [...new Set([...code(text).matchAll(/\b[A-Z][A-Z0-9_]*FORMS\b/g)].map((m) => m[0]))].sort();
+}
+
+/** The expressions a gate's source iterates its forms over. */
+function formIterationsIn(text: string): string[] {
+  return [...code(text).matchAll(/\bof\s+([^)]*?)\)\s*if\b/g)].map((m) => m[1]!.trim());
+}
 
 function storeClockFormsBlock(): string {
   const text = readFileSync(storeGate, "utf8");
@@ -516,6 +605,31 @@ describe("the engine reads no clock and mints no id", () => {
       expect(TEST.test("policy.ts")).toBe(false);
     });
 
+    it("reads nothing inside a regex literal as code", () => {
+      // REGRESSION ROWS. A version of this scanner treated `\\` as an escape only
+      // inside quotes and carried quote state across lines, and a second review
+      // measured four real clock reads walking past it. Each is a row now.
+      //
+      // A URL-scheme regex ends in `\\/\\/`, which read as a line comment and
+      // blanked the rest of its line. The most realistic of the four.
+      expect(nondeterminismReads('const re = /^https?:\\/\\//; const t = Date.now();')).toHaveLength(1);
+      // A regex with an odd quote opened a fake string that the next real string
+      // closed, so a url's `//` became code and blanked the read.
+      expect(nondeterminismReads(['const re = /["]/;', 'const u = "https://x"; const t = Date.now();'].join("\n")))
+        .toHaveLength(1);
+      // A regex holding one backtick inverted template parity.
+      expect(nondeterminismReads(['const n = (l) => (l.match(/`/g) ?? []).length;', 'const u = `https://x`; const t = Date.now();'].join("\n")))
+        .toHaveLength(1);
+      // And `/*` inside a character class opened a block comment that any later
+      // `*/` closed -- a miss BOTH the old and the new scanner had.
+      expect(nondeterminismReads(['const re = /[/*]/;', 'const t = Date.now();', '/** later */'].join("\n")))
+        .toHaveLength(1);
+      // The controls: legitimate code that must stay clean.
+      expect(nondeterminismReads('const re = /^https?:\\/\\//;')).toEqual([]);
+      expect(nondeterminismReads("const half = (a, b) => a / b; // not Date.now()")).toEqual([]);
+      expect(nondeterminismReads(["const q = `", "  select 1", "`;"].join("\n"))).toEqual([]);
+    });
+
     it("reports the line number of an offender inside a module", () => {
       const module = ["const a = 1;", "", "function f() {", "  // nothing", "  const id = randomUUID();", "}"];
       expect(nondeterminismReads(module.join("\n"))).toEqual([
@@ -606,6 +720,25 @@ describe("the engine reads no clock and mints no id", () => {
         "STORE_CLOCK_FORMS_SHA256 to " + digest + " in the same commit.",
     ).toBe(STORE_CLOCK_FORMS_SHA256);
 
+    // THE SCAN SITE, pinned as well as the list. The digest covers the block
+    // from `const CLOCK_FORMS` to its `];` and nothing else, so review grew what
+    // the store refuses from OUTSIDE it: a second list declared a hundred lines
+    // down and spread in at the iteration site -- `of [...CLOCK_FORMS,
+    // ...EXTRA_FORMS]` -- left this test green while the store refused a form
+    // this file does not carry. A digest over a list does not pin the list that
+    // is actually used.
+    const storeSource = readFileSync(storeGate, "utf8");
+    const formLists = formListsIn(storeSource);
+    expect(
+      formLists,
+      "the store's gate declares a form list this one does not know about:\n" + formLists.join("\n"),
+    ).toEqual(["CLOCK_FORMS"]);
+    // And the one place it is iterated reads that list and nothing joined to it.
+    expect(
+      formIterationsIn(storeSource),
+      "the store iterates its forms somewhere this test cannot see",
+    ).toEqual(["CLOCK_FORMS"]);
+
     // And the names, still compared, because the digest says THAT something
     // changed while this says WHAT is missing. Kept as a diagnostic and not as
     // the rule: review walked six of seven list changes past it.
@@ -617,6 +750,32 @@ describe("the engine reads no clock and mints no id", () => {
       missing,
       "the store's clock gate declares forms this one does not; copy them across:\n" + missing.join("\n"),
     ).toEqual([]);
+  });
+
+  it("names a second form list spread in at the store's scan site", () => {
+    // The extraction, proven on synthetic text. Hard-coding its result survived
+    // mutation, because the real store file has exactly one list -- so the rule
+    // was held by the tree being clean, again.
+    const synthetic = [
+      "const CLOCK_FORMS = [",
+      '  ["Date.now", (l) => /x/.test(l)],',
+      "];",
+      "const EXTRA_FORMS = [",
+      '  ["Temporal.Now", (l) => /y/.test(l)],',
+      "];",
+      "    for (const [name, matches] of [...CLOCK_FORMS, ...EXTRA_FORMS]) if (matches(t, s)) return name;",
+    ].join("\n");
+    expect(formListsIn(synthetic)).toEqual(["CLOCK_FORMS", "EXTRA_FORMS"]);
+    expect(formIterationsIn(synthetic)).toEqual(["[...CLOCK_FORMS, ...EXTRA_FORMS]"]);
+    // A single-list file yields exactly the one name and the bare iteration.
+    const honest = [
+      "const CLOCK_FORMS = [",
+      '  ["Date.now", (l) => /x/.test(l)],',
+      "];",
+      "    for (const [name, matches] of CLOCK_FORMS) if (matches(t, s)) return name;",
+    ].join("\n");
+    expect(formListsIn(honest)).toEqual(["CLOCK_FORMS"]);
+    expect(formIterationsIn(honest)).toEqual(["CLOCK_FORMS"]);
   });
 
   it("would notice the store's list changing, which is the only thing the digest is for", () => {

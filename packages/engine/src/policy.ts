@@ -116,6 +116,21 @@ export interface BriefPolicy {
    *
    * WHAT WOULD REPLACE IT: a measured rate of how often same-namespace
    * cross-channel evidence precedes a loss, from the shadow evaluation.
+   *
+   * IT DECIDES NOTHING IN M3, and that is worth knowing before anyone tunes it.
+   * Under R11 and R12 relatedness takes exactly three values -- 0 for a
+   * different namespace, `crossChannelAffinity` for a different channel, 1 for
+   * the same `(channel, aspect)` -- and the cross-field rule forces this floor
+   * at or below the affinity. So every admissible policy partitions those three
+   * values identically, and two policies differing only in this field return
+   * byte-identical briefs. Measured at floors 0.01, 0.3 and 0.55. It becomes
+   * load-bearing when M4 makes relatedness continuous, or sooner if the fourth
+   * case below is given a value beneath the affinity.
+   *
+   * THE FOURTH CASE R12 DOES NOT RULE: same namespace, same channel, DIFFERENT
+   * ASPECT -- `price/quoted/USDC` against `price/quoted/XLM`, both of which the
+   * corpus produces. R12 names three terms and the data model has four, and
+   * design §1 puts aspect matching inside `rel()`. Owed a ruling before Task 4.
    */
   readonly relatednessFloor: number;
   /**
@@ -279,14 +294,23 @@ export function assertBriefPolicy(policy: BriefPolicy): void {
   requirePositive(label("briefThreshold"), policy.briefThreshold);
   // Open at 1: a factor of 1 lowers nothing.
   requireUnitInterval(label("activeTagFactor"), policy.activeTagFactor, false);
-  // CLOSED at 1, deliberately, and it is not merely "strict". `refreshTag` can
-  // saturate g0 to exactly `g0Ceiling` = 1, and `strengthAt` returns g0 only at
-  // zero elapsed, so a floor of 1 admits a saturated tag at the instant of its
-  // own refresh and nothing else. That is the OFF setting -- the control
-  // configuration for a champion-challenger run in which no tag lowers any
-  // threshold -- which is also why refusing `activeTagFactor` of 1 is not
-  // over-strict: the two express different things and only one of them is
-  // reachable by a factor.
+  // CLOSED at 1, deliberately: it is the nearest thing to an OFF setting this
+  // value has, the control configuration for a champion-challenger run in which
+  // almost no tag lowers any threshold. Which is also why refusing
+  // `activeTagFactor` of 1 is not over-strict: the two express different things.
+  //
+  // WHAT "ALMOST" IS DOING THERE, because an earlier version of this comment
+  // said "a saturated tag at the instant of its own refresh and nothing else"
+  // and that was wrong twice, both measured. `strengthAt` returns `g0` for
+  // EVERY non-positive elapsed (`strength.ts:38`), not only for zero, so a floor
+  // of 1 admits any tag with `g0 === 1` whose `taggedAt` is at or AFTER the
+  // instant being asked about -- which the synchronous path never produces, but
+  // a REPLAY does, since the brief's `at` is an input. And `g0 === 1` is
+  // reachable on an OPEN tag under an admissible policy, not only by saturation:
+  // `categoricalBase` and the calibration weights are each closed at 1, so their
+  // product can be 1. Under the shipped numbers no open tag gets there -- the
+  // largest categorical g0 is 0.774 -- but the bound admits a policy where one
+  // does.
   requireUnitInterval(label("activeFloor"), policy.activeFloor, true);
   // OPEN at 1, and this is a correction. It was closed, on the argument that a
   // floor of 1 expresses "only same-channel evidence counts". Measured: the

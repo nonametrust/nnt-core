@@ -184,8 +184,14 @@ describe("BriefPolicy", () => {
     expect(() => assertBriefPolicy({ ...BRIEF_POLICY_V0, mediumCeiling: 3000 })).toThrow(
       /mediumCeiling.*briefThreshold/,
     );
-    // Strictly below, so equality is refused too: at equality an intent AT the
-    // threshold is held when reachable and proceeds when not.
+    // Strictly below, and the argument for strictness is WEAKER than an earlier
+    // version of this comment claimed. It said "at equality an intent AT the
+    // threshold is held when reachable and proceeds when not" -- which is false:
+    // under the declared semantics an intent equal to both is held when
+    // reachable and is NOT below the ceiling when unreachable, so equality is
+    // coherent and `<=` would have served. `<` is kept because it is one point
+    // stricter in the direction §6:281 cares about and costs nothing, but the
+    // equality case is Task 7's to rule, and it is unruled there today.
     expect(() =>
       assertBriefPolicy({ ...BRIEF_POLICY_V0, mediumCeiling: 2999, briefThreshold: 3000 }),
     ).not.toThrow();

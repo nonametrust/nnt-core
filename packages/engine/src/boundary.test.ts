@@ -1,5 +1,5 @@
-import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { readdirSync, readFileSync, realpathSync, statSync, symlinkSync, unlinkSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 
@@ -44,123 +44,207 @@ const pkgDir = fileURLToPath(new URL("../", import.meta.url));
 const SOURCE = /\.(ts|mts|cts|tsx|js|mjs|cjs)$/;
 const TEST = /\.(test|spec)\.(ts|mts|cts|tsx|js|mjs|cjs)$/;
 
-// Static imports and re-exports with a `from`, bare side-effect imports, dynamic
-// imports of a string literal, and `require` of one.
+// Static imports and re-exports with a `from`, bare side-effect imports, and
+// dynamic imports or `require`s of a string literal. UNANCHORED, as the
+// original was.
 //
-// ANCHORED AT STATEMENT POSITION, and the anchor is load-bearing rather than
-// tidy. A gate that quotes import syntax as DATA -- `expect(reads('import {
-// randomUUID } from "node:crypto";'))` -- hands that string to a lexical scan
-// which cannot tell a quoted example from a real import. Measured: this file
-// refused `clock-gate.test.ts` for the very rows that prove its import blanker
-// works. An ESM import is a top-level statement, so `^[ \t]*` costs nothing real
-// and excludes every quoted example, which sits inside an expression. The
-// character classes still admit newlines, so a multi-line import matches whole.
+// AN ANCHORED VERSION OF THIS PATTERN SHIPPED AND DROPPED NINE REAL SHAPES.
+// The anchor (`^[ \t]*`) was added to stop a gate's own quoted examples being
+// read as imports, and it did that by narrowing the rule instead of by
+// understanding it. Measured, each planted and each resolving and running with
+// every gate green: a statement before the import on the same line
+// (`const a = 1; import { x } from "..."`), a leading UTF-8 BOM, a newline
+// between `from` and the specifier, `return import("...")`,
+// `mod = await import("...")`, a bare `await import("...")`, `;import ...`, and
+// a line indented with a non-breaking space.
+//
+// The quoted-example problem is solved below instead, by POSITION: a match is
+// kept only when its first character is real code rather than text inside a
+// string, a template or a regex. That needs no guess about statement shape.
 const SPECIFIER =
-  /^[ \t]*(?:import|export)\b[^"'`;]*?\bfrom[ \t]*["']([^"']+)["']|^[ \t]*import[ \t]*["']([^"']+)["']|^[ \t]*(?:const|let|var|export)\b[^;]*?\b(?:import|require)\s*\(\s*["']([^"']+)["']\s*\)/gm;
-const DYNAMIC_EXPRESSION = /\b(?:import|require)\s*\(\s*[^"')]/;
-// A module turned into a CommonJS resolver, which is a second module system this
-// gate would have to re-learn. Refused outright instead.
-//
-// BUILT FROM PARTS ON PURPOSE, and the reason is a measured collision between
-// two gates rather than cleverness. The root composer gate refuses this same
-// bare word across every package, and a bare word in a PATTERN DEFINITION is
-// code and not a quoted example -- so no anchor and no string-blanking can tell
-// the two apart, and writing the token here literally made the root gate refuse
-// this file for the line declaring what it refuses. Tagging's gate solves the
-// same problem by skipping itself, which works only while the rule and the gate
-// live in one tree; two gates in two trees cannot skip each other without one of
-// them stopping scanning the other. So the token is assembled, and then neither
-// gate needs an exemption.
-const CREATE_REQUIRE = new RegExp(`\\b${"create"}${"Require"}\\b`);
+  /\b(?:import|export)\b[^"'`;]*?\bfrom\s*["']([^"']+)["']|\bimport\s*["']([^"']+)["']|\b(?:import|require)\s*\(\s*["']([^"']+)["']\s*\)/g;
+
+// The characters and keywords after which a `/` begins a REGEX LITERAL rather
+// than a division. A regex's contents must never be read as code: a `//` inside
+// one starts no comment, a quote inside one opens no string.
+const REGEX_MAY_FOLLOW = "([{,;:=!&|?+-~^<>*%";
+const KEYWORDS_BEFORE_REGEX = new Set([
+  "return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "case",
+  "do", "else", "yield", "await",
+]);
+
+/** The end of the regex literal starting at `start`, or null if that is not one. */
+function endOfRegex(text: string, start: number): number | null {
+  let i = start + 1;
+  let inClass = false;
+  while (i < text.length) {
+    const c = text[i]!;
+    if (c === "\\") { i += 2; continue; }
+    if (c === "\n") return null;
+    if (c === "[") inClass = true;
+    else if (c === "]") inClass = false;
+    else if (c === "/" && !inClass) {
+      i += 1;
+      while (i < text.length && /[a-z]/.test(text[i]!)) i += 1;
+      return i;
+    }
+    i += 1;
+  }
+  return null;
+}
 
 /**
- * The text with its comments removed, line count preserved.
+ * Two views of one module, produced in a single pass and **exactly the same
+ * length as the input and as each other**, so an offset in one is an offset in
+ * the other:
  *
- * REQUIRED BEFORE MATCHING A SPECIFIER, and that is a measured defect and not
- * hygiene. `SPECIFIER`'s clause runs `[^"'`;]*?` between `import` and `from`, so
- * an APOSTROPHE inside a comment in the import clause terminates it:
+ * - `clear`: comments blanked, everything else kept. A specifier is read from
+ *   this, because a specifier IS the contents of a string literal.
+ * - `blanked`: comments blanked AND the contents of strings, templates and
+ *   regex literals blanked. This decides whether a position is real code.
  *
- *   import {
- *     requirePositive, // the store's only use
- *   } from "@nonametrust/tagging";
+ * ONE PASS, TRACKING STRINGS, COMMENTS AND REGEX LITERALS TOGETHER, and each
+ * part of that is a rule a simpler version lost:
  *
- * matched nothing, in the composer gate and in tagging's gate both, while
- * resolving and running normally. The `'` in "store's" is what did it.
+ * 1. Running a block-comment regex over RAW text first means
+ *    `const glob = "dist/*"` opens a comment that the next `*\/` closes, and
+ *    every line between them is blanked. Measured: an import in that span was
+ *    invisible to this gate.
+ * 2. A regex literal is skipped whole. `const ok = /"/.test(x)` would otherwise
+ *    leave a quote open for the rest of its line, blanking a real `import(` after
+ *    it -- measured, and it MISSED rather than over-refused.
+ * 3. A single- or double-quoted string cannot span a line in JavaScript, so a
+ *    quote still open at a newline means the scanner was wrong; it is dropped
+ *    there, which bounds any remaining desync to one line. A backtick is kept,
+ *    because a template legitimately spans lines.
+ *
+ * What it is not: a parser. A comment inside a template SUBSTITUTION is still
+ * treated as template text.
  */
+function views(text: string): { clear: string; blanked: string } {
+  let clear = "";
+  let blanked = "";
+  let i = 0;
+  let quote: string | null = null;
+  let inBlock = false;
+  let lastChar = "";
+  let lastWord = "";
+  const push = (a: string, b: string): void => { clear += a; blanked += b; };
+  while (i < text.length) {
+    const c = text[i]!;
+    const next = text[i + 1];
+    if (inBlock) {
+      if (c === "*" && next === "/") { push("  ", "  "); i += 2; inBlock = false; continue; }
+      push(c === "\n" ? "\n" : " ", c === "\n" ? "\n" : " ");
+      i += 1;
+      continue;
+    }
+    if (quote !== null) {
+      if (c === "\\") { push(text.slice(i, i + 2), "  "); i += 2; continue; }
+      if (c === quote) { quote = null; push(c, c); i += 1; continue; }
+      if (c === "\n") {
+        if (quote !== "`") quote = null;
+        push("\n", "\n");
+        i += 1;
+        continue;
+      }
+      push(c, " ");
+      i += 1;
+      continue;
+    }
+    if (c === "/" && next === "*") { push("  ", "  "); i += 2; inBlock = true; continue; }
+    if (c === "/" && next === "/") {
+      while (i < text.length && text[i] !== "\n") { push(" ", " "); i += 1; }
+      continue;
+    }
+    if (c === "/") {
+      const mayStart =
+        lastChar === "" || REGEX_MAY_FOLLOW.includes(lastChar) ||
+        (/[A-Za-z]/.test(lastChar) && KEYWORDS_BEFORE_REGEX.has(lastWord));
+      const end = mayStart ? endOfRegex(text, i) : null;
+      if (end !== null) {
+        const body = text.slice(i, end);
+        push(body, " ".repeat(body.length));
+        lastChar = "/";
+        lastWord = "";
+        i = end;
+        continue;
+      }
+    }
+    if (c === "\\") { push(text.slice(i, i + 2), text.slice(i, i + 2)); i += 2; continue; }
+    if (c === "'" || c === '"' || c === "`") { quote = c; push(c, c); i += 1; continue; }
+    push(c, c);
+    if (!/\s/.test(c)) {
+      if (/[A-Za-z0-9_$]/.test(c)) lastWord = /[A-Za-z0-9_$]/.test(lastChar) ? lastWord + c : c;
+      else lastWord = "";
+      lastChar = c;
+    }
+    i += 1;
+  }
+  return { clear, blanked };
+}
+
+/** The module with only its comments blanked, length preserved. */
 function withoutComments(text: string): string {
-  const withoutBlocks = text.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "));
-  return withoutBlocks
-    .split("\n")
-    .map((line) => {
-      // Quote-tracked, so a `//` inside a string literal is not a comment: the
-      // store's clock gate lost a clock read to a url in a string that way.
-      let quote: string | null = null;
-      for (let i = 0; i < line.length; i++) {
-        const c = line[i]!;
-        if (c === "\\") { i++; continue; }
-        if (quote !== null) { if (c === quote) quote = null; continue; }
-        if (c === "'" || c === '"' || c === "`") { quote = c; continue; }
-        if (c === "/" && line[i + 1] === "/") return line.slice(0, i);
-      }
-      return line;
-    })
-    .join("\n");
+  return views(text).clear;
 }
 
 /**
- * Comments removed AND the contents of quoted runs blanked, quotes kept, line
- * count preserved.
- *
- * For the checks that look for a SHAPE rather than for a specifier: a gate that
- * plants `"const m = await import(name);"` as a refusal row contains exactly the
- * text that row refuses, so the check fired on the row proving it works. A real
- * `await import(name)` is not inside quotes; a planted one always is.
- *
- * NOT used for specifier extraction, because a specifier IS the contents of a
- * quoted run -- blanking it first returned a list of empty strings. Measured, by
- * doing it.
- *
- * Comments are removed BEFORE the quote tracker runs, and that order is itself a
- * fix: over raw text every apostrophe in prose opens a string that never closes,
- * so the blanking walks out of step with the file from the first "Tagging's"
- * onward.
+ * Every specifier this module imports, read from the clear view and filtered by
+ * position so a quoted EXAMPLE is not an import.
  */
-function codeOnly(text: string): string {
-  return withoutComments(text)
-    .split("\n")
-    .map((line) => {
-      // PER LINE, with the quote state RESET at every newline, and that is a
-      // measured fix rather than a simplification.
-      //
-      // A whole-file pass reads a REGEX LITERAL's character class as string
-      // delimiters: `/["']([^"']+)["']/` -- the specifier pattern in this very
-      // file -- leaves an odd number of quotes open, and from that line onward
-      // the parse is INVERTED, code blanked and string contents kept. Measured:
-      // this gate then refused itself for a planted row it had already blanked,
-      // forty lines further down. A per-line reset cannot poison the rest of a
-      // file; at worst it is wrong about the one line it is on.
-      //
-      // WHAT THIS GIVES UP, stated: `import(` inside a MULTI-LINE template
-      // literal is not blanked, so such a line is refused. That errs toward
-      // refusing and never toward missing, which is the direction a gate should
-      // fail in.
-      let out = "";
-      let quote: string | null = null;
-      for (let i = 0; i < line.length; i++) {
-        const c = line[i]!;
-        if (quote !== null) {
-          if (c === "\\") { out += "  "; i += 1; continue; }
-          if (c === quote) { quote = null; out += c; continue; }
-          out += " ";
-          continue;
-        }
-        if (c === "'" || c === '"' || c === "`") { quote = c; out += c; continue; }
-        out += c;
-      }
-      return out;
-    })
-    .join("\n");
+function specifiers(text: string): string[] {
+  const { clear, blanked } = views(text);
+  const found: string[] = [];
+  for (const m of clear.matchAll(SPECIFIER)) {
+    const at = m.index;
+    if (at === undefined) continue;
+    // The keyword must be real code. `blanked` holds a space wherever `clear`
+    // holds literal content, and the two are the same length, so one character
+    // comparison decides it -- and no anchor has to guess at statement shape.
+    if (blanked[at] !== clear[at]) continue;
+    const spec = m[1] ?? m[2] ?? m[3];
+    if (spec !== undefined) found.push(spec);
+  }
+  return found;
 }
+
+/**
+ * The `import(` and `require(` calls whose argument is not exactly one string
+ * literal -- which is every call no reader can resolve.
+ *
+ * A first-character peek was not enough: `await import("x", {})` passes import
+ * OPTIONS and `import("a" + "b")` concatenates, and both begin with a quote, so
+ * both were read as resolvable and neither is. Matched over the BLANKED view, so
+ * a gate quoting `await import(name)` as a refusal row is not refused for it.
+ */
+function unresolvableImports(text: string): string[] {
+  const { blanked } = views(text);
+  const out: string[] = [];
+  for (const m of blanked.matchAll(/\b(?:import|require)\s*\(/g)) {
+    const at = m.index;
+    if (at === undefined) continue;
+    const rest = blanked.slice(at + m[0].length);
+    // In the blanked view a resolvable call is: quote, blanks, the same quote,
+    // optional space, `)`.
+    if (/^\s*(["'])[^"'`\n]*\1\s*\)/.test(rest)) continue;
+    out.push(`${m[0].trim()} with an argument no reader can resolve`);
+  }
+  return out;
+}
+
+/**
+ * The node builtins this package may reach, named rather than admitted by
+ * prefix. `node:crypto` is `ids.ts`'s; `node:fs`, `node:path` and `node:url` are
+ * this gate's own and the clock gate's.
+ */
+const ALLOWED_BUILTINS = ["node:crypto", "node:fs", "node:path", "node:url"];
+
+// A module turned into a CommonJS resolver, which is a second module system this
+// gate would have to re-learn. Refused outright instead. Note this is a rule
+// about a SPELLING, and `node:module` is refused above as a rule about the
+// capability -- which is what actually closes the hole.
+const CREATE_REQUIRE = /\bcreateRequire\b/;
 
 /** The three packages this one may reach, and the only three. */
 const ALLOWED_PACKAGES = ["@nonametrust/schema", "@nonametrust/store", "@nonametrust/tagging"];
@@ -196,15 +280,6 @@ function sourceFiles(): SourceFile[] {
   return out;
 }
 
-function specifiers(text: string): string[] {
-  const found: string[] = [];
-  for (const m of withoutComments(text).matchAll(SPECIFIER)) {
-    const spec = m[1] ?? m[2] ?? m[3];
-    if (spec !== undefined) found.push(spec);
-  }
-  return found;
-}
-
 /**
  * Whether this specifier reaches past one of the allowed packages' public
  * surfaces -- the package name followed by anything.
@@ -234,7 +309,7 @@ export function isTestModule(spec: string): boolean {
  * follows it, and falls back to the lexical path when the target does not exist
  * so a broken import is reported as an import and not as a crash.
  */
-function staysInside(fileAbs: string, spec: string): boolean {
+export function staysInside(fileAbs: string, spec: string): boolean {
   const landed = resolve(dirname(fileAbs), spec);
   const real = (p: string): string => {
     try {
@@ -245,15 +320,25 @@ function staysInside(fileAbs: string, spec: string): boolean {
   };
   // The specifier carries a `.js` extension that TypeScript resolves to `.ts`,
   // so the path itself may not exist; its directory does.
-  return real(dirname(landed)).startsWith(real(srcDir));
+  // The separator is not optional: `realpathSync` strips a trailing slash, so
+  // without it a sibling directory named `srcfoo` "starts with" `src` and an
+  // import into it reads as staying inside. Measured.
+  const inside = real(srcDir).replace(/\/$/, "") + sep;
+  return (real(dirname(landed)) + sep).startsWith(inside);
 }
 
 /** Whether this specifier is allowed at all, from a file in this package. */
 export function isAllowed(file: SourceFile, spec: string): boolean {
   if (spec.startsWith("./") || spec.startsWith("../")) return staysInside(file.abs, spec);
   if (ALLOWED_PACKAGES.includes(spec)) return true;
-  // `node:crypto` is `ids.ts`'s, and the clock gate exempts that module by name.
-  if (spec.startsWith("node:")) return true;
+  // ONLY the builtins this package actually uses, named one by one rather than
+  // admitted by prefix. `node:module` is a builtin AND it is the second module
+  // system: `nm[["create","Require"].join("")](import.meta.url)` reaches the
+  // store's internals with no `createRequire` token anywhere and no `require(`
+  // either -- measured, resolved, and ran. A prefix allowance is a rule about a
+  // namespace; what this gate needs is a rule about a capability. `node` without
+  // the colon would also have admitted `nodemailer` and `node-fetch`.
+  if (ALLOWED_BUILTINS.includes(spec)) return true;
   if (file.isTest && spec === "vitest") return true;
   return false;
 }
@@ -278,10 +363,15 @@ export function isAllowed(file: SourceFile, spec: string): boolean {
 
 /** Specifiers this file may not import at all, plus the two shapes no reader can follow. */
 export function importOffences(file: SourceFile): string[] {
-  const out: string[] = [];
-  const code = codeOnly(file.text);
-  if (DYNAMIC_EXPRESSION.test(code)) out.push("dynamic import or require of a non-literal");
-  if (CREATE_REQUIRE.test(code)) out.push("a second module system");
+  const out: string[] = [...unresolvableImports(file.text)];
+  // Written as a plain pattern rather than assembled from parts. An earlier
+  // version built the token out of `"create" + "Require"` and justified it with
+  // a measurement that does not reproduce: a regex LITERAL spelling
+  // `\bcreateRequire\b` cannot match itself, because the character before the
+  // `c` is the `b` of `\b`, a word character. Review measured the literal
+  // spelling leaving every root gate green. The capability is refused by
+  // `node:module` not being an allowed builtin; this is the spelling.
+  if (CREATE_REQUIRE.test(views(file.text).blanked)) out.push("a second module system");
   for (const spec of specifiers(file.text)) {
     if (!isAllowed(file, spec)) out.push(`imports ${spec}`);
   }
@@ -457,15 +547,28 @@ describe("the engine's boundary", () => {
       expect(isTestModule(spec)).toBe(false);
     });
 
-    it("refuses a dynamic import or require no reader can resolve", () => {
-      // The predicate the composer gate carries and never exercised: mutating
-      // its regex to match nothing left all 34 root gates green, because the
-      // tree is clean and no planted row ran it.
-      expect(DYNAMIC_EXPRESSION.test("const m = await import(name);")).toBe(true);
-      expect(DYNAMIC_EXPRESSION.test("const m = await import(`./${k}.js`);")).toBe(true);
-      expect(DYNAMIC_EXPRESSION.test("const m = require(name);")).toBe(true);
-      expect(DYNAMIC_EXPRESSION.test('const m = await import("./policy.js");')).toBe(false);
-      expect(DYNAMIC_EXPRESSION.test('const m = require("./policy.js");')).toBe(false);
+    it("refuses every import call whose argument is not one string literal", () => {
+      // A first-character peek was not enough, measured: `import("x", {})` passes
+      // import OPTIONS and `import("a" + "b")` concatenates, and both begin with
+      // a quote, so both read as resolvable and neither is.
+      for (const line of [
+        "const m = await import(name);",
+        "const m = await import(`./${k}.js`);",
+        "const m = require(name);",
+        'const m = await import("./policy.js", { with: { type: "json" } });',
+        'const m = await import("@nonametrust/store" + "/dist/db.js");',
+      ]) {
+        expect(unresolvableImports(line), line).toHaveLength(1);
+      }
+      for (const line of [
+        'const m = await import("./policy.js");',
+        "const m = require('./policy.js');",
+        "const u = import.meta.url;",
+      ]) {
+        expect(unresolvableImports(line), line).toEqual([]);
+      }
+      // And a gate quoting one of those as a refusal row is not refused for it.
+      expect(unresolvableImports('expect(reads("const m = await import(name);"));')).toEqual([]);
     });
 
     it("finds a require of a literal, which no pattern in this repository looked for", () => {
@@ -552,7 +655,7 @@ describe("the engine's boundary", () => {
 
       it("refuses an unresolvable dynamic import", () => {
         expect(importOffences(asModule("const m = await import(name);"))).toEqual([
-          "dynamic import or require of a non-literal",
+          "import( with an argument no reader can resolve",
         ]);
         expect(importOffences(asModule('const m = await import("./policy.js");'))).toEqual([]);
       });
@@ -587,6 +690,81 @@ describe("the engine's boundary", () => {
         expect(SOURCE.test("clocky.mjs")).toBe(true);
         expect(SOURCE.test("clocky.cjs")).toBe(true);
         expect(SOURCE.test("notes.md")).toBe(false);
+      });
+
+      it("refuses each driver name, not just the one that happens to be planted", () => {
+        // Each alternative of DATABASE_DRIVER gets its own row. Review deleted
+        // `kysely`, `["\']pg["\']` and `PoolClient` one at a time and all three
+        // mutants SURVIVED, because only `new Pool` was ever exercised through
+        // this judge.
+        expect(driverOffences(asModule('import { Kysely } from "kysely";'))).toHaveLength(1);
+        expect(driverOffences(asModule('const x: PoolClient = c;'))).toHaveLength(1);
+        expect(driverOffences(asModule("const pool = new Pool();"))).toHaveLength(1);
+        expect(driverOffences(asModule('const name = "pg";'))).toHaveLength(1);
+        // And what must NOT trip it: the word in prose, and an unrelated name.
+        expect(driverOffences(asModule("const pageCount = 1;"))).toEqual([]);
+        expect(driverOffences(asModule("const progress = 1;"))).toEqual([]);
+      });
+
+      it("admits only the builtins this package uses, by name and not by prefix", () => {
+        for (const ok of ALLOWED_BUILTINS) {
+          expect(isAllowed(asModule(""), ok), ok).toBe(true);
+        }
+        // `node:module` is a builtin and it IS the second module system:
+        // `nm[["create","Require"].join("")](import.meta.url)` reaches another
+        // package's internals with no `createRequire` token and no `require(`.
+        // Measured: it resolved and ran.
+        for (const refused of ["node:module", "node:vm", "node:child_process", "node:worker_threads"]) {
+          expect(isAllowed(asModule(""), refused), refused).toBe(false);
+        }
+        // And a prefix check without the colon would have admitted these.
+        for (const refused of ["nodemailer", "node-fetch"]) {
+          expect(isAllowed(asModule(""), refused), refused).toBe(false);
+        }
+      });
+
+      it("classifies a module and a test file apart, over the real tree", () => {
+        // Review set every scanned file's `isTest` to true and no test noticed --
+        // which would let a module import vitest and a test-file import go
+        // unrefused. The classification is held here on real files.
+        const files = sourceFiles();
+        const byName = (rel: string) => files.find((f) => f.rel === rel);
+        expect(byName("policy.ts")?.isTest, "policy.ts is not a test").toBe(false);
+        expect(byName("ids.ts")?.isTest).toBe(false);
+        expect(byName("boundary.test.ts")?.isTest, "boundary.test.ts is a test").toBe(true);
+        expect(byName("policy.test.ts")?.isTest).toBe(true);
+      });
+
+      it("follows a real symlinked directory, which a lexical answer cannot", () => {
+        // `staysInside` resolves real paths, and review measured that making it
+        // lexical SURVIVED: this file's other rows only pin the predicate's
+        // shape. Held here on a symlink made and removed inside the test, the
+        // way the root composer gate holds its own.
+        const link = join(srcDir, "__boundary_probe_tg");
+        try {
+          symlinkSync(join(srcDir, "..", "..", "tagging", "src"), link, "dir");
+          expect(staysInside(join(srcDir, "policy.ts"), "./__boundary_probe_tg/policy.js")).toBe(false);
+        } finally {
+          try { unlinkSync(link); } catch { /* never created */ }
+        }
+        // The control: an ordinary sibling really is inside.
+        expect(staysInside(join(srcDir, "policy.ts"), "./ids.js")).toBe(true);
+      });
+
+      it("does not treat a sibling directory whose name starts with src as inside", () => {
+        // `realpathSync` strips a trailing slash, so without an explicit
+        // separator `.../engine/srcfoo` "starts with" `.../engine/src`.
+        expect(staysInside(join(srcDir, "policy.ts"), "../srcfoo/x.js")).toBe(false);
+        expect(staysInside(join(srcDir, "policy.ts"), "../src/ids.js")).toBe(true);
+      });
+
+      it("reads nothing inside a regex literal as code", () => {
+        const hidden = 'const ok = /"/.test(x); const m = await import(name);';
+        expect(importOffences(asModule(hidden))).toContain(
+          "import( with an argument no reader can resolve",
+        );
+        const url = 'const re = /^https?:\\/\\//; import pg from "pg";';
+        expect(importOffences(asModule(url))).toContain("imports pg");
       });
 
       it("refuses a manifest that declares more, less, or the wrong kind", () => {
