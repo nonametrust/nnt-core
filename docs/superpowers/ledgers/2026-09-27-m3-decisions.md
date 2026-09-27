@@ -575,3 +575,119 @@ since `keyof` of a union is only its common keys. **A helper that can be deleted
 with nothing failing is a helper whose comment is wrong** — and the only reason
 this one was found is that the mutation step covers type-level rules through
 `tsc`, not only runtime rules through vitest.
+
+## Task 4 — relatedness, and the three decisions it could not start without
+
+Committed at `25e038f`. Counts: schema 117, tagging 329, indexer 122, store 529,
+engine **177**, root gates 64.
+
+The three were listed above as owed to Kerem or to a later task. He delegated all
+three; they are ruled here with their reasoning and their costs.
+
+### R35. Relatedness has FOUR cases, and `crossAspectAffinity` is the fourth
+
+R12 names three terms. The data model has four: same namespace, same channel,
+**different aspect** — `price/quoted/USDC` against `price/quoted/XLM`,
+`volume/amount/USDC/in` against `volume/amount/XLM/in`, both of which the corpus
+produces. Design §1 puts aspect matching inside `rel()`, so this was never out of
+scope, only unruled — and unruled it would have been decided on the day Task 4 met
+a second aspect, by whichever branch happened to catch it.
+
+Ordered by SPECIFICITY, which is the ruling: `crossChannelAffinity <
+crossAspectAffinity < 1`. Evidence about the same quantity is more related than
+evidence about another quantity on the same channel, which is more related than
+evidence on another channel. A policy inverting the middle pair is refused by
+name.
+
+**Cost:** a tenth field, and the version composite grows with it.
+
+### R36. The `crossChannelAffinity >= relatednessFloor` rule is RETIRED
+
+It was added in Task 1 — by me, not by the plan — to stop the cross-channel term
+being "in range and dead". Review measured what it cost: with only three
+relatedness values the floor had exactly ONE admissible position, so every
+admissible policy partitioned those values identically and two policies differing
+only in the floor returned byte-identical briefs. `relatednessFloor` occupied a
+slot in the version composite and decided nothing.
+
+With four values the floor has three meaningful positions — every same-namespace
+term counts; cross-channel excluded; only the same aspect counts — and two of them
+are what that rule forbade. Those are configuration CHOICES a challenger policy
+should be able to make, not incoherent states.
+
+What the rule was really protecting is that the SHIPPED default admits
+cross-channel evidence, because design §9 needs a day-twelve `address_integrity`
+change to bear on a day-twenty-one `price` intent. That is now asserted on
+`BRIEF_POLICY_V0` itself rather than imposed on every policy.
+
+**Cost, and it is real:** a challenger policy can now be written that silently
+fails design §9. Nothing holds that but the default's own assertion. Recorded as a
+limit rather than closed, because closing it would re-impose the rule that made the
+field inert.
+
+**`relatednessFloor`'s bound has now moved twice** and the chain is in one place in
+`policy.ts`: closed, then opened when review proved 1 unreachable under the retired
+rule, now closed again because "only the same aspect counts" is reachable and
+meaningful. Each move was right when it was made.
+
+### R37. The defaults satisfy BOTH scenarios' hold
+
+F8 records that design §9 and R15 disagree on the amount. §9:358 asserts a **five
+hundred** unit authorization is held on day twenty-one because the day-twelve tag
+lowered the threshold; R15 rules M3's acceptance scenario is M1's story at **2500
+USDC**. The first defaults were fitted to R15 alone — threshold 3000, lowered to
+2400 or 1920 — and measurement showed §9's own assertion FAILING on the numbers
+this repository ships.
+
+Both are satisfiable at once, so both are satisfied. `briefThreshold` 600 with
+`activeTagFactor` 0.8 leaves 500 above the base bar and below it once one tag is
+active, which is what §9 means by the tag doing the work; 2500 stays held under
+R15's two active tags. The admissible window — above 500, at or below `500 / f` —
+is pinned by a test, so a later change to the factor cannot silently leave one
+scenario behind. `mediumCeiling` moves to 100 to stay under the lower threshold,
+and the seven-tag gap its docstring recorded is nine tags now, computed rather
+than recalled.
+
+**These numbers are still FITTED, and still declared so.** What changed is that
+they are fitted to both documents instead of one, which removes any need to edit
+either — and §9's story is the whitepaper's story, so not editing it was the point.
+
+### R38. What produces `watch`
+
+§7 rules the vocabulary provisionally and records that `hold` is the only value any
+document names; review called the middle value the largest unruled number left in
+the plan.
+
+**`hold`** when the amount is at or above the threshold. **`watch`** when it is
+not and at least one piece of evidence cleared `relatednessFloor`. **`clear`** when
+it is not and nothing did.
+
+**It needs no number**, which is why it beat the alternative. A fraction of the
+threshold would have added an eleventh uncalibrated field with no measurement
+behind it, which §6 would then declare and R5 would have to defend. This rule
+reuses the threshold (R3, R4, R27) and the reasons (R12), and tells a caller
+something it did not know — a fraction would only have said "your amount is
+largish".
+
+Monotone in both inputs, held by property tests: raising the amount or adding a
+reason can never soften a grade. And it makes R29 exact — a first-ever brief
+grades `clear` on no evidence, so `clear` means "nothing crossed" and never
+"nothing happened", which is the sentence the README owes.
+
+**Cost:** `watch` says nothing about HOW MUCH evidence. One weak reason and nine
+strong ones read the same while the amount is under the bar. A graded watch needs a
+number and a population to measure it against; that is the shadow evaluation's, and
+M4's at the earliest.
+
+**Implemented rather than recorded**, in `grade.ts`, because a ruling held by prose
+is what §3b forbids — and because Task 5 should compose this rule, not invent it.
+
+### Still open, and now the most important unruled thing
+
+**Does an UNRELATED active tag lower the threshold?** Design §6:275 says "an active
+tag lowers that counterparty's brief threshold" and says nothing about relatedness.
+R12 gives relatedness; R38's grade rule counts reasons. If an unrelated active tag
+lowers the threshold, a brief can `hold` with ZERO reasons — a graded answer with no
+account of itself, against design §6:270-273. If it does not, the threshold depends
+on the intent and `thresholdFor(namespaceId, at)` in Task 6 cannot have that
+signature. **Owed before Task 6, and asked of the round-three review.**
