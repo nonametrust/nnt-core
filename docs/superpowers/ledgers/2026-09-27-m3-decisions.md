@@ -193,3 +193,143 @@ wrong when it was written. Corrected in memory. They are 34 now.
   correlated — is not yet known.
 - Whether exporting `randomIdSource` from `index.ts` is consistent with ids
   entering only at the edge.
+
+### Task 1's review round: three lenses, and what it changed
+
+Committed at `ab5fcfe`. Counts after it: schema 105, tagging 329, indexer 122,
+store **510**, engine **143**, root gates **47**.
+
+Three agents, one lens each — are the gates real, are the rulings implemented,
+what is missing — in separate worktrees with separate databases. They converged
+independently on two findings, which is the strongest signal a review gives: R26
+is gated for one component of four, and `ba66afa`'s exemption fix was still
+narrower than its hole.
+
+**Nine holes in the gates, each replanted and now refused.** They are written out
+in `ab5fcfe`'s message with the measurement for each. The two worth carrying
+here because they are about this repository's habits rather than about M3:
+
+- **A string containing `/*` blanked real code in BOTH clock gates**, the store's
+  included. The block-comment regex ran before quote tracking, so
+  `const glob = "dist/*"` opened a comment that any later `*/` closed. This was a
+  live hole in a shipped gate, not an M3 defect, and it is the third round of
+  holes found in that scanner.
+- **The drift test was fooled by six of seven ways to grow the store's list.** It
+  parsed another file's source with a regex. It pins that block's SHA-256 now.
+  The general lesson: a check that reads another file's SOURCE to confirm two
+  copies agree should compare bytes, not parse.
+
+**Twelve fixes survived mutation, and that is the finding of the round.** A
+tree-scan rule over a clean tree returns the same empty offender list whether it
+checks anything or not. Nine holes had been closed and not one closure was held.
+Every rule is now a named judge over one file or manifest, with a synthetic
+violation and a synthetic innocent; survivors went 12 → 0. Recorded in memory as
+[[tree-scan-rules-need-synthetic-inputs]] because it is not specific to M3.
+
+**Two defects in the fixes themselves.** The import blanker was per-line, so a
+multi-line import kept the hollow exemption alive (`ba66afa`); the property is
+tested behaviourally now as well. And the real-path fix was wrong in the case it
+existed for — it asked "inside store? inside tagging?" with a lexical fallback
+OR-ed into each question, so a symlink lexically inside the store answered the
+first question and the self-reference check returned null. It resolves one answer
+now, real path first.
+
+**A whole-file quote scan cannot read a regex literal.** `/["']([^"']+)["']/`
+leaves an odd number of quotes open and inverts the parse from that line on. The
+scan is per line with the state reset at each newline; a multi-line template
+holding `import(` is refused rather than missed, which is the direction a gate
+should fail in.
+
+**Rulings the review corrected.**
+
+- The escape hatch documented for the `crossChannelAffinity >= relatednessFloor`
+  rule **does not exist**. A `relatednessFloor` of 1 is refused under every
+  admissible affinity — measured at 0.55, 0.999 and 1 — so same-channel-only
+  relatedness is not expressible under this policy at all. The claim is deleted
+  from the three places it appeared and the bound is declared `(0, 1)`, which was
+  always its effective range. A sentence with an argument and no measurement,
+  which is the failure this project keeps naming.
+- **`mediumCeiling` now must sit strictly below `briefThreshold`.** A ceiling of
+  5000 against a threshold of 3000 let a medium-risk intent of 4000 PROCEED while
+  a store was unreachable and be HELD when it was reachable — design §6:281's
+  prohibition, wearing a valid-looking policy. Necessary and not sufficient:
+  3000 × 0.8^7 = 629.15 is under the shipped ceiling, and nothing in M3 bounds
+  the number of active tags.
+- **`thresholdUnit` refuses padding.** `" USDC "` was legal and would have made
+  Task 6's comparison refuse a correct intent.
+- **Every refusal row demands its own bound's phrasing.** Deleting
+  `relatednessFloor`'s interval left its `1.01` row green on the cross-field
+  rule's message.
+- **A bound is two claims**, and the refusal table held one. Flipping
+  `activeFloor` from closed-at-1 to open survived, because nothing asserted that
+  1 is ACCEPTED — and 1 is the OFF setting, the control configuration for a
+  champion-challenger run. There is an "accepts the admissible ends" test now.
+- **The defaults' derivation was arithmetically wrong.** "3000 × 0.8 = 2400" is
+  one tag. Replaying M2's corpus through the real `tagObservation` and
+  `strengthAt` at the day-twenty-one instant gives a `trustline_open` state at
+  0.5197, the address tag at 0.4165 and the price tag at 0.4151; R22 excludes the
+  last, leaving TWO active tags and a threshold of 1920. §9's hold survives; the
+  sentence did not.
+
+### Owed to later tasks, from the review
+
+- **TASK 9 CANNOT USE THE COMPARISON ITS ACCEPTANCE NAMES.** The
+  `protocol/event/trustline_open` state is refreshed every morning, so it is
+  active from day ONE and the provider's threshold is lowered before the
+  day-twelve address change exists. "The provider's threshold lower than the same
+  query returns for a counterparty with no active tag" is therefore satisfiable
+  with the day-twelve tag doing no work at all — R22's failure one tag over. The
+  comparison must be the provider before and after day twelve, or with the
+  address tag filtered out.
+- **Nothing holds §3's "the same `Clock` object the store holds", and §8's claim
+  about it is false.** Review constructed an engine module giving
+  `TagRepository` and `BaselineRepository` two different clock objects: typecheck
+  clean, every test green. The store checks clock identity in exactly one place,
+  `observation.ts:129` (observation against namespace repository); `TagRepository`,
+  `BaselineRepository`, `TriggerEventRepository`, `AuditChain` and
+  `VolatilityRepository` each take an unchecked clock. §8 says "the engine must
+  pass the same object down or it will be refused at construction — which is the
+  good case": untrue for five of six. The cheap fix is store-side and therefore
+  **Task 2's**; the alternative is one engine composition root whose test asserts
+  every repository's clock is `===` one object, which is Task 5's. It is a gate
+  the plan gives to no task.
+- **R26's join must refuse the separator in all four components, at join time.**
+  Measured: `retention-v0`, `policy-v0`, `calibration-v0` and `brief-policy-v0`
+  contain no `/` today, so the composite is not broken — but the other three
+  assert non-blank only, so `retention/v1` is legal in the store tomorrow. The
+  engine is the only place that joins them, so the join is where the refusal
+  belongs. **Task 5's**, with a plant per component.
+- **`BriefPolicy` will gain a tenth field at Task 7.** R7 names "a timeout the
+  engine sets itself" and Task 7's acceptance uses one; by R2's own logic a number
+  that decides when "unavailable" fires belongs in this value. The lexical field
+  pin will move then, deliberately.
+- **R1's replay holds for the brief only, not for ingest.**
+  `ObservationRepository.append` mints its own `randomUUID()` and
+  `AuditChain.append` stamps `occurredAt` from its clock, and Task 2 does not add
+  an id parameter to `append`. So design §9's "identical audit chain" cannot hold
+  over the ingest path as written. Plan-level; name it or narrow the claim.
+- **`tagging/src/policy.ts:11-12` still describes the scenario as "a
+  five-hundred-unit request … held".** R15 made it 2500 USDC. A stale docstring in
+  another package, left alone rather than edited mid-task.
+- **`README.md` is stale in four places** now that the engine exists: line 25
+  says the engine arrives in a later milestone, the packages table has no engine
+  row, the `gates/` row names three gates of six, and "only schema resolves
+  through dist" is no longer true. One docs commit before the public tag.
+
+### A process failure worth more than most of the findings
+
+The three reviewer worktrees were created with
+`git worktree add -f <path> m3-sync-path` — separate directories, separate
+databases, and **the same branch ref**. Two consequences, both measured:
+
+1. Commits made in the main checkout moved the reviewers' HEAD mid-review. Two
+   of the three noticed and reported a staged file they had never touched.
+2. One reviewer ran `git reset --hard HEAD` to return to a clean state, which
+   moved the shared branch BACKWARD and discarded the ledger commit made minutes
+   earlier. The reflog records it as `reset: moving to ba66afa`. This file
+   survived only because it was still in the main checkout's working tree and was
+   re-added by the next commit; its own commit and message are gone.
+
+Isolation has three axes, not two: the tree, the database, **and the ref**.
+Reviewer worktrees must be `--detach`ed or on their own throwaway branch. Carried
+into memory as [[mutation-agents-need-isolation]].
