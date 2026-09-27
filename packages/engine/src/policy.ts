@@ -154,6 +154,30 @@ export interface BriefPolicy {
    */
   readonly crossChannelAffinity: number;
   /**
+   * Relatedness of two readings in the same namespace, on the SAME channel, for
+   * DIFFERENT aspects -- `price/quoted/USDC` against `price/quoted/XLM`, or
+   * `volume/amount/USDC/in` against `volume/amount/XLM/in`. Both pairs the corpus
+   * actually produces.
+   *
+   * R12 NAMES THREE TERMS AND THE DATA MODEL HAS FOUR. This is the case it
+   * leaves out, and design §1 puts aspect matching inside `rel()` rather than
+   * outside it, so it is not out of scope either. Left unruled it would have been
+   * decided on the day Task 4 met a second aspect, by whichever branch happened to
+   * catch it.
+   *
+   * Strictly between `crossChannelAffinity` and 1, because relatedness is ordered
+   * by SPECIFICITY: evidence about the same quantity is more related than evidence
+   * about another quantity on the same channel, which is more related than
+   * evidence on another channel. A policy that inverted the two middle terms would
+   * be saying a different channel is closer than a different aspect.
+   *
+   * AND IT IS WHAT MAKES `relatednessFloor` DECIDE ANYTHING. With three values the
+   * floor had one admissible position and every policy partitioned them the same
+   * way; with four it has three, and two of those were forbidden by a rule this
+   * value's arrival retired.
+   */
+  readonly crossAspectAffinity: number;
+  /**
    * The amount below which a MEDIUM-risk intent proceeds while a store is
    * unavailable, in `thresholdUnit`.
    *
@@ -241,13 +265,14 @@ export const VERSION_SEPARATOR = "/";
  */
 export const BRIEF_POLICY_V0: BriefPolicy = {
   version: "brief-policy-v0",
-  briefThreshold: 3000,
+  briefThreshold: 600,
   thresholdUnit: "USDC",
   activeTagFactor: 0.8,
   activeFloor: 0.25,
   relatednessFloor: 0.3,
   crossChannelAffinity: 0.55,
-  mediumCeiling: 750,
+  crossAspectAffinity: 0.75,
+  mediumCeiling: 100,
   maxRetries: 5,
 };
 
@@ -316,28 +341,38 @@ export function assertBriefPolicy(policy: BriefPolicy): void {
   // floor of 1 expresses "only same-channel evidence counts". Measured: the
   // cross-field rule below refuses a floor of 1 under EVERY admissible affinity,
   // so the closed end was unreachable and the declared interval said otherwise.
-  requireUnitInterval(label("relatednessFloor"), policy.relatednessFloor, false);
+  // CLOSED at 1: "only the same aspect counts" is a reachable configuration now
+  // that no rule pins this field below the smallest affinity term.
+  requireUnitInterval(label("relatednessFloor"), policy.relatednessFloor, true);
   // Open at 1 by R12: at 1 the term is not a cross-channel affinity.
   requireUnitInterval(label("crossChannelAffinity"), policy.crossChannelAffinity, false);
+  requireUnitInterval(label("crossAspectAffinity"), policy.crossAspectAffinity, false);
   requirePositive(label("mediumCeiling"), policy.mediumCeiling);
   requirePositiveInteger(label("maxRetries"), policy.maxRetries);
-  // Two cross-field rules. Each field above can be in range while a PAIR is
-  // incoherent, and both pairs were measured to be reachable under a policy
-  // that looked valid.
+  // Two cross-field rules, and one that used to be here is gone.
   //
-  // First: an affinity below the floor is in range and DEAD -- the term R12
-  // exists to make non-zero can never produce a reason, so relatedness silently
-  // becomes same-channel-only, which is R12's own failure wearing a valid
-  // policy. WHAT THIS COSTS, corrected: same-channel-only relatedness is NOT
-  // expressible under this policy at all. An earlier version of this comment
-  // said it was reachable by a floor of 1; it is not, because the affinity must
-  // clear the floor and is itself below 1. A challenger policy that wants it
-  // needs a field this value does not have.
-  if (!(policy.crossChannelAffinity >= policy.relatednessFloor)) {
+  // RETIRED: `crossChannelAffinity >= relatednessFloor`. It was added on the
+  // argument that a floor above the affinity leaves the cross-channel term "in
+  // range and dead", and review then measured what it cost: with three relatedness
+  // values the floor had exactly one admissible position, so every policy
+  // partitioned them identically and `relatednessFloor` decided nothing. The two
+  // configurations it forbade -- excluding cross-channel evidence, and admitting
+  // only the same aspect -- are choices a challenger policy should be able to make,
+  // not incoherent states. What that rule was really protecting is that the
+  // SHIPPED default admits cross-channel evidence, because design §9 needs a
+  // day-twelve `address_integrity` change to bear on a day-twenty-one `price`
+  // intent; that is asserted on `BRIEF_POLICY_V0` in `policy.test.ts`, where it
+  // belongs, rather than imposed on every policy.
+  //
+  // FIRST: the two affinity terms are ORDERED, because relatedness is ordered by
+  // specificity. Same channel and a different aspect is more related than a
+  // different channel; a policy that inverts them says the opposite, and equality
+  // makes the aspect term not a term.
+  if (!(policy.crossChannelAffinity < policy.crossAspectAffinity)) {
     throw new RangeError(
-      `${label("crossChannelAffinity")} ${policy.crossChannelAffinity} must be at least ` +
-        `${label("relatednessFloor")} ${policy.relatednessFloor}, or a same-namespace reason on a ` +
-        `different channel can never clear the floor`,
+      `${label("crossChannelAffinity")} ${policy.crossChannelAffinity} must be below ` +
+        `${label("crossAspectAffinity")} ${policy.crossAspectAffinity}: evidence about another ` +
+        `quantity on the same channel is more related than evidence on another channel`,
     );
   }
   // Second: a ceiling at or above the threshold it sits under makes the

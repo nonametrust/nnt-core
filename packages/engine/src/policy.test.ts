@@ -24,6 +24,7 @@ const NUMERIC_FIELDS = [
   "activeFloor",
   "relatednessFloor",
   "crossChannelAffinity",
+  "crossAspectAffinity",
   "mediumCeiling",
   "maxRetries",
 ] as const satisfies ReadonlyArray<keyof BriefPolicy>;
@@ -43,6 +44,7 @@ describe("BriefPolicy", () => {
       "activeFloor",
       "activeTagFactor",
       "briefThreshold",
+      "crossAspectAffinity",
       "crossChannelAffinity",
       "maxRetries",
       "mediumCeiling",
@@ -93,20 +95,6 @@ describe("BriefPolicy", () => {
       ["activeFloor", 1.01, /briefPolicy\.activeFloor must lie in/],
       ["relatednessFloor", 0, /briefPolicy\.relatednessFloor must lie in/],
       ["relatednessFloor", 1.01, /briefPolicy\.relatednessFloor must lie in/],
-      // Open at 1, and the reason is a correction. The first version declared
-      // (0, 1] and documented a floor of 1 as the way to express
-      // "only same-channel evidence counts" -- which the cross-field rule
-      // below makes UNREACHABLE under any affinity, since an affinity must be
-      // at least the floor and is itself capped below 1. Measured: refused at
-      // affinity 0.55, at 0.999, and at 1. So the effective range was already
-      // (0, 1) and the declared bound said otherwise; it is declared open now
-      // so the refusal names THIS field instead of arriving from the pair.
-      // The regex demands the FIELD's own phrasing ("must lie in"), not merely
-      // the field's name: the cross-field rule further down also names
-      // `relatednessFloor` in its message, so a looser pattern here was green
-      // while the field's bound admitted 1. A refusal arriving from the pair is
-      // not this row's rule being held.
-      ["relatednessFloor", 1, /relatednessFloor must lie in/],
       // R12: the same-namespace-different-channel term is NOT zero, because
       // the acceptance scenario's own case is same namespace, different
       // channel, and a zero there makes the address change not a reason.
@@ -114,6 +102,11 @@ describe("BriefPolicy", () => {
       // Nor is it 1: at 1 a different channel is worth exactly as much as the
       // same one and the term it exists to express is gone.
       ["crossChannelAffinity", 1, /briefPolicy\.crossChannelAffinity must lie in/],
+      // The fourth relatedness case R12 does not name: same namespace, same
+      // channel, DIFFERENT aspect. `price/quoted/USDC` against
+      // `price/quoted/XLM`, both of which the corpus produces.
+      ["crossAspectAffinity", 0, /briefPolicy\.crossAspectAffinity must lie in/],
+      ["crossAspectAffinity", 1, /briefPolicy\.crossAspectAffinity must lie in/],
       ["mediumCeiling", 0, /briefPolicy\.mediumCeiling must be a positive finite/],
       ["mediumCeiling", -5, /briefPolicy\.mediumCeiling must be a positive finite/],
       ["maxRetries", 0, /briefPolicy\.maxRetries must be a positive integer/],
@@ -125,23 +118,61 @@ describe("BriefPolicy", () => {
     });
   });
 
-  it("refuses a cross-channel affinity that cannot clear the relatedness floor", () => {
-    // Not a per-field bound: each of the two is in range and the PAIR is
-    // inverted. Below the floor, the term R12 exists to make non-zero can
-    // never produce a reason, so relatedness silently becomes
-    // same-channel-only and the acceptance scenario's address change stops
-    // being a reason -- the exact failure R12 was written to prevent, wearing
-    // a valid-looking policy.
+  it("orders the two affinity terms, because relatedness is ordered by specificity", () => {
+    // The four values relatedness can take, most specific first: same
+    // `(channel, aspect)` is 1, same channel with a different ASPECT is
+    // `crossAspectAffinity`, same namespace with a different channel is
+    // `crossChannelAffinity`, a different namespace is 0. Evidence about the same
+    // quantity is more related than evidence about another quantity on the same
+    // channel, which is more related than evidence on another channel -- so the
+    // two middle terms have an order, and a policy that inverts them says a
+    // different channel is closer than a different aspect.
+    expect(() =>
+      assertBriefPolicy({ ...BRIEF_POLICY_V0, crossChannelAffinity: 0.8, crossAspectAffinity: 0.5 }),
+    ).toThrow(/crossChannelAffinity.*crossAspectAffinity/);
+    // Equal is refused too: at equality the aspect term is not a term.
+    expect(() =>
+      assertBriefPolicy({ ...BRIEF_POLICY_V0, crossChannelAffinity: 0.5, crossAspectAffinity: 0.5 }),
+    ).toThrow(/crossChannelAffinity.*crossAspectAffinity/);
+    expect(() =>
+      assertBriefPolicy({ ...BRIEF_POLICY_V0, crossChannelAffinity: 0.4, crossAspectAffinity: 0.9 }),
+    ).not.toThrow();
+  });
+
+  it("no longer forces the floor below the smallest term, and that is a RETIRED rule", () => {
+    // THE RULE THAT WAS HERE IS GONE, and its removal is the finding rather than a
+    // loosening. It required `crossChannelAffinity >= relatednessFloor` for every
+    // policy, on the argument that otherwise the cross-channel term is "in range
+    // and dead". Review then measured the cost: with only three relatedness values
+    // the floor had to sit at or below the smallest non-zero one, so EVERY
+    // admissible policy partitioned those values identically and two policies
+    // differing only in the floor returned byte-identical briefs. The field
+    // occupied a slot in the version composite and decided nothing.
     //
-    // The cost, stated: this policy cannot express "only same-channel
-    // evidence counts". That configuration is reachable by raising the floor
-    // to 1, which admits the same-(channel, aspect) term alone.
-    const inverted = { ...BRIEF_POLICY_V0, crossChannelAffinity: 0.2, relatednessFloor: 0.9 };
-    expect(() => assertBriefPolicy(inverted)).toThrow(/crossChannelAffinity.*relatednessFloor/);
-    // At the floor exactly it clears, because the comparison a reason makes is
-    // `>=` and a term equal to the floor is a reason.
-    const atTheFloor = { ...BRIEF_POLICY_V0, crossChannelAffinity: 0.4, relatednessFloor: 0.4 };
-    expect(() => assertBriefPolicy(atTheFloor)).not.toThrow();
+    // With four values the floor has three meaningful positions, and two of them
+    // are what that rule forbade:
+    //   floor <= crossChannel            every same-namespace term counts
+    //   crossChannel < floor <= crossAspect   cross-channel excluded
+    //   crossAspect < floor <= 1              only same-aspect counts
+    // Those are configuration CHOICES, not incoherent states, and a champion
+    // policy that excludes cross-channel evidence is exactly the experiment the
+    // version composite exists to run.
+    for (const floor of [0.1, 0.5, 0.9, 1]) {
+      expect(() => assertBriefPolicy({ ...BRIEF_POLICY_V0, relatednessFloor: floor }), `floor ${floor}`)
+        .not.toThrow();
+    }
+  });
+
+  it("ships a default that admits cross-channel evidence, because §9 needs it to", () => {
+    // What the retired rule was really protecting, now asserted where it belongs:
+    // on the SHIPPED value rather than as a bound on every value. Design §9's
+    // scenario is a day-twelve `address_integrity` change bearing on a
+    // day-twenty-one `price` intent -- same namespace, different channel -- so
+    // this default must let that term clear the floor or the address change is
+    // not a reason and §9's own assertion fails.
+    expect(BRIEF_POLICY_V0.crossChannelAffinity).toBeGreaterThanOrEqual(
+      BRIEF_POLICY_V0.relatednessFloor,
+    );
   });
 
   it("ACCEPTS the ends that are meant to be admissible, which no refusal row can show", () => {
@@ -158,11 +189,16 @@ describe("BriefPolicy", () => {
     expect(() =>
       assertBriefPolicy({ ...BRIEF_POLICY_V0, activeTagFactor: 0.999999 }),
     ).not.toThrow();
+    // A floor of exactly 1 -- "only the same aspect counts" -- is admissible now
+    // that no rule pins the floor below the affinity terms.
+    expect(() => assertBriefPolicy({ ...BRIEF_POLICY_V0, relatednessFloor: 1 })).not.toThrow();
+    // And just inside the affinity terms' open ends, keeping their order: a row
+    // that pushed one of them to 0.999999 without moving the other would be
+    // refused by the ORDERING rule, not by the bound it means to test.
     expect(() =>
-      assertBriefPolicy({ ...BRIEF_POLICY_V0, relatednessFloor: 0.999, crossChannelAffinity: 0.9995 }),
-    ).not.toThrow();
-    expect(() =>
-      assertBriefPolicy({ ...BRIEF_POLICY_V0, crossChannelAffinity: 0.999999 }),
+      assertBriefPolicy({
+        ...BRIEF_POLICY_V0, crossChannelAffinity: 0.999997, crossAspectAffinity: 0.999999,
+      }),
     ).not.toThrow();
     expect(() => assertBriefPolicy({ ...BRIEF_POLICY_V0, maxRetries: 1 })).not.toThrow();
   });
@@ -181,9 +217,9 @@ describe("BriefPolicy", () => {
     expect(() => assertBriefPolicy({ ...BRIEF_POLICY_V0, mediumCeiling: 5000 })).toThrow(
       /mediumCeiling.*briefThreshold/,
     );
-    expect(() => assertBriefPolicy({ ...BRIEF_POLICY_V0, mediumCeiling: 3000 })).toThrow(
-      /mediumCeiling.*briefThreshold/,
-    );
+    expect(() =>
+      assertBriefPolicy({ ...BRIEF_POLICY_V0, mediumCeiling: BRIEF_POLICY_V0.briefThreshold }),
+    ).toThrow(/mediumCeiling.*briefThreshold/);
     // Strictly below, and the argument for strictness is WEAKER than an earlier
     // version of this comment claimed. It said "at equality an intent AT the
     // threshold is held when reachable and proceeds when not" -- which is false:
@@ -213,10 +249,42 @@ describe("BriefPolicy", () => {
       lowered *= activeTagFactor;
       tags += 1;
     }
-    expect(tags).toBe(7);
+    // Nine at the shipped numbers, computed rather than asserted from memory. The
+    // count is not the point; that it is FINITE is.
+    expect(tags).toBe(9);
     expect(lowered).toBeLessThan(mediumCeiling);
     // And the policy accepts that configuration, which is the point of the test.
     expect(() => assertBriefPolicy(BRIEF_POLICY_V0)).not.toThrow();
+  });
+
+  it("satisfies BOTH scenarios' hold, which the first defaults did not", () => {
+    // DESIGN §9 AND R15 DISAGREE ON THE AMOUNT, and finding F8 records that. The
+    // first defaults -- threshold 3000 -- were fitted to R15's 2500 USDC alone, and
+    // measurement then showed design §9's own assertion FAILING: §9:358 says a FIVE
+    // HUNDRED unit authorization is held on day twenty-one because the day-twelve
+    // tag lowered the threshold, and against a lowered 2400 or 1920 a 500-unit
+    // request is nowhere near held.
+    //
+    // Both are satisfiable at once, so both are satisfied. §9's story has ONE
+    // active tag (the address change); R15's merged corpus has two, because M2's
+    // daily-refreshed trustline state is active as well.
+    const { briefThreshold: base, activeTagFactor: f } = BRIEF_POLICY_V0;
+    const heldAt = (amount: number, activeTags: number): boolean =>
+      amount >= base * f ** activeTags;
+
+    // §9: not held at the base threshold, held once one tag is active -- so the
+    // TAG is what flips it, which is the whole point of the scenario.
+    expect(heldAt(500, 0)).toBe(false);
+    expect(heldAt(500, 1)).toBe(true);
+    // R15: held with the two tags its corpus produces.
+    expect(heldAt(2500, 2)).toBe(true);
+
+    // The window this pins the base to, written out so a later change to the
+    // factor cannot silently leave one scenario behind: above 500 so the
+    // unlowered bar passes it, and at or below 625 so one active tag brings it
+    // under 500.
+    expect(base).toBeGreaterThan(500);
+    expect(base).toBeLessThanOrEqual(500 / f);
   });
 
   it("ships no two numbers the same, so a wrong-field read cannot return the right answer", () => {
