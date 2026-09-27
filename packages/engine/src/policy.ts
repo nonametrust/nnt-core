@@ -128,8 +128,8 @@ export interface BriefPolicy {
    * case below is given a value beneath the affinity.
    *
    * THE FOURTH CASE R12 DOES NOT RULE: same namespace, same channel, DIFFERENT
-   * ASPECT -- `price/quoted/USDC` against `price/quoted/XLM`, both of which the
-   * corpus produces. R12 names three terms and the data model has four, and
+   * ASPECT -- `volume/amount/USDC/in` against `volume/amount/XLM/in`, which the
+   * corpus really produces. R12 names three terms and the data model has four, and
    * design §1 puts aspect matching inside `rel()`. Owed a ruling before Task 4.
    */
   readonly relatednessFloor: number;
@@ -155,9 +155,11 @@ export interface BriefPolicy {
   readonly crossChannelAffinity: number;
   /**
    * Relatedness of two readings in the same namespace, on the SAME channel, for
-   * DIFFERENT aspects -- `price/quoted/USDC` against `price/quoted/XLM`, or
-   * `volume/amount/USDC/in` against `volume/amount/XLM/in`. Both pairs the corpus
-   * actually produces.
+   * DIFFERENT aspects -- `volume/amount/USDC/in` against `volume/amount/XLM/in`,
+   * which the corpus really produces. An earlier version of this comment paired
+   * `price/quoted/USDC` with `price/quoted/XLM` as well; replaying the corpus
+   * found no `price/quoted/XLM` in it, and a claim about what the corpus contains
+   * is a claim that gets replayed.
    *
    * R12 NAMES THREE TERMS AND THE DATA MODEL HAS FOUR. This is the case it
    * leaves out, and design §1 puts aspect matching inside `rel()` rather than
@@ -364,17 +366,24 @@ export function assertBriefPolicy(policy: BriefPolicy): void {
   // intent; that is asserted on `BRIEF_POLICY_V0` in `policy.test.ts`, where it
   // belongs, rather than imposed on every policy.
   //
-  // FIRST: the two affinity terms are ORDERED, because relatedness is ordered by
-  // specificity. Same channel and a different aspect is more related than a
-  // different channel; a policy that inverts them says the opposite, and equality
-  // makes the aspect term not a term.
-  if (!(policy.crossChannelAffinity < policy.crossAspectAffinity)) {
-    throw new RangeError(
-      `${label("crossChannelAffinity")} ${policy.crossChannelAffinity} must be below ` +
-        `${label("crossAspectAffinity")} ${policy.crossAspectAffinity}: evidence about another ` +
-        `quantity on the same channel is more related than evidence on another channel`,
-    );
-  }
+  // WHAT IS NOT HERE, and its absence is the same finding twice. An earlier
+  // version imposed `crossChannelAffinity < crossAspectAffinity` on EVERY policy,
+  // justified by "relatedness is ordered by specificity". Review pointed out that
+  // this repeats, one commit later, the mistake that retired the rule above: it is
+  // an UNMEASURED modelling claim imposed as a law, and it forbids an inversion a
+  // challenger might have good reason to want.
+  //
+  // The reason it might: under the shipped numbers an `address_integrity`
+  // transition -- a payment address changing, which is what design §9 is built
+  // around -- scores 0.55 against a price intent while a quote in another currency
+  // scores 0.75. So identity evidence ranks BELOW a second currency's price, and
+  // nobody has measured which is actually more predictive of a loss. That is
+  // exactly the kind of question the champion-challenger arrangement exists to
+  // settle, and a universal rule would settle it by fiat instead.
+  //
+  // So the ordering is asserted on `BRIEF_POLICY_V0` in `policy.test.ts`, where the
+  // cross-channel requirement also lives, and declared in `relatedness.ts` as the
+  // shipped default's assumption rather than as a property of relatedness.
   // Second: a ceiling at or above the threshold it sits under makes the
   // unavailable path MORE permissive than the available one, which is design
   // §6:281's prohibition -- degrading availability is not a way to bypass the

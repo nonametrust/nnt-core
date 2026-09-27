@@ -20,7 +20,20 @@ export interface GradeInput {
   amount: number;
   /** The threshold for this counterparty at this instant, already lowered by any active tag. */
   threshold: number;
-  /** How many pieces of evidence cleared `relatednessFloor` for this intent. */
+  /**
+   * How many pieces of evidence are REASONS for this intent -- meaning they clear
+   * BOTH floors: `relatednessFloor` and `activeFloor`.
+   *
+   * Both, because design §6:266 says so in as many words: "keep those whose
+   * relatedness and decayed strength clear their thresholds". An earlier version
+   * of this docstring named relatedness alone, and review measured what that
+   * costs: the day-twelve address tag at three thousand six hundred and fifty days
+   * has a decayed strength of 2.1e-79 and is still perfectly RELATED, so it would
+   * have been a reason forever and every counterparty with any history would read
+   * `watch` until the end of time. Under the shipped policy the two sets happen to
+   * coincide on the corpus -- two active, two related, two reasons -- so nothing
+   * there would have caught the wrong reading.
+   */
   reasonCount: number;
 }
 
@@ -58,11 +71,20 @@ export interface GradeInput {
  * population to measure it against, and neither exists yet; that is the shadow
  * evaluation's, and M4's at the earliest.
  *
- * AND `clear` IS NOT A REASSURANCE. R29 rules that a first-ever brief grades
- * `clear` on no evidence at all -- a counterparty seen for the first time has no
- * tags and a cold baseline computes no surprise -- so `clear` means "nothing
- * crossed", never "nothing happened". That sentence belongs in the README beside
- * R13's, and this rule is what makes it exact.
+ * AND `clear` IS NOT A REASSURANCE -- but the sentence needs a qualifier the
+ * first version of it did not have. R29 rules that a first-ever brief grades
+ * `clear` on no evidence at all, and that is true only BELOW the base threshold:
+ * measured, a pristine counterparty asking for the base amount or more grades
+ * `hold` with zero reasons, because the threshold is what a threshold is. So
+ * `clear` means "nothing crossed AND the amount is under the bar", never "nothing
+ * happened".
+ *
+ * A second qualifier, also measured: for a counterparty whose producer emits any
+ * standing STATE, `clear` is unreachable on any day at any amount below the bar. A
+ * state is a categorical tag refreshed every morning, so it never decays out of
+ * `activeFloor`, and it is related to everything in its own namespace. R29's
+ * sentence holds for a counterparty with no state at all, which the corpus's
+ * provider is not. Both qualifiers belong in the README beside R13's.
  *
  * Every input is refused unless it is a number the comparison can trust: a NaN
  * amount fails `>=` and would come back as the SOFTEST grade, produced by the

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { BRIEF_POLICY_V0, type BriefPolicy } from "./policy.js";
-import { isReason, relatedness, relatednessCase, type RelatednessCase } from "./relatedness.js";
+import { clearsRelatednessFloor, relatedness, relatednessCase, type RelatednessCase } from "./relatedness.js";
 
 // R12: how related a piece of evidence is to the intent being briefed.
 //
@@ -15,7 +15,11 @@ import { isReason, relatedness, relatednessCase, type RelatednessCase } from "./
 // `address_integrity/transition` and the day-twenty-one intent is `price`, so a
 // zero there makes the address change not a reason while §9 and Task 9 both
 // require it to be one. The SECOND case is the one R12 leaves out entirely and
-// the corpus produces anyway -- `price/quoted/USDC` against `price/quoted/XLM`.
+// the corpus produces anyway -- `volume/amount/USDC/in` against
+// `volume/amount/XLM/in`. The `price/quoted/XLM` fixtures below are SYNTHETIC and
+// deliberately so: the function takes three strings and does not care whether the
+// corpus ever produced them, and review found an earlier comment here claiming it
+// did. A fixture may be invented; a claim about the corpus may not.
 //
 // The fourth is zero in M3 by R11, and that is a scope exclusion rather than a
 // measurement: `continuityAssertionSchema` carries no target namespace, so no
@@ -103,20 +107,20 @@ describe("relatedness", () => {
   });
 });
 
-describe("isReason", () => {
+describe("clearsRelatednessFloor", () => {
   const intent = tag("ns-provider", "price", "quoted/USDC");
 
   it("admits a term at the floor, because a reason clears it at equality", () => {
     const atFloor: BriefPolicy = { ...policy, relatednessFloor: policy.crossChannelAffinity };
-    expect(isReason(intent, tag("ns-provider", "address_integrity", "transition"), atFloor)).toBe(true);
+    expect(clearsRelatednessFloor(intent, tag("ns-provider", "address_integrity", "transition"), atFloor)).toBe(true);
   });
 
   it("refuses a term below the floor", () => {
     const above: BriefPolicy = { ...policy, relatednessFloor: 0.5 };
     // 0.41 < 0.5: cross-channel evidence stops being a reason.
-    expect(isReason(intent, tag("ns-provider", "address_integrity", "transition"), above)).toBe(false);
+    expect(clearsRelatednessFloor(intent, tag("ns-provider", "address_integrity", "transition"), above)).toBe(false);
     // 0.68 >= 0.5: cross-aspect evidence still is.
-    expect(isReason(intent, tag("ns-provider", "price", "quoted/XLM"), above)).toBe(true);
+    expect(clearsRelatednessFloor(intent, tag("ns-provider", "price", "quoted/XLM"), above)).toBe(true);
   });
 
   it("lets the floor pick each of its three meaningful positions", () => {
@@ -130,15 +134,15 @@ describe("isReason", () => {
     const sameAspect = tag("ns-provider", "price", "quoted/USDC");
 
     const permissive: BriefPolicy = { ...policy, relatednessFloor: 0.1 };
-    expect([crossChannel, crossAspect, sameAspect].map((t) => isReason(intent, t, permissive)))
+    expect([crossChannel, crossAspect, sameAspect].map((t) => clearsRelatednessFloor(intent, t, permissive)))
       .toEqual([true, true, true]);
 
     const aspectOnly: BriefPolicy = { ...policy, relatednessFloor: 0.5 };
-    expect([crossChannel, crossAspect, sameAspect].map((t) => isReason(intent, t, aspectOnly)))
+    expect([crossChannel, crossAspect, sameAspect].map((t) => clearsRelatednessFloor(intent, t, aspectOnly)))
       .toEqual([false, true, true]);
 
     const exact: BriefPolicy = { ...policy, relatednessFloor: 1 };
-    expect([crossChannel, crossAspect, sameAspect].map((t) => isReason(intent, t, exact)))
+    expect([crossChannel, crossAspect, sameAspect].map((t) => clearsRelatednessFloor(intent, t, exact)))
       .toEqual([false, false, true]);
   });
 
@@ -148,7 +152,7 @@ describe("isReason", () => {
     // cross-namespace reason.
     const other = tag("ns-wallet", "price", "quoted/USDC");
     for (const floor of [0.01, 0.2, 1]) {
-      expect(isReason(intent, other, { ...policy, relatednessFloor: floor }), `floor ${floor}`)
+      expect(clearsRelatednessFloor(intent, other, { ...policy, relatednessFloor: floor }), `floor ${floor}`)
         .toBe(false);
     }
   });
@@ -158,7 +162,7 @@ describe("isReason", () => {
     // day-twelve address change to be a reason for the day-twenty-one price
     // intent, and this is that comparison, made with the numbers a release would
     // actually use.
-    expect(isReason(intent, tag("ns-provider", "address_integrity", "transition"), BRIEF_POLICY_V0))
+    expect(clearsRelatednessFloor(intent, tag("ns-provider", "address_integrity", "transition"), BRIEF_POLICY_V0))
       .toBe(true);
   });
 

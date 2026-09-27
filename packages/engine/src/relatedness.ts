@@ -43,10 +43,14 @@ export function relatednessCase(a: Related, b: Related): RelatednessCase {
  * - **1** -- same namespace, same channel, same aspect. The same quantity about
  *   the same counterparty.
  * - **`crossAspectAffinity`** -- same namespace, same channel, DIFFERENT aspect.
- *   `price/quoted/USDC` against `price/quoted/XLM`, or
- *   `volume/amount/USDC/in` against `volume/amount/XLM/in`. R12 names three
- *   terms and the data model has four; this is the missing one, and the corpus
- *   produces both of those pairs. Design §1 puts aspect matching inside `rel()`
+ *   `volume/amount/USDC/in` against `volume/amount/XLM/in`, which the corpus
+ *   really does produce: measured, the five aspects it reads into are
+ *   `address_integrity/transition`, `price/quoted/USDC`,
+ *   `protocol/event/trustline_open`, `volume/amount/USDC/in` and
+ *   `volume/amount/XLM/in`. R12 names three terms and the data model has four;
+ *   this is the missing one. An earlier version of this comment also claimed
+ *   `price/quoted/XLM`, which the corpus does NOT contain -- a claim about what
+ *   the corpus holds is a claim that gets replayed. Design §1 puts aspect matching inside `rel()`
  *   rather than outside it, so it was never out of scope -- only unruled, which
  *   meant it would have been decided on the day Task 4 met a second aspect, by
  *   whichever branch happened to catch it.
@@ -62,6 +66,17 @@ export function relatednessCase(a: Related, b: Related): RelatednessCase {
  *   `{assertedBy, assertedAt, reason}` -- there is no target namespace in it, so
  *   no wire observation can express the link and a table for it would be
  *   populated by nothing but a test. M4 needs a versioned wire change first.
+ *
+ * THE ORDER OF THE TWO MIDDLE TERMS IS THE SHIPPED DEFAULT'S ASSUMPTION, not a
+ * property of relatedness. `BRIEF_POLICY_V0` puts `crossAspectAffinity` above
+ * `crossChannelAffinity` on the argument that evidence about another quantity on
+ * the same channel is closer than evidence on another channel -- and nobody has
+ * measured that. Under those numbers a payment address CHANGING scores 0.55
+ * against a price intent while a quote in another currency scores 0.75, so
+ * identity evidence ranks lower, which is at least arguable. `assertBriefPolicy`
+ * therefore does NOT impose the order: a challenger may invert it, and that is an
+ * experiment the version composite exists to run. This function returns whatever
+ * the policy says.
  *
  * SYMMETRIC, because relatedness is a comparison and not a direction: evidence
  * A bearing on intent B is as related as B bearing on A. The brief always asks
@@ -86,8 +101,21 @@ export function relatedness(a: Related, b: Related, policy: BriefPolicy): number
 }
 
 /**
- * Whether this evidence is related enough to the intent to be a REASON in its
- * brief.
+ * Whether this evidence clears the RELATEDNESS floor for this intent.
+ *
+ * NAMED FOR THE ONE FLOOR IT CHECKS, which is a correction. It was
+ * `isReason`, and that name claimed more than the function holds: design
+ * §6:266 says a reason is evidence "whose relatedness AND decayed strength clear
+ * their thresholds", so relatedness is one of two conditions and the other one --
+ * `activeFloor` against the decayed strength -- lives with the brief, which is
+ * the only caller that has a strength to compare. A predicate called `isReason`
+ * that decides half of reason-hood is the defect this repository already has a
+ * commit about, three names that claimed more than their tests held.
+ *
+ * Measured consequence of getting it wrong, from review: the day-twelve address
+ * tag at three thousand six hundred and fifty days has a decayed strength of
+ * 2.1e-79 and is still perfectly related, so a brief counting reasons on
+ * relatedness alone would carry it forever.
  *
  * `>=`, so a term equal to the floor is a reason -- the floor is declared as "the
  * relatedness at or above which a tag is a reason", and the comparison has to
@@ -114,6 +142,6 @@ export function relatedness(a: Related, b: Related, policy: BriefPolicy): number
  * A different namespace never clears any floor, because zero clears nothing and
  * every floor is positive. That is the one thing R11 must not leak.
  */
-export function isReason(a: Related, b: Related, policy: BriefPolicy): boolean {
+export function clearsRelatednessFloor(a: Related, b: Related, policy: BriefPolicy): boolean {
   return relatedness(a, b, policy) >= policy.relatednessFloor;
 }

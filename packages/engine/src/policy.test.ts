@@ -103,8 +103,8 @@ describe("BriefPolicy", () => {
       // same one and the term it exists to express is gone.
       ["crossChannelAffinity", 1, /briefPolicy\.crossChannelAffinity must lie in/],
       // The fourth relatedness case R12 does not name: same namespace, same
-      // channel, DIFFERENT aspect. `price/quoted/USDC` against
-      // `price/quoted/XLM`, both of which the corpus produces.
+      // channel, DIFFERENT aspect. `volume/amount/USDC/in` against
+      // `volume/amount/XLM/in`, which the corpus really produces.
       ["crossAspectAffinity", 0, /briefPolicy\.crossAspectAffinity must lie in/],
       ["crossAspectAffinity", 1, /briefPolicy\.crossAspectAffinity must lie in/],
       ["mediumCeiling", 0, /briefPolicy\.mediumCeiling must be a positive finite/],
@@ -118,24 +118,24 @@ describe("BriefPolicy", () => {
     });
   });
 
-  it("orders the two affinity terms, because relatedness is ordered by specificity", () => {
-    // The four values relatedness can take, most specific first: same
-    // `(channel, aspect)` is 1, same channel with a different ASPECT is
-    // `crossAspectAffinity`, same namespace with a different channel is
-    // `crossChannelAffinity`, a different namespace is 0. Evidence about the same
-    // quantity is more related than evidence about another quantity on the same
-    // channel, which is more related than evidence on another channel -- so the
-    // two middle terms have an order, and a policy that inverts them says a
-    // different channel is closer than a different aspect.
+  it("ships a default whose affinity terms are ordered by specificity", () => {
+    // ON THE DEFAULT, NOT ON EVERY POLICY, and that is a correction. An earlier
+    // version refused `crossChannelAffinity >= crossAspectAffinity` for any policy,
+    // justified by "relatedness is ordered by specificity" -- which review named as
+    // the same mistake that had just retired the floor rule, one commit later: an
+    // unmeasured modelling claim imposed as a law.
+    //
+    // Nobody has measured whether a payment address changing is more or less
+    // predictive of a loss than a quote in another currency, and under these
+    // numbers the address change scores LOWER. A challenger that inverts the pair
+    // is a legitimate experiment, so the ordering is the shipped default's
+    // assumption and not a property of relatedness.
+    expect(BRIEF_POLICY_V0.crossChannelAffinity).toBeLessThan(BRIEF_POLICY_V0.crossAspectAffinity);
+    expect(BRIEF_POLICY_V0.crossAspectAffinity).toBeLessThan(1);
+    // And an inverted pair is now ACCEPTED, which is the half of this that a
+    // refusal row cannot show.
     expect(() =>
       assertBriefPolicy({ ...BRIEF_POLICY_V0, crossChannelAffinity: 0.8, crossAspectAffinity: 0.5 }),
-    ).toThrow(/crossChannelAffinity.*crossAspectAffinity/);
-    // Equal is refused too: at equality the aspect term is not a term.
-    expect(() =>
-      assertBriefPolicy({ ...BRIEF_POLICY_V0, crossChannelAffinity: 0.5, crossAspectAffinity: 0.5 }),
-    ).toThrow(/crossChannelAffinity.*crossAspectAffinity/);
-    expect(() =>
-      assertBriefPolicy({ ...BRIEF_POLICY_V0, crossChannelAffinity: 0.4, crossAspectAffinity: 0.9 }),
     ).not.toThrow();
   });
 
@@ -257,34 +257,61 @@ describe("BriefPolicy", () => {
     expect(() => assertBriefPolicy(BRIEF_POLICY_V0)).not.toThrow();
   });
 
-  it("satisfies BOTH scenarios' hold, which the first defaults did not", () => {
+  it("satisfies what design §9 and R15 each literally assert, and not more", () => {
     // DESIGN §9 AND R15 DISAGREE ON THE AMOUNT, and finding F8 records that. The
     // first defaults -- threshold 3000 -- were fitted to R15's 2500 USDC alone, and
-    // measurement then showed design §9's own assertion FAILING: §9:358 says a FIVE
-    // HUNDRED unit authorization is held on day twenty-one because the day-twelve
-    // tag lowered the threshold, and against a lowered 2400 or 1920 a 500-unit
-    // request is nowhere near held.
+    // §9:358's own assertion was FALSE on them: a 500-unit request against a
+    // lowered 2400 or 1920 is nowhere near held.
     //
-    // Both are satisfiable at once, so both are satisfied. §9's story has ONE
-    // active tag (the address change); R15's merged corpus has two, because M2's
-    // daily-refreshed trustline state is active as well.
+    // WHAT §9 ACTUALLY ASSERTS, read rather than paraphrased: "the brief returns
+    // `hold`, its reasons include the address change carrying its original
+    // day-twelve timestamp, and the call completes inside the latency budget". The
+    // narrative says the live tag LOWERS that provider's threshold. Lowering is not
+    // flipping, and an earlier version of this test asserted flipping -- that a 500
+    // request passes at zero active tags and holds at one. Review refuted the model
+    // behind it by replaying the corpus, and the refutation is recorded below
+    // because it constrains Task 9.
     const { briefThreshold: base, activeTagFactor: f } = BRIEF_POLICY_V0;
     const heldAt = (amount: number, activeTags: number): boolean =>
       amount >= base * f ** activeTags;
 
-    // §9: not held at the base threshold, held once one tag is active -- so the
-    // TAG is what flips it, which is the whole point of the scenario.
-    expect(heldAt(500, 0)).toBe(false);
-    expect(heldAt(500, 1)).toBe(true);
-    // R15: held with the two tags its corpus produces.
-    expect(heldAt(2500, 2)).toBe(true);
+    // R15 merges M2's corpus in, and that corpus opens a
+    // `protocol/event/trustline_open` state on day one which is refreshed every
+    // morning and never decays. So at the day-twenty-one instant TWO tags are
+    // active for the provider once the intent's own is excluded by R22: the
+    // trustline state and the day-twelve address change. Measured, not assumed.
+    const activeAtDayTwentyOne = 2;
+    expect(heldAt(500, activeAtDayTwentyOne), "§9's 500-unit request is held").toBe(true);
+    expect(heldAt(2500, activeAtDayTwentyOne), "R15's 2500 USDC request is held").toBe(true);
+  });
 
-    // The window this pins the base to, written out so a later change to the
-    // factor cannot silently leave one scenario behind: above 500 so the
-    // unlowered bar passes it, and at or below 625 so one active tag brings it
-    // under 500.
-    expect(base).toBeGreaterThan(500);
-    expect(base).toBeLessThanOrEqual(500 / f);
+  it("records that no single base makes the day-twelve tag the FLIPPING tag for both amounts", () => {
+    // THE LIMIT, measured and pinned so Task 9 cannot assume otherwise. For the
+    // address tag to be what turns a grade from not-held to held, the amount must
+    // sit below the threshold at one active tag and at or above it at two:
+    //   amount < base × f   and   amount >= base × f²
+    // which is base ∈ (amount/f, amount/f²]. Those windows are DISJOINT for 500 and
+    // 2500 -- (625, 781.25] against (3125, 3906.25] -- so one base cannot give both
+    // amounts a flip, whatever it is. §9 does not ask for a flip, which is why the
+    // shipped base is admissible; Task 9's counterfactual must therefore compare
+    // the provider's THRESHOLD before and after day twelve, not the grade.
+    const { activeTagFactor: f } = BRIEF_POLICY_V0;
+    const flipWindow = (amount: number): [number, number] => [amount / f, amount / f ** 2];
+    const [lo500, hi500] = flipWindow(500);
+    const [lo2500] = flipWindow(2500);
+    expect(hi500).toBeLessThan(lo2500);
+    // And the shipped base is in NEITHER window, which is the honest statement of
+    // where it sits: it holds both amounts without either flipping.
+    expect(BRIEF_POLICY_V0.briefThreshold).toBeLessThanOrEqual(lo500);
+  });
+
+  it("keeps the day-twelve tag LOWERING the threshold, which is what §9 does say", () => {
+    // §9's narrative: "the live tag lowers that provider's brief threshold". That is
+    // held by the factor being below 1 and is the property Task 9 asserts as a
+    // comparison. One active tag is strictly lower than none, two than one.
+    const { briefThreshold: base, activeTagFactor: f } = BRIEF_POLICY_V0;
+    expect(base * f).toBeLessThan(base);
+    expect(base * f * f).toBeLessThan(base * f);
   });
 
   it("ships no two numbers the same, so a wrong-field read cannot return the right answer", () => {
