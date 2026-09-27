@@ -53,6 +53,12 @@ export interface BriefPolicy {
    * intent carrying a different unit is refused by name rather than coerced:
    * a coercion here would need an exchange rate, which is a price feed and a
    * trust assumption this system does not have.
+   *
+   * Refused if it is not already trimmed. Task 6 compares this against the
+   * intent's unit, and against a padded policy that comparison refuses a
+   * CORRECT intent -- the coercion problem arriving as a false refusal instead
+   * of a wrong answer. Trimming on read would be the coercion; refusing where
+   * the value is declared is not.
    */
   readonly thresholdUnit: string;
   /**
@@ -67,6 +73,12 @@ export interface BriefPolicy {
    *
    * WHAT IT CANNOT EXPRESS: "never above X regardless", which a subtraction
    * can. If that is wanted it is a separate cap and not this number.
+   *
+   * It composes PER ACTIVE TAG, so the lowered threshold is
+   * `briefThreshold × activeTagFactor^k` for k active tags — not a single
+   * multiplication. The shipped default's derivation is written out at
+   * `BRIEF_POLICY_V0`, where an earlier version of that sentence described one
+   * tag and the merged acceptance corpus has two.
    */
   readonly activeTagFactor: number;
   /**
@@ -84,7 +96,27 @@ export interface BriefPolicy {
    * test, not only by this sentence.
    */
   readonly activeFloor: number;
-  /** The relatedness at or above which a tag is a reason for this intent. */
+  /**
+   * The relatedness at or above which a tag is a reason for this intent. "At or
+   * above", so the comparison is `>=` and a term equal to the floor is a reason.
+   *
+   * WHAT IT IS NOT: a measured number. Nothing in the study speaks to how
+   * related two pieces of evidence must be before one bears on the other.
+   *
+   * Strictly below 1, and that bound is a CORRECTION. It was declared `(0, 1]`
+   * on the argument that a floor of 1 expresses "only same-channel evidence
+   * counts". It does not, twice over: the cross-field rule in
+   * `assertBriefPolicy` requires `crossChannelAffinity >= relatednessFloor`
+   * while the affinity is itself capped below 1, so a floor of 1 is refused
+   * under EVERY affinity — measured at 0.55, at 0.999 and at 1 — and even were
+   * it reachable, a floor of 1 with an affinity of 1 would still make
+   * cross-channel evidence a reason. The effective range was always `(0, 1)`;
+   * it is declared that way now so the refusal names this field rather than
+   * arriving from the pair.
+   *
+   * WHAT WOULD REPLACE IT: a measured rate of how often same-namespace
+   * cross-channel evidence precedes a loss, from the shadow evaluation.
+   */
   readonly relatednessFloor: number;
   /**
    * Relatedness of two readings in the same namespace on DIFFERENT channels.
@@ -99,6 +131,11 @@ export interface BriefPolicy {
    * declared.
    *
    * It must also clear `relatednessFloor`, or the term is in range and dead.
+   * Its own `> 0` bound is REDUNDANT given that rule -- a floor is always
+   * positive, so an affinity of 0 fails the pair before it fails the bound --
+   * and is kept because a refusal that names this field is what a reader of the
+   * message needs. Said here because the test row for 0 is killed by the pair
+   * and not by this bound, and a comment claiming otherwise would be false.
    */
   readonly crossChannelAffinity: number;
   /**
@@ -109,6 +146,24 @@ export interface BriefPolicy {
    * ruling put it: a caller supplying its own ceiling is a caller raising it,
    * and design §6:281 says degrading availability is not a way to bypass the
    * layer.
+   *
+   * Strictly below `briefThreshold`, and that rule is the same argument
+   * reaching the ceiling's VALUE rather than only its location. Measured: with
+   * the threshold at 3000, ceilings of 5000, 3000 and 2900 were all accepted,
+   * and at 5000 a medium-risk intent of 4000 PROCEEDS while a store is
+   * unreachable and is HELD when it is reachable. That is the layer bypassed by
+   * making it unavailable, wearing a valid-looking policy.
+   *
+   * NECESSARY AND NOT SUFFICIENT, and the gap is declared rather than implied:
+   * an active tag multiplies the threshold down, so 3000 × 0.8^7 = 629.15 sits
+   * UNDER the shipped ceiling of 750, and a counterparty with seven active tags
+   * is again more permissively treated when a store is down. Nothing in M3
+   * bounds the number of active tags, so no rule over these two numbers can
+   * close it; closing it needs a floor under the lowered threshold, which is a
+   * number nobody has measured.
+   *
+   * WHAT WOULD REPLACE IT: a measured loss rate by amount band, which would
+   * also give the floor above.
    */
   readonly mediumCeiling: number;
   /**
@@ -119,6 +174,15 @@ export interface BriefPolicy {
    * producer cap already makes in the store.
    *
    * A positive integer: a bound of 2.5 retries is a bound nothing can honour.
+   * Zero is refused, so "never retry" is not expressible — declared rather than
+   * left to be discovered, and defensible because under R7 a `Deadlocked` that
+   * is never retried becomes an unavailability, which is the one response 40P01
+   * was mapped to `Deadlocked` to avoid.
+   *
+   * NAMED FOR THE BRIEF AND USED BY INGEST. `BaselineStale`, `TagRefreshStale`
+   * and the 23505 on `tag_one_live_per_pair` are all ingest-path refusals, and
+   * this bound governs them too. The name is the plan's; a reader expecting a
+   * brief-only value will trip on it, so it is said here.
    */
   readonly maxRetries: number;
 }
@@ -132,10 +196,30 @@ export const VERSION_SEPARATOR = "/";
 /**
  * v0. Chosen so the section 9 scenario behaves, and that is the whole
  * derivation: a 2500 USDC request on day twenty-one passes the base threshold
- * and is held once the day-twelve address tag has lowered it (3000 × 0.8 =
- * 2400 < 2500). Recorded as fitted, because design §8:338-339 admits the same
- * of its own defaults and the failure this project has already paid for is a
- * number chosen to make a test pass and then described as measured.
+ * of 3000 and is held once an active tag has lowered it. Recorded as fitted,
+ * because design §8:338-339 admits the same of its own defaults and the failure
+ * this project has already paid for is a number chosen to make a test pass and
+ * then described as measured.
+ *
+ * THE FIRST VERSION OF THIS SENTENCE SAID "3000 × 0.8 = 2400 < 2500" AND THAT
+ * IS ONE TAG. The factor composes per active tag, and review replayed M2's
+ * corpus -- which R15 merges into the acceptance scenario -- through the real
+ * `tagObservation` and the store's real `strengthAt` at the day-twenty-one
+ * instant: a `protocol/event/trustline_open` state at strength 0.5197, the
+ * `address_integrity/transition` tag at 0.4165, and the `price/quoted/USDC` tag
+ * the day-twenty-one quote opens at 0.4151. R22 excludes the last as the
+ * intent's own, leaving TWO active tags and a threshold of 3000 × 0.8² = 1920.
+ * 2500 is held either way, so §9's outcome survives -- but the arithmetic in the
+ * sentence did not, and the measurement is what corrected it.
+ *
+ * WHAT THAT COSTS TASK 9, recorded here because it is where the numbers live:
+ * the trustline state is refreshed every morning, so it is active from day ONE
+ * and the provider's threshold is lowered before the day-twelve address change
+ * exists. Task 9's acceptance -- "the provider's threshold lower than the same
+ * query returns for a counterparty with no active tag" -- is therefore
+ * satisfiable with the day-twelve tag doing no work at all, which is R22's
+ * failure one tag over. The comparison Task 9 needs is the provider before and
+ * after day twelve, or with the address tag filtered out.
  *
  * Every number here differs from every other, held by a test. The M2
  * collision map is why.
@@ -185,27 +269,64 @@ export function assertBriefPolicy(policy: BriefPolicy): void {
     );
   }
   requireNonBlank(label("thresholdUnit"), policy.thresholdUnit);
+  // Refused rather than trimmed: Task 6 compares this against the intent's unit
+  // and a padded policy refuses a correct intent.
+  if (policy.thresholdUnit !== policy.thresholdUnit.trim()) {
+    throw new RangeError(
+      `${label("thresholdUnit")} must not be padded, got ${JSON.stringify(policy.thresholdUnit)}`,
+    );
+  }
   requirePositive(label("briefThreshold"), policy.briefThreshold);
   // Open at 1: a factor of 1 lowers nothing.
   requireUnitInterval(label("activeTagFactor"), policy.activeTagFactor, false);
-  // Closed at 1: a floor of 1 admits only a tag at full strength, which is a
-  // strict setting and not an incoherent one.
+  // CLOSED at 1, deliberately, and it is not merely "strict". `refreshTag` can
+  // saturate g0 to exactly `g0Ceiling` = 1, and `strengthAt` returns g0 only at
+  // zero elapsed, so a floor of 1 admits a saturated tag at the instant of its
+  // own refresh and nothing else. That is the OFF setting -- the control
+  // configuration for a champion-challenger run in which no tag lowers any
+  // threshold -- which is also why refusing `activeTagFactor` of 1 is not
+  // over-strict: the two express different things and only one of them is
+  // reachable by a factor.
   requireUnitInterval(label("activeFloor"), policy.activeFloor, true);
-  requireUnitInterval(label("relatednessFloor"), policy.relatednessFloor, true);
+  // OPEN at 1, and this is a correction. It was closed, on the argument that a
+  // floor of 1 expresses "only same-channel evidence counts". Measured: the
+  // cross-field rule below refuses a floor of 1 under EVERY admissible affinity,
+  // so the closed end was unreachable and the declared interval said otherwise.
+  requireUnitInterval(label("relatednessFloor"), policy.relatednessFloor, false);
   // Open at 1 by R12: at 1 the term is not a cross-channel affinity.
   requireUnitInterval(label("crossChannelAffinity"), policy.crossChannelAffinity, false);
   requirePositive(label("mediumCeiling"), policy.mediumCeiling);
   requirePositiveInteger(label("maxRetries"), policy.maxRetries);
-  // A cross-field rule, and the only one here. Each of the two is in range
-  // and the PAIR can still be inverted, in which case the term R12 exists to
-  // make non-zero can never produce a reason and relatedness silently becomes
-  // same-channel-only. The cost: "only same-channel evidence counts" is not
-  // expressible this way, and is reachable instead by a floor of 1.
+  // Two cross-field rules. Each field above can be in range while a PAIR is
+  // incoherent, and both pairs were measured to be reachable under a policy
+  // that looked valid.
+  //
+  // First: an affinity below the floor is in range and DEAD -- the term R12
+  // exists to make non-zero can never produce a reason, so relatedness silently
+  // becomes same-channel-only, which is R12's own failure wearing a valid
+  // policy. WHAT THIS COSTS, corrected: same-channel-only relatedness is NOT
+  // expressible under this policy at all. An earlier version of this comment
+  // said it was reachable by a floor of 1; it is not, because the affinity must
+  // clear the floor and is itself below 1. A challenger policy that wants it
+  // needs a field this value does not have.
   if (!(policy.crossChannelAffinity >= policy.relatednessFloor)) {
     throw new RangeError(
       `${label("crossChannelAffinity")} ${policy.crossChannelAffinity} must be at least ` +
         `${label("relatednessFloor")} ${policy.relatednessFloor}, or a same-namespace reason on a ` +
         `different channel can never clear the floor`,
+    );
+  }
+  // Second: a ceiling at or above the threshold it sits under makes the
+  // unavailable path MORE permissive than the available one, which is design
+  // §6:281's prohibition -- degrading availability is not a way to bypass the
+  // layer. Necessary and not sufficient: the lowered threshold can still fall
+  // under the ceiling, and `mediumCeiling`'s own comment carries the measured
+  // seven-tag case.
+  if (!(policy.mediumCeiling < policy.briefThreshold)) {
+    throw new RangeError(
+      `${label("mediumCeiling")} ${policy.mediumCeiling} must be below ` +
+        `${label("briefThreshold")} ${policy.briefThreshold}, or a medium-risk intent proceeds ` +
+        `while a store is unavailable and is held when it is reachable`,
     );
   }
 }

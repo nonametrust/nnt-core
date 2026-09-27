@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,8 +46,12 @@ import { describe, it, expect } from "vitest";
 const srcDir = fileURLToPath(new URL("./", import.meta.url));
 const storeGate = fileURLToPath(new URL("../../store/src/clock-gate.test.ts", import.meta.url));
 
-const SOURCE = /\.(ts|mts|cts|tsx)$/;
-const TEST = /\.(test|spec)\.(ts|mts|cts|tsx)$/;
+// Every extension the compiler admits, PLUS the plain-JavaScript ones. Measured:
+// a `clocky.js` beside a `clocky.d.ts`, imported by a module, held a
+// `Date.now()` that this gate could not see, typechecked clean, and then emitted
+// nothing into `dist` -- so the built package was broken as well as unscanned.
+const SOURCE = /\.(ts|mts|cts|tsx|js|mjs|cjs)$/;
+const TEST = /\.(test|spec)\.(ts|mts|cts|tsx|js|mjs|cjs)$/;
 
 type Form = readonly [string, (line: string, inSql: boolean) => boolean];
 
@@ -69,7 +74,9 @@ const CLOCK_FORMS: ReadonlyArray<Form> = [
   ["destructured from Date", (l) => /\}\s*=\s*Date\b/.test(l)],
   ["Reflect.construct(Date", (l) => /\bReflect\s*\.\s*construct\s*\(\s*Date\b/.test(l)],
   ["performance clock", (l) => /\bperformance\s*\.\s*(now|timeOrigin)\b/.test(l)],
-  ["process.hrtime", (l) => /\bprocess\s*\.\s*hrtime\b/.test(l)],
+  // `hrtime` and `uptime` both; `process.uptime()` measures from process start
+  // rather than from the epoch and is a clock read all the same.
+  ["process.hrtime", (l) => /\bprocess\s*\.\s*(hrtime|uptime)\b/.test(l)],
   // The database's clock. The engine writes no SQL of its own today -- it goes
   // through the store's repositories -- and the patterns are kept anyway,
   // because the day it opens a transaction and writes one statement is the day
@@ -105,15 +112,27 @@ const CLOCK_FORMS: ReadonlyArray<Form> = [
 // `Math.random` is here for the same reason and not because anything wanted
 // it -- it is the spelling someone reaches for when a unique-looking string is
 // needed and `crypto` is not imported.
+// One form the store's list does not carry, and it is the engine's alone: the
+// engine formats no dates, so any `Intl.DateTimeFormat` here is either a clock
+// read (`format()` with no argument returns TODAY) or presentation the engine
+// has no business doing. The store may legitimately format, so this is not
+// pushed onto its list; the drift test only requires that this list be a
+// SUPERSET of the store's.
+const ENGINE_ONLY_CLOCK_FORMS: ReadonlyArray<Form> = [
+  ["Intl date formatter", (l) => /\bIntl\s*\.\s*DateTimeFormat\b/.test(l)],
+];
+
 const ID_FORMS: ReadonlyArray<Form> = [
   ["randomUUID", (l) => /\brandomUUID\b/.test(l)],
   ["Math.random", (l) => /\bMath\s*\.\s*random\b/.test(l)],
   // `crypto.getRandomValues` and `randomBytes` are the same hole one layer
   // down: an id built out of bytes is still an id the core invented.
-  ["random bytes", (l) => /\b(getRandomValues|randomBytes|randomInt|randomFillSync)\b/.test(l)],
+  // `randomFill` and `generateKey` are the same hole one spelling over: review
+  // built a working id out of `generateKeySync("hmac", ...).export()`.
+  ["random bytes", (l) => /\b(getRandomValues|randomBytes|randomInt|randomFill|randomFillSync|generateKey|generateKeySync)\b/.test(l)],
 ];
 
-const ALL_FORMS: ReadonlyArray<Form> = [...CLOCK_FORMS, ...ID_FORMS];
+const ALL_FORMS: ReadonlyArray<Form> = [...CLOCK_FORMS, ...ENGINE_ONLY_CLOCK_FORMS, ...ID_FORMS];
 
 // The one module allowed to mint an identifier, and the reason it exists.
 //
@@ -144,48 +163,62 @@ function sourceFiles(): SourceFile[] {
 }
 
 /**
- * Comments blanked, line count preserved so line numbers still point at the
- * source. Without this a doc comment mentioning `Date.now()` counts as a clock
- * read -- which is how the store's exemption test once passed for a `clock.ts`
- * whose clock had been taken out entirely: the comment at its top was doing
- * all the work.
+ * The module with its COMMENTS removed and everything else kept, line count
+ * preserved so line numbers still point at the source. String contents are
+ * KEPT on purpose: `const q = "select current_date"` is a clock read this gate
+ * refuses, and blanking strings would lose every SQL form on the list.
+ *
+ * ONE PASS, tracking strings and both comment kinds together, and that is a
+ * measured fix rather than a tidy-up. The previous version ran the
+ * block-comment regex FIRST and the quote tracker second:
+ *
+ *   const glob = "dist/*";
+ *   export const t = Date.now();
+ *   export const re = /x*\/;
+ *
+ * `"dist/*"` opened a "block comment" that the next `*\/` -- a regex, or any
+ * later doc comment -- closed, blanking every line between them. The clock read
+ * in the middle vanished and the gate stayed GREEN. Measured in both this gate
+ * and the engine's copy of it.
+ *
+ * What it still does not parse: a comment inside a template-literal
+ * substitution, and a regex literal containing an unbalanced quote. Both err
+ * toward treating text as code, which refuses rather than misses.
  */
 function code(text: string): string {
-  return text
-    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
-    .split("\n")
-    .map(stripLineComment)
-    .join("\n");
-}
-
-/**
- * The line with its `//` comment removed -- where `//` means a comment and not
- * two characters inside a string. A plain replace of everything after the
- * first `//` cut `const u = "https://x"; const t = Date.now();` down to
- * `const u = "https:` and the clock read was gone.
- *
- * Quotes are tracked rather than parsed: single, double and backtick, with
- * backslash escapes skipped. A `//` inside a template SUBSTITUTION is still
- * treated as code, which errs toward refusing and never toward missing a read.
- */
-function stripLineComment(line: string): string {
+  let out = "";
+  let i = 0;
   let quote: string | null = null;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i]!;
-    if (c === "\\") { i++; continue; }
-    if (quote !== null) { if (c === quote) quote = null; continue; }
-    if (c === "'" || c === '"' || c === "`") { quote = c; continue; }
-    if (c === "/" && line[i + 1] === "/") return line.slice(0, i);
+  let inBlock = false;
+  while (i < text.length) {
+    const c = text[i]!;
+    const next = text[i + 1];
+    if (inBlock) {
+      if (c === "*" && next === "/") { out += "  "; i += 2; inBlock = false; continue; }
+      out += c === "\n" ? "\n" : " ";
+      i += 1;
+      continue;
+    }
+    if (quote !== null) {
+      // An escape consumes the next character, so a `\"` does not close.
+      if (c === "\\") { out += text.slice(i, i + 2); i += 2; continue; }
+      if (c === quote) { quote = null; out += c; i += 1; continue; }
+      out += c;
+      i += 1;
+      continue;
+    }
+    if (c === "/" && next === "*") { out += "  "; i += 2; inBlock = true; continue; }
+    if (c === "/" && next === "/") {
+      while (i < text.length && text[i] !== "\n") { out += " "; i += 1; }
+      continue;
+    }
+    if (c === "'" || c === '"' || c === "`") { quote = c; out += c; i += 1; continue; }
+    out += c;
+    i += 1;
   }
-  return line;
+  return out;
 }
 
-/**
- * The lines of a module that reach for an instant or an identifier, as
- * `line: form: text`. One function over both lists, so the exemption test
- * below can ask "does this module still reach for SOMETHING" of a module whose
- * something is an id and not a clock.
- */
 function nondeterminismReads(text: string, forms: ReadonlyArray<Form> = ALL_FORMS): string[] {
   const lines = code(text).split("\n");
   // Backtick parity, so a `now()` on its own line inside a multi-line sql
@@ -283,19 +316,33 @@ function withoutImports(text: string): string {
 }
 
 /**
- * The form names the store's gate declares, read out of its source. Used by
- * the drift test only: this file's own list is the one that runs.
+ * The store's `CLOCK_FORMS` block, verbatim, and its digest.
+ *
+ * WHY A DIGEST AND NOT A PARSE. The first version of this check read the store's
+ * form NAMES out of its source with a regex and compared the sets. Review made
+ * the store's list grow in seven ways and the check saw ONE of them: a
+ * single-quoted name walked past, a template-literal name walked past, a name
+ * held in a `const` walked past, a name passed through a helper walked past, a
+ * second list spread into the store's scan walked past, and widening an existing
+ * pattern without adding a name walked past by design. A check that misses six
+ * of seven changes is worse than no check, because its green is what the commit
+ * message asks a reader to trust.
+ *
+ * So the whole block is hashed. ANY edit to the store's list turns this red, and
+ * the red is the instruction: read what changed, copy the form across, and
+ * update the digest in the same commit. That is a deliberate chore -- it is the
+ * chore that keeps two copies of a scanner honest, and the alternative measured
+ * worse.
  */
-function storeFormNames(): string[] {
+const STORE_CLOCK_FORMS_SHA256 = "b29de15e07833b2da6d27c2ab63c77c43feb0356f5d76737e70aec6959368699";
+
+function storeClockFormsBlock(): string {
   const text = readFileSync(storeGate, "utf8");
   const start = text.indexOf("const CLOCK_FORMS");
   expect(start, "the store's gate no longer declares CLOCK_FORMS").toBeGreaterThan(-1);
   const end = text.indexOf("\n];", start);
   expect(end, "the store's CLOCK_FORMS list is not terminated as expected").toBeGreaterThan(start);
-  // Comments first, or a comment naming `Date["now"]` is read as a form called
-  // `now`. Measured: it was.
-  const block = code(text.slice(start, end));
-  return [...block.matchAll(/\[\s*\n?\s*"([^"]+)"/g)].map((m) => m[1]!);
+  return text.slice(start, end + 3);
 }
 
 describe("the engine reads no clock and mints no id", () => {
@@ -369,6 +416,8 @@ describe("the engine reads no clock and mints no id", () => {
       ["Reflect.construct", "const t = Reflect.construct(Date, []);"],
       ["the performance clock", "const t = performance.timeOrigin;"],
       ["process.hrtime", "const t = process.hrtime.bigint();"],
+      ["process.uptime", "const t = process.uptime();"],
+      ["a formatter with no argument, which formats today", 'const d = new Intl.DateTimeFormat("en").format();'],
       ["the database's clock in a template", "await sql`select now()`.execute(db);"],
       ["current_timestamp in SQL", "const q = sql`where t < current_timestamp`;"],
       ["current_date outside a template", 'const q = "select current_date";'],
@@ -430,11 +479,102 @@ describe("the engine reads no clock and mints no id", () => {
       expect(nondeterminismReads(["const a = 1;", "const t = Date.now();"].join("\n"))).toHaveLength(1);
     });
 
+
+    it("does not lose a clock read to a string that contains a comment opener", () => {
+      // MEASURED, and it left this gate green over the tree. The scanner used to
+      // run the block-comment regex before it tracked quotes, so `"dist/*"`
+      // opened a comment that the next `*/` closed -- and any regex literal or
+      // later doc comment supplies one. Everything between them was blanked,
+      // clock read included.
+      const module = [
+        'const glob = "dist/*";',
+        "const t = Date.now();",
+        "const re = /x*/;",
+      ].join("\n");
+      expect(nondeterminismReads(module)).toEqual([
+        "2: Date.now: const t = Date.now();",
+      ]);
+      // And the other order: a comment opener in a string AFTER the read.
+      expect(nondeterminismReads(['const t = Date.now();', 'const g = "a/*b";'].join("\n"))).toHaveLength(1);
+    });
+
+    it("scans a plain .js module, which a TypeScript-only pattern cannot see", () => {
+      // The extension list, held. Measured: a `clocky.js` beside a `clocky.d.ts`,
+      // imported by a module, held a `Date.now()` this gate could not see, and
+      // `tsc` then emitted nothing for it -- so the built package was broken as
+      // well as unscanned. Removing the JavaScript extensions from SOURCE left
+      // every test green, because the engine has no `.js` module today.
+      expect(SOURCE.test("clocky.js")).toBe(true);
+      expect(SOURCE.test("clocky.mjs")).toBe(true);
+      expect(SOURCE.test("clocky.cjs")).toBe(true);
+      expect(SOURCE.test("policy.ts")).toBe(true);
+      expect(SOURCE.test("notes.md")).toBe(false);
+      // And the test-suffix list moves with it, or a `util.test.js` would be
+      // scanned as a module.
+      expect(TEST.test("util.test.js")).toBe(true);
+      expect(TEST.test("util.test.ts")).toBe(true);
+      expect(TEST.test("policy.ts")).toBe(false);
+    });
+
     it("reports the line number of an offender inside a module", () => {
       const module = ["const a = 1;", "", "function f() {", "  // nothing", "  const id = randomUUID();", "}"];
       expect(nondeterminismReads(module.join("\n"))).toEqual([
         "5: randomUUID: const id = randomUUID();",
       ]);
+    });
+
+    // The import blanker, on planted lines. Review found the tree-level
+    // exemption test was the ONLY thing holding it: replacing `withoutImports`
+    // with the identity function survived, because the helper had no test and
+    // the rule was held by hand-mutating `ids.ts`. That is the same shape as the
+    // defect the helper exists to fix.
+    describe("the import blanker", () => {
+      it("blanks a one-line import", () => {
+        expect(nondeterminismReads(withoutImports('import { randomUUID } from "node:crypto";'))).toEqual([]);
+      });
+
+      it("blanks a MULTI-LINE import, which a per-line test cannot", () => {
+        const multi = ['import {', "  randomUUID,", '} from "node:crypto";'].join("\n");
+        expect(nondeterminismReads(withoutImports(multi))).toEqual([]);
+      });
+
+      it("leaves a CALL alone, so the blanker cannot blank the thing it is looking for", () => {
+        // The control. A blanker that blanks too much makes every mutant die for
+        // the wrong reason, so this row is as load-bearing as the two above.
+        const module = ['import { randomUUID } from "node:crypto";', "const id = randomUUID();"].join("\n");
+        expect(nondeterminismReads(withoutImports(module))).toEqual([
+          "2: randomUUID: const id = randomUUID();",
+        ]);
+      });
+
+      it("preserves line numbers, so a refusal still points at the source", () => {
+        const module = ['import {', "  randomUUID,", '} from "node:crypto";', "", "const id = randomUUID();"].join("\n");
+        expect(nondeterminismReads(withoutImports(module))).toEqual([
+          "5: randomUUID: const id = randomUUID();",
+        ]);
+      });
+
+      it("does not run a match from an export through the rest of the file", () => {
+        // The `[^;]*?` bound. With `[\s\S]*?` an `export const` would pair with
+        // any later `from` and swallow the code between them.
+        const module = [
+          "export const source = {",
+          "  next: () => randomUUID(),",
+          "};",
+          'const note = "taken from crypto";',
+        ].join("\n");
+        expect(nondeterminismReads(withoutImports(module))).toEqual([
+          "2: randomUUID: next: () => randomUUID(),",
+        ]);
+      });
+    });
+
+    it("blanks a clock read inside a block comment", () => {
+      // The block-comment arm of `code()`, which nothing exercised directly.
+      expect(nondeterminismReads("/* Date.now() is refused here */")).toEqual([]);
+      expect(nondeterminismReads(["/*", " * const t = Date.now();", " */"].join("\n"))).toEqual([]);
+      // And the line after a block comment is still read.
+      expect(nondeterminismReads(["/* nothing */", "const t = Date.now();"].join("\n"))).toHaveLength(1);
     });
 
     it("sees the database's clock on its own line inside a multi-line query", () => {
@@ -450,25 +590,47 @@ describe("the engine reads no clock and mints no id", () => {
     });
   });
 
-  it("carries every clock form the store's gate declares", () => {
-    // THE DRIFT TEST, and the reason this file can be a copy at all.
+  it("carries every clock form the store's gate declares, byte for byte", () => {
+    // THE DRIFT TEST, and the reason this file may be a copy at all.
     //
     // Each of the store's patterns except the first two was added after review
-    // planted a spelling that walked past. A copy frozen at today's list would
-    // report green on a narrower one the day the store's grows, and nothing
-    // would say so -- a gate that has quietly stopped holding what its
-    // original holds is worse than no gate, because its green is trusted.
-    //
-    // Names, not implementations: two packages may legitimately phrase a
-    // pattern differently, and what must not happen is a FORM going
-    // unrepresented here.
+    // planted a spelling that walked past it. A copy frozen at today's list
+    // would report green on a narrower one the day the store's grows, and
+    // nothing would say so.
+    const block = storeClockFormsBlock();
+    const digest = createHash("sha256").update(block).digest("hex");
+    expect(
+      digest,
+      "the store's CLOCK_FORMS block has changed.\n" +
+        "Read the diff, carry any new form into this file's CLOCK_FORMS, then set\n" +
+        "STORE_CLOCK_FORMS_SHA256 to " + digest + " in the same commit.",
+    ).toBe(STORE_CLOCK_FORMS_SHA256);
+
+    // And the names, still compared, because the digest says THAT something
+    // changed while this says WHAT is missing. Kept as a diagnostic and not as
+    // the rule: review walked six of seven list changes past it.
     const mine = new Set(CLOCK_FORMS.map(([name]) => name));
-    const theirs = storeFormNames();
-    expect(theirs.length, "read no form names out of the store's gate").toBeGreaterThan(5);
+    const theirs = [...code(block).matchAll(/\[\s*\n?\s*"([^"]+)"/g)].map((m) => m[1]!);
+    expect(theirs.length, "read no form names out of the store's gate").toBeGreaterThan(10);
     const missing = theirs.filter((name) => !mine.has(name));
     expect(
       missing,
       "the store's clock gate declares forms this one does not; copy them across:\n" + missing.join("\n"),
     ).toEqual([]);
   });
+
+  it("would notice the store's list changing, which is the only thing the digest is for", () => {
+    // The digest's own proof. Without this the pin is a constant nobody has seen
+    // fail, and a pin that has never been observed to fire is indistinguishable
+    // from a pin of the wrong thing.
+    const block = storeClockFormsBlock();
+    for (const change of [
+      block + '\n["process.uptime", (l) => /uptime/.test(l)],',
+      block.replace('"Date.now"', "'Date.now'"),
+      block.replace("const CLOCK_FORMS", "const CLOCK_FORMS /* reordered */"),
+    ]) {
+      expect(createHash("sha256").update(change).digest("hex")).not.toBe(STORE_CLOCK_FORMS_SHA256);
+    }
+  });
+
 });

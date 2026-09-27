@@ -55,42 +55,71 @@ describe("BriefPolicy", () => {
   describe("refuses each field by name", () => {
     // The value in each row is bad for that field and for no other reason, so
     // a refusal naming a different field is a wrong-field read and not a pass.
+    //
+    // AND EACH ROW DEMANDS ITS OWN BOUND'S PHRASING, not merely the field's
+    // name. Review measured what the looser pattern cost: deleting
+    // `relatednessFloor`'s interval check left its `1.01` row GREEN, and deleting
+    // `crossChannelAffinity`'s lower bound left its `0` row green, because in
+    // both cases the CROSS-FIELD rule then fired and its message also names the
+    // field. A row satisfied by a different rule's refusal is not that row's
+    // bound being held -- it is the same wrong-killer mistake this repository
+    // once wrote into a commit message as "measured", one layer down.
     it.each([
-      ["version", "" as const, /briefPolicy\.version/],
-      ["version", "   " as const, /briefPolicy\.version/],
+      ["version", "" as const, /briefPolicy\.version must not be blank/],
+      ["version", "   " as const, /briefPolicy\.version must not be blank/],
       // R26 joins four versions as `retention/tagging/calibration/brief` and
       // says no component may contain the separator. Nothing held that.
       ["version", "brief/v0" as const, /briefPolicy\.version.*separator|separator.*briefPolicy\.version/],
-      ["thresholdUnit", "" as const, /briefPolicy\.thresholdUnit/],
-      ["thresholdUnit", "  " as const, /briefPolicy\.thresholdUnit/],
-      ["briefThreshold", 0, /briefPolicy\.briefThreshold/],
-      ["briefThreshold", -1, /briefPolicy\.briefThreshold/],
-      ["briefThreshold", Number.POSITIVE_INFINITY, /briefPolicy\.briefThreshold/],
-      ["briefThreshold", Number.NaN, /briefPolicy\.briefThreshold/],
-      ["activeTagFactor", 0, /briefPolicy\.activeTagFactor/],
+      ["thresholdUnit", "" as const, /briefPolicy\.thresholdUnit must not be blank/],
+      ["thresholdUnit", "  " as const, /briefPolicy\.thresholdUnit must not be blank/],
+      // Refused rather than trimmed on read. R27 makes an intent whose unit
+      // differs a NAMED REFUSAL and not a coercion, and Task 6 compares the
+      // two units; against a padded policy that comparison refuses a correct
+      // intent, which is the coercion problem arriving as a false refusal
+      // instead. So the padding is refused where it is declared.
+      ["thresholdUnit", " USDC " as const, /briefPolicy\.thresholdUnit must not be padded/],
+      ["briefThreshold", 0, /briefPolicy\.briefThreshold must be a positive finite/],
+      ["briefThreshold", -1, /briefPolicy\.briefThreshold must be a positive finite/],
+      ["briefThreshold", Number.POSITIVE_INFINITY, /briefPolicy\.briefThreshold must be a positive finite/],
+      ["briefThreshold", Number.NaN, /briefPolicy\.briefThreshold must be a positive finite/],
+      ["activeTagFactor", 0, /briefPolicy\.activeTagFactor must lie in/],
       // A factor of exactly 1 multiplies the threshold by itself: an active
       // tag that lowers nothing. Task 9's acceptance turns on this -- "lower
       // than it was" is satisfiable with a factor of 1 -- so 1 is refused
       // here rather than caught by a comparison nine tasks later.
-      ["activeTagFactor", 1, /briefPolicy\.activeTagFactor/],
-      ["activeTagFactor", 1.5, /briefPolicy\.activeTagFactor/],
-      ["activeFloor", 0, /briefPolicy\.activeFloor/],
-      ["activeFloor", 1.01, /briefPolicy\.activeFloor/],
-      ["relatednessFloor", 0, /briefPolicy\.relatednessFloor/],
-      ["relatednessFloor", 1.01, /briefPolicy\.relatednessFloor/],
+      ["activeTagFactor", 1, /briefPolicy\.activeTagFactor must lie in/],
+      ["activeTagFactor", 1.5, /briefPolicy\.activeTagFactor must lie in/],
+      ["activeFloor", 0, /briefPolicy\.activeFloor must lie in/],
+      ["activeFloor", 1.01, /briefPolicy\.activeFloor must lie in/],
+      ["relatednessFloor", 0, /briefPolicy\.relatednessFloor must lie in/],
+      ["relatednessFloor", 1.01, /briefPolicy\.relatednessFloor must lie in/],
+      // Open at 1, and the reason is a correction. The first version declared
+      // (0, 1] and documented a floor of 1 as the way to express
+      // "only same-channel evidence counts" -- which the cross-field rule
+      // below makes UNREACHABLE under any affinity, since an affinity must be
+      // at least the floor and is itself capped below 1. Measured: refused at
+      // affinity 0.55, at 0.999, and at 1. So the effective range was already
+      // (0, 1) and the declared bound said otherwise; it is declared open now
+      // so the refusal names THIS field instead of arriving from the pair.
+      // The regex demands the FIELD's own phrasing ("must lie in"), not merely
+      // the field's name: the cross-field rule further down also names
+      // `relatednessFloor` in its message, so a looser pattern here was green
+      // while the field's bound admitted 1. A refusal arriving from the pair is
+      // not this row's rule being held.
+      ["relatednessFloor", 1, /relatednessFloor must lie in/],
       // R12: the same-namespace-different-channel term is NOT zero, because
       // the acceptance scenario's own case is same namespace, different
       // channel, and a zero there makes the address change not a reason.
-      ["crossChannelAffinity", 0, /briefPolicy\.crossChannelAffinity/],
+      ["crossChannelAffinity", 0, /briefPolicy\.crossChannelAffinity must lie in/],
       // Nor is it 1: at 1 a different channel is worth exactly as much as the
       // same one and the term it exists to express is gone.
-      ["crossChannelAffinity", 1, /briefPolicy\.crossChannelAffinity/],
-      ["mediumCeiling", 0, /briefPolicy\.mediumCeiling/],
-      ["mediumCeiling", -5, /briefPolicy\.mediumCeiling/],
-      ["maxRetries", 0, /briefPolicy\.maxRetries/],
-      ["maxRetries", -1, /briefPolicy\.maxRetries/],
+      ["crossChannelAffinity", 1, /briefPolicy\.crossChannelAffinity must lie in/],
+      ["mediumCeiling", 0, /briefPolicy\.mediumCeiling must be a positive finite/],
+      ["mediumCeiling", -5, /briefPolicy\.mediumCeiling must be a positive finite/],
+      ["maxRetries", 0, /briefPolicy\.maxRetries must be a positive integer/],
+      ["maxRetries", -1, /briefPolicy\.maxRetries must be a positive integer/],
       // A bound of 2.5 retries is a bound nothing can honour exactly.
-      ["maxRetries", 2.5, /briefPolicy\.maxRetries/],
+      ["maxRetries", 2.5, /briefPolicy\.maxRetries must be a positive integer/],
     ] as const)("%s = %s", (field, value, message) => {
       expect(() => assertBriefPolicy(withField(field, value as never))).toThrow(message);
     });
@@ -113,6 +142,75 @@ describe("BriefPolicy", () => {
     // `>=` and a term equal to the floor is a reason.
     const atTheFloor = { ...BRIEF_POLICY_V0, crossChannelAffinity: 0.4, relatednessFloor: 0.4 };
     expect(() => assertBriefPolicy(atTheFloor)).not.toThrow();
+  });
+
+  it("ACCEPTS the ends that are meant to be admissible, which no refusal row can show", () => {
+    // A refusal table holds only one side of a bound. Review measured what that
+    // costs: flipping `activeFloor`'s interval from closed-at-1 to open
+    // SURVIVED every test, because nothing asserted that 1 is accepted. A bound
+    // is two claims and a suite that tests one of them holds half a rule.
+    //
+    // `activeFloor` of 1 is the OFF setting -- a saturated tag at the instant of
+    // its own refresh and nothing else -- so it must be admissible, and Task 6
+    // builds the threshold on exactly this.
+    expect(() => assertBriefPolicy({ ...BRIEF_POLICY_V0, activeFloor: 1 })).not.toThrow();
+    // And just inside each open end, so flipping those to closed is visible too.
+    expect(() =>
+      assertBriefPolicy({ ...BRIEF_POLICY_V0, activeTagFactor: 0.999999 }),
+    ).not.toThrow();
+    expect(() =>
+      assertBriefPolicy({ ...BRIEF_POLICY_V0, relatednessFloor: 0.999, crossChannelAffinity: 0.9995 }),
+    ).not.toThrow();
+    expect(() =>
+      assertBriefPolicy({ ...BRIEF_POLICY_V0, crossChannelAffinity: 0.999999 }),
+    ).not.toThrow();
+    expect(() => assertBriefPolicy({ ...BRIEF_POLICY_V0, maxRetries: 1 })).not.toThrow();
+  });
+
+  it("refuses a medium ceiling at or above the threshold it is meant to sit under", () => {
+    // R27 moved this ceiling OFF the brief's input and onto the policy for one
+    // reason: design §6:281 says degrading availability is not a way to bypass
+    // the layer, and a caller supplying its own ceiling is a caller raising it.
+    // The same argument reaches the ceiling's VALUE, which nothing held.
+    //
+    // Measured: with the shipped threshold of 3000, ceilings of 5000, 3000 and
+    // 2900 were all accepted. At a ceiling of 5000 a medium-risk intent of 4000
+    // PROCEEDS while a store is unreachable and is HELD when it is reachable --
+    // the layer bypassed by making it unavailable, wearing a valid-looking
+    // policy.
+    expect(() => assertBriefPolicy({ ...BRIEF_POLICY_V0, mediumCeiling: 5000 })).toThrow(
+      /mediumCeiling.*briefThreshold/,
+    );
+    expect(() => assertBriefPolicy({ ...BRIEF_POLICY_V0, mediumCeiling: 3000 })).toThrow(
+      /mediumCeiling.*briefThreshold/,
+    );
+    // Strictly below, so equality is refused too: at equality an intent AT the
+    // threshold is held when reachable and proceeds when not.
+    expect(() =>
+      assertBriefPolicy({ ...BRIEF_POLICY_V0, mediumCeiling: 2999, briefThreshold: 3000 }),
+    ).not.toThrow();
+  });
+
+  it("does not claim that ceiling rule is sufficient, because it is not", () => {
+    // NECESSARY AND NOT SUFFICIENT, stated as a test so the limit is not just
+    // a sentence. An active tag multiplies the threshold down, so a
+    // counterparty with enough active tags has a LOWERED threshold below the
+    // ceiling, and the unavailable path is more permissive than the available
+    // one again. Measured: 3000 × 0.8^7 = 629.15, under the shipped ceiling of
+    // 750. Nothing in M3 bounds the number of active tags, so this cannot be
+    // closed by a policy rule; it is closed, if ever, by a floor under the
+    // lowered threshold, which is a number nobody has measured.
+    const { briefThreshold, activeTagFactor, mediumCeiling } = BRIEF_POLICY_V0;
+    let lowered = briefThreshold;
+    let tags = 0;
+    while (lowered >= mediumCeiling) {
+      lowered *= activeTagFactor;
+      tags += 1;
+    }
+    expect(tags).toBe(7);
+    expect(lowered).toBeLessThan(mediumCeiling);
+    // And the policy accepts that configuration, which is the point of the test.
+    expect(() => assertBriefPolicy(BRIEF_POLICY_V0)).not.toThrow();
   });
 
   it("ships no two numbers the same, so a wrong-field read cannot return the right answer", () => {

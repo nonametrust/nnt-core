@@ -58,7 +58,10 @@ const CLOCK_FORMS: ReadonlyArray<readonly [string, (line: string, inSql: boolean
   ["destructured from Date", (l) => /\}\s*=\s*Date\b/.test(l)],
   ["Reflect.construct(Date", (l) => /\bReflect\s*\.\s*construct\s*\(\s*Date\b/.test(l)],
   ["performance clock", (l) => /\bperformance\s*\.\s*(now|timeOrigin)\b/.test(l)],
-  ["process.hrtime", (l) => /\bprocess\s*\.\s*hrtime\b/.test(l)],
+  // `hrtime` and `uptime` both. `process.uptime()` is a clock read measured
+  // from process start rather than from the epoch, and it is a clock read all
+  // the same; review walked it past this gate.
+  ["process.hrtime", (l) => /\bprocess\s*\.\s*(hrtime|uptime)\b/.test(l)],
   // The database's clock, which this package can reach from every query it
   // writes and which no amount of watching JavaScript would catch. `now()`
   // only where it is not a method call, so the injected `clock.now()` and
@@ -124,47 +127,60 @@ function sourceFiles(): SourceFile[] {
 }
 
 /**
- * Comments blanked, line count preserved so line numbers still point at the
- * source. Without this a doc comment mentioning `Date.now()` counts as a
- * clock read -- which is how the exemption test below passed for a
- * `clock.ts` whose clock had been taken out entirely: the comment at its top
- * was doing all the work.
+ * The module with its COMMENTS removed and everything else kept, line count
+ * preserved so line numbers still point at the source. String contents are
+ * KEPT on purpose: `const q = "select current_date"` is a clock read this gate
+ * refuses, and blanking strings would lose every SQL form on the list.
+ *
+ * ONE PASS, tracking strings and both comment kinds together, and that is a
+ * measured fix rather than a tidy-up. The previous version ran the
+ * block-comment regex FIRST and the quote tracker second:
+ *
+ *   const glob = "dist/*";
+ *   export const t = Date.now();
+ *   export const re = /x*\/;
+ *
+ * `"dist/*"` opened a "block comment" that the next `*\/` -- a regex, or any
+ * later doc comment -- closed, blanking every line between them. The clock read
+ * in the middle vanished and the gate stayed GREEN. Measured in both this gate
+ * and the engine's copy of it.
+ *
+ * What it still does not parse: a comment inside a template-literal
+ * substitution, and a regex literal containing an unbalanced quote. Both err
+ * toward treating text as code, which refuses rather than misses.
  */
 function code(text: string): string {
-  return text
-    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
-    .split("\n")
-    .map(stripLineComment)
-    .join("\n");
-}
-
-/**
- * The line with its `//` comment removed -- where `//` means a comment and
- * not two characters inside a string.
- *
- * A plain regex replace of everything from the first `//` to the end of the
- * line cut it wherever it was, so `const u = "https://x"; const t = Date.now();`
- * arrived at the predicate as `const u = "https:` and the clock read was
- * gone. Review planted exactly that and the gate stayed green. A url in a
- * string is not a contrived line in a package that talks to a database over
- * one.
- *
- * Quotes are tracked rather than parsed: single, double and backtick, with
- * backslash escapes skipped. That is enough for this file's job and stops
- * short of being a scanner -- a `//` inside a template SUBSTITUTION would
- * still be treated as code, which errs toward refusing and never toward
- * missing a clock read.
- */
-function stripLineComment(line: string): string {
+  let out = "";
+  let i = 0;
   let quote: string | null = null;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i]!;
-    if (c === "\\") { i++; continue; }
-    if (quote !== null) { if (c === quote) quote = null; continue; }
-    if (c === "'" || c === '"' || c === "`") { quote = c; continue; }
-    if (c === "/" && line[i + 1] === "/") return line.slice(0, i);
+  let inBlock = false;
+  while (i < text.length) {
+    const c = text[i]!;
+    const next = text[i + 1];
+    if (inBlock) {
+      if (c === "*" && next === "/") { out += "  "; i += 2; inBlock = false; continue; }
+      out += c === "\n" ? "\n" : " ";
+      i += 1;
+      continue;
+    }
+    if (quote !== null) {
+      // An escape consumes the next character, so a `\"` does not close.
+      if (c === "\\") { out += text.slice(i, i + 2); i += 2; continue; }
+      if (c === quote) { quote = null; out += c; i += 1; continue; }
+      out += c;
+      i += 1;
+      continue;
+    }
+    if (c === "/" && next === "*") { out += "  "; i += 2; inBlock = true; continue; }
+    if (c === "/" && next === "/") {
+      while (i < text.length && text[i] !== "\n") { out += " "; i += 1; }
+      continue;
+    }
+    if (c === "'" || c === '"' || c === "`") { quote = c; out += c; i += 1; continue; }
+    out += c;
+    i += 1;
   }
-  return line;
+  return out;
 }
 
 function clockReads(text: string): string[] {
@@ -297,6 +313,7 @@ describe("the store reads no clock but its own", () => {
       ["Reflect.construct", "const t = Reflect.construct(Date, []);"],
       ["the performance clock", "const t = performance.timeOrigin;"],
       ["process.hrtime", "const t = process.hrtime.bigint();"],
+      ["process.uptime", "const t = process.uptime();"],
       ["the database's clock in a template", "await sql`select now()`.execute(db);"],
       ["current_timestamp in SQL", "const q = sql`where t < current_timestamp`;"],
       ["current_date outside a template", "const q = \"select current_date\";"],
@@ -377,6 +394,25 @@ describe("the store reads no clock but its own", () => {
       expect(clockReads(module.join("\n"))).toEqual([
         "4: SQL now() in a template: applied_at timestamptz not null default now()",
       ]);
+    });
+
+
+    it("does not lose a clock read to a string that contains a comment opener", () => {
+      // MEASURED, and it left this gate green over the tree. The scanner used to
+      // run the block-comment regex before it tracked quotes, so `"dist/*"`
+      // opened a comment that the next `*/` closed -- and any regex literal or
+      // later doc comment supplies one. Everything between them was blanked,
+      // clock read included.
+      const module = [
+        'const glob = "dist/*";',
+        "const t = Date.now();",
+        "const re = /x*/;",
+      ].join("\n");
+      expect(clockReads(module)).toEqual([
+        "2: Date.now: const t = Date.now();",
+      ]);
+      // And the other order: a comment opener in a string AFTER the read.
+      expect(clockReads(['const t = Date.now();', 'const g = "a/*b";'].join("\n"))).toHaveLength(1);
     });
 
     it("reports the line number of an offender inside a module", () => {
