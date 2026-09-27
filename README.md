@@ -17,14 +17,15 @@ Private until the `v0` tag, then public. Apache-2.0.
 |---|---|
 | `packages/schema` | The observation schema: seven channels, the event/state distinction, namespace and source, per-channel payload validators, the deterministic idempotency key, and one golden fixture per channel. **This is the only package the indexer depends on.** |
 | `packages/store` | The Postgres home of every observation, tag, trigger and audit entry the engine produces, with each invariant held by the database rather than by a caller's good manners. Depends on `schema`. See [The store](#the-store). |
+| `packages/engine` | The composition point, and the only package allowed to import BOTH `store` and `tagging` -- which is what those two were kept apart for. Holds `BriefPolicy`, the brief's own versioned numbers, and `ids.ts`, the single place an identifier is minted. Depends on `schema`, `store` and `tagging`. See [The engine](#the-engine). |
 | `packages/tagging` | The arithmetic: an observation read into `(aspect, value)` readings by a derivation no caller can influence, judged against its baseline, clipped, folded in, and turned into a bounded `g0` when the surprise crosses the noise-adaptive threshold. Depends on `schema` alone and needs no database. See [Tagging](#tagging). |
 | `docs/observation-contract.md` | The contract for the indexer developer, in Turkish: what an observation is, what each field means, which rules the schema enforces and which it does not yet. Start there if you are writing a producer. |
 | `docs/superpowers/specs/`, `docs/superpowers/plans/` | The v0 design and the milestone plan the code follows. |
-| `gates/` | Repository-wide gates that are not about one package. Today: no tracked file may contain a Stellar-shaped account id, only `datedAt` reads a date off an observation, and the tagging and store baseline shapes agree field for field. |
+| `gates/` | Repository-wide gates that are not about one package. Today: no tracked file may contain a Stellar-shaped account id, only `datedAt` reads a date off an observation, the tagging and store baseline shapes agree field for field, the tag-refresh shapes do too, nothing outside the indexer's reader imports Horizon, and only `packages/engine` imports both the store and tagging. See [Gates](#gates) for all six. |
 
-The remaining engine packages named in the design (`engine`, `nonametrust`)
-arrive in later milestones and will depend on `schema`; `schema` depends on
-nothing and is publishable on its own.
+`packages/engine` arrived with M3. The one package named in the design and
+still to come is `nonametrust`, the distribution package, which is M5's;
+`schema` depends on nothing and is publishable on its own.
 
 ## Running it
 
@@ -37,11 +38,13 @@ pnpm typecheck   # every package, plus the root gates
 pnpm test        # every package, then the root gates
 ```
 
-Build comes first because `@nonametrust/schema` resolves through `dist` and
-has no `src` fallback: a package that imports it cannot typecheck or test on a
-fresh checkout until `dist` exists, and must be rebuilt after every pull that
-touches `packages/schema`. CI runs those four in that order and then fails if
-any file under `packages/*/dist` matches `*.test.*` or `*.spec.*`.
+Build comes first because every workspace dependency resolves through `dist`
+and none has a `src` fallback: a package that imports another cannot typecheck
+or test on a fresh checkout until that package's `dist` exists, and must be
+rebuilt after every pull that touches it. This used to be true of `schema`
+alone; since M3 it is true of `store` and `tagging` too, because
+`packages/engine` imports both. CI runs those four in that order and then
+fails if any file under `packages/*/dist` matches `*.test.*` or `*.spec.*`.
 
 ## The store
 
@@ -124,6 +127,32 @@ is gitignored. `pnpm --filter @nonametrust/store db:down` stops it;
 creates it again. Each test file works in a schema of its own, created and
 dropped around the file, so the database carries nothing over between runs.
 
+## The engine
+
+`packages/engine` is the composition point, and the only package allowed to
+import both `@nonametrust/store` and `@nonametrust/tagging`. Those two were
+kept apart deliberately -- the store holds invariants and computes nothing a
+decision depends on, tagging is arithmetic provable over a fixed corpus with no
+cluster -- and a root gate holds the separation in both directions and in the
+manifests.
+
+As of M3's first task it holds two values and no behaviour yet. `BriefPolicy`
+is the brief's own versioned numbers, kept out of tagging's `Policy` because a
+brief field there is a number that package never reads, and because three
+fields of the tagging policy are all `3`, which once made a wrong-field read
+invisible. **None of its numbers is measured**: each was chosen so the design's
+section 9 scenario behaves, which is the same admission the design makes about
+its own defaults, and each carries a comment saying what it is, what it is not
+and what would replace it. `ids.ts` is the single place an identifier is
+minted, and the engine's own gate refuses `randomUUID` everywhere else --
+because the brief is a pure function of its inputs, so that the same inputs
+replay to the same output, and one identifier reached for inside it breaks that
+while leaving the output well-formed.
+
+The engine reads no clock of its own either. Its instant is the `Clock` object
+the store already holds, injected, so `clock.now()` is an ordinary call here
+and there is nothing to exempt.
+
 ## Tagging
 
 `packages/tagging` is where a baseline is defined, where a surprise is
@@ -163,7 +192,9 @@ that scenario, in milliseconds.
 
 A rule in this repository that nothing enforces is treated as unwritten, so
 each property the code claims has a test that would fail if it stopped being
-true. The ones worth knowing before you add a file:
+true. Several of the gates below exist because a review walked a spelling past
+their first version; each one's own file records which. The ones worth knowing
+before you add a file:
 
 - **No Stellar account id in any tracked file**, checksum-valid or not
   (`gates/no-stellar-address.test.ts`). Takes its paths from the git index and
@@ -214,6 +245,29 @@ true. The ones worth knowing before you add a file:
   semantics. What makes the rule true is the suite: every retention fixture
   pins a fixed instant, so a repository that started reading the wall clock
   fails eleven tests before it reaches this one.
+- **Only `packages/engine` imports both the store and tagging**
+  (`gates/engine-is-the-only-composer.test.ts`). The two were kept apart so
+  that the arithmetic stays provable without a database and the store stays a
+  place that computes nothing; the engine is the composition point they were
+  kept apart for, and this gate holds that the set of packages composing them
+  is a set of one. It scans every `packages/*/src`, checks the manifests as
+  well as the imports -- including the ROOT manifest, because pnpm hoists a
+  dependency declared there into every package's resolution -- resolves real
+  paths so a symlinked directory cannot pass a lexical check, and refuses
+  `require`, `createRequire` and a dynamic import no reader can resolve.
+- **The engine reads no clock and mints no identifier**
+  (`packages/engine/src/clock-gate.test.ts`), the store's gate copied pattern
+  for pattern and extended to refuse identifiers. `ids.ts` is the one exempt
+  module. Because it is a COPY, its last test pins the SHA-256 of the store's
+  own form list: any change there turns this red, and the red is the
+  instruction to carry the new form across. An earlier version compared form
+  NAMES parsed out of that file and review grew the store's list six ways it
+  could not see.
+- **The engine's boundary** (`packages/engine/src/boundary.test.ts`): it
+  declares exactly its three workspace dependencies and no driver, reaches each
+  through its public surface rather than past it -- a deep import resolves,
+  because no `exports` field refuses one -- and imports no `*.test.ts` helper,
+  which would carry that file into `dist`.
 - **The schema version is checked exactly** on every observation
   (`packages/schema/src/payloads.test.ts`), and the golden fixtures must all
   validate (`packages/schema/src/fixtures.test.ts`).
