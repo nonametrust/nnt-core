@@ -1172,7 +1172,7 @@ describe("expirePeriods: expiry is unreadability and nothing else", () => {
   it("shreds nothing one millisecond before the expiry, and the month at it", async () => {
     const september = at("2026-09-07T00:00:00.000Z");
     const observation = storedObservation(await september.observations.append(anEvent("SWEEPSEPT", "op:sweep:1")));
-    const id = observation.observationId!;
+    const id = observation.observationId;
     // Readable before anything sweeps, so the refusal below is the sweep's
     // doing and not the fixture's.
     expect((await september.observations.get(id)).channel).toBe("volume");
@@ -1236,9 +1236,9 @@ describe("expirePeriods: expiry is unreadability and nothing else", () => {
 
     const swept = await at(due.toISOString()).namespaces.expirePeriods();
     expect(swept.shredded.map((s) => s.period)).toEqual([SEPT]);
-    await expect(late.observations.get(storedObservation(stale).observationId!))
+    await expect(late.observations.get(storedObservation(stale).observationId))
       .rejects.toBeInstanceOf(PayloadExpired);
-    expect((await october.observations.get(storedObservation(live).observationId!)).channel)
+    expect((await october.observations.get(storedObservation(live).observationId)).channel)
       .toBe("volume");
     expect(await october.namespaces.periodsOf(await idOf("SWEEPOCT"))).toEqual([OCT]);
   });

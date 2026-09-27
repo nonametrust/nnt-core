@@ -75,7 +75,7 @@ describe("the round trip", () => {
     // `get` has already re-parsed the decrypted blob through the schema; that
     // parse is the proof, and a second one here would only hide which one
     // carries it.
-    const read = (await observations.get(observation.observationId!)) as Record<string, unknown>;
+    const read = (await observations.get(observation.observationId)) as Record<string, unknown>;
     for (const key of Object.keys(input)) {
       expect(read[key]).toEqual((input as Record<string, unknown>)[key]);
     }
@@ -98,23 +98,23 @@ describe("the round trip", () => {
       },
     });
     const observation = storedObservation(await observations.append(input));
-    const read = await observations.get(observation.observationId!);
+    const read = await observations.get(observation.observationId);
     expect(read.namespace).toEqual((input as Record<string, unknown>).namespace);
   });
 
   it("leaves a state undated, so a standing condition never enters a timing computation", async () => {
     const observation = storedObservation(await observations.append(aState()));
     const row = await db.selectFrom("observation").select(["dated_at"])
-      .where("observation_id", "=", observation.observationId!).executeTakeFirstOrThrow();
+      .where("observation_id", "=", observation.observationId).executeTakeFirstOrThrow();
     expect(row.dated_at).toBeNull();
-    const read = await observations.get(observation.observationId!);
+    const read = await observations.get(observation.observationId);
     expect(read.evidenceKind).toBe("state");
   });
 
   it("dates an event by its own instant", async () => {
     const observation = storedObservation(await observations.append(anEvent({ source: { ...src, ref: "op:rt:4" } })));
     const row = await db.selectFrom("observation").select(["dated_at"])
-      .where("observation_id", "=", observation.observationId!).executeTakeFirstOrThrow();
+      .where("observation_id", "=", observation.observationId).executeTakeFirstOrThrow();
     expect(row.dated_at?.toISOString()).toBe("2026-09-12T09:00:00.000Z");
   });
 
@@ -189,7 +189,7 @@ describe("idempotency", () => {
     const input = anEvent({ source: { ...src, ref: "op:key:1" } });
     const observation = storedObservation(await observations.append(input));
     const row = await db.selectFrom("observation").select(["idempotency_key"])
-      .where("observation_id", "=", observation.observationId!).executeTakeFirstOrThrow();
+      .where("observation_id", "=", observation.observationId).executeTakeFirstOrThrow();
     expect(row.idempotency_key).toBe(
       deriveIdempotencyKey(input.source, input.channel, input.namespace),
     );
@@ -297,7 +297,7 @@ describe("idempotency", () => {
     priv.skeleton = async () => {
       if (blind > 0) { blind -= 1; return null; }
       return {
-        observationId: standIn.observationId!,
+        observationId: standIn.observationId,
         ingestedAt: new Date(standIn.ingestedAt!),
         periodExpired: false,
         namespaceErased: false,
@@ -322,7 +322,7 @@ describe("append-only", () => {
         .execute(db),
     ).rejects.toMatchObject({ code: "NNT01" });
     const row = await db.selectFrom("observation").select(["kind"])
-      .where("observation_id", "=", observation.observationId!).executeTakeFirstOrThrow();
+      .where("observation_id", "=", observation.observationId).executeTakeFirstOrThrow();
     expect(row.kind).toBe("payment");
   });
 
@@ -332,7 +332,7 @@ describe("append-only", () => {
       sql`delete from observation where observation_id = ${observation.observationId}`.execute(db),
     ).rejects.toMatchObject({ code: "NNT01" });
     const row = await db.selectFrom("observation").select(["observation_id"])
-      .where("observation_id", "=", observation.observationId!).executeTakeFirst();
+      .where("observation_id", "=", observation.observationId).executeTakeFirst();
     expect(row?.observation_id).toBe(observation.observationId);
   });
 
@@ -354,7 +354,7 @@ describe("append-only", () => {
 describe("the columns beside the payload", () => {
   it("are bound to it: a rewritten column refuses the read, even with append-only off", async () => {
     const observation = storedObservation(await observations.append(anEvent({ source: { ...src, ref: "op:aad:1" } })));
-    const id = observation.observationId!;
+    const id = observation.observationId;
     const moves = [
       sql`dated_at = dated_at + interval '1 day'`,
       sql`channel = 'latency'`,
@@ -434,8 +434,8 @@ describe("the columns beside the payload", () => {
     const b = await observations.append(anEvent({
       source: { ...src, ref: "op:swap:b" }, kind: "refund",
     }));
-    const idA = storedObservation(a).observationId!;
-    const idB = storedObservation(b).observationId!;
+    const idA = storedObservation(a).observationId;
+    const idB = storedObservation(b).observationId;
     await expect(
       db.transaction().execute(async (trx) => {
         await sql`alter table observation disable trigger observation_no_update`.execute(trx);
@@ -478,7 +478,7 @@ describe("the columns beside the payload", () => {
   it("refuses a payload that opens on this row but names another observation", async () => {
     const a = await observations.append(anEvent({ source: { ...src, ref: "op:forge:a" } }));
     const b = await observations.append(anEvent({ source: { ...src, ref: "op:forge:b" } }));
-    const idA = storedObservation(a).observationId!;
+    const idA = storedObservation(a).observationId;
     const row = await db.selectFrom("observation")
       .select(["namespace_id", "idempotency_key", "evidence_kind", "channel", "kind",
         "dated_at", "ingested_at", "producer"])
@@ -523,7 +523,7 @@ describe("the columns beside the payload", () => {
     const observation = storedObservation(await observations.append(
       anEvent({ source: { ...src, ref: "op:producer:2" } }),
     ));
-    const id = observation.observationId!;
+    const id = observation.observationId;
     for (const bad of ["Stellar-Indexer", "stellar_indexer", "-stellar", "stellar--indexer", ""]) {
       await expect(
         db.transaction().execute(async (trx) => {
@@ -547,7 +547,7 @@ describe("the columns beside the payload", () => {
     const observation = storedObservation(await observations.append(
       anEvent({ source: { ...src, ref: "op:producer:3" } }),
     ));
-    const id = observation.observationId!;
+    const id = observation.observationId;
     await expect(
       db.transaction().execute(async (trx) => {
         await sql`alter table observation disable trigger observation_no_update`.execute(trx);
@@ -565,7 +565,7 @@ describe("the columns beside the payload", () => {
     const observation = storedObservation(await observations.append(
       anEvent({ source: { ...src, ref: "op:producer:4" } }),
     ));
-    const id = observation.observationId!;
+    const id = observation.observationId;
     const at64 = "a".repeat(64);
     const at65 = "a".repeat(65);
     await expect(
@@ -602,14 +602,14 @@ describe("the columns beside the payload", () => {
       source: { ...src, producer: "x402-gateway", ref: "op:twoproducers:b" },
     }));
     const rows = await db.selectFrom("observation").select(["observation_id", "producer"])
-      .where("observation_id", "in", [storedObservation(a).observationId!, storedObservation(b).observationId!])
+      .where("observation_id", "in", [storedObservation(a).observationId, storedObservation(b).observationId])
       .execute();
     const byId = new Map(rows.map((r) => [r.observation_id, r.producer]));
-    expect(byId.get(storedObservation(a).observationId!)).toBe("stellar-indexer");
-    expect(byId.get(storedObservation(b).observationId!)).toBe("x402-gateway");
+    expect(byId.get(storedObservation(a).observationId)).toBe("stellar-indexer");
+    expect(byId.get(storedObservation(b).observationId)).toBe("x402-gateway");
     // And both still open, so the column and the envelope agree for each.
-    expect((await observations.get(storedObservation(a).observationId!)).source.producer).toBe("stellar-indexer");
-    expect((await observations.get(storedObservation(b).observationId!)).source.producer).toBe("x402-gateway");
+    expect((await observations.get(storedObservation(a).observationId)).source.producer).toBe("stellar-indexer");
+    expect((await observations.get(storedObservation(b).observationId)).source.producer).toBe("x402-gateway");
   });
 
   // The envelope binds the Date the column will hold, and every test in this
@@ -625,7 +625,7 @@ describe("the columns beside the payload", () => {
     const observation = storedObservation(await repo.append(
       anEvent({ source: { ...src, ref: "op:ticking:1" } }),
     ));
-    const id = observation.observationId!;
+    const id = observation.observationId;
     // The read must succeed: it rebuilds the envelope from the stored column,
     // so column and envelope agreeing is exactly what this proves.
     await expect(repo.get(id)).resolves.toBeDefined();
@@ -643,9 +643,9 @@ describe("shredding", () => {
     })));
     await namespaces.shred(ns.namespaceId);
     const row = await db.selectFrom("observation").select(["observation_id"])
-      .where("observation_id", "=", observation.observationId!).executeTakeFirst();
+      .where("observation_id", "=", observation.observationId).executeTakeFirst();
     expect(row).toBeDefined();
-    await expect(observations.get(observation.observationId!))
+    await expect(observations.get(observation.observationId))
       .rejects.toBeInstanceOf(NamespaceShredded);
   });
 
@@ -674,7 +674,7 @@ describe("the retention period", () => {
     ));
     const row = await sql<{ period: string }>`
       select to_char(period, 'YYYY-MM-DD') as period from observation
-      where observation_id = ${observation.observationId!}`.execute(db);
+      where observation_id = ${observation.observationId}`.execute(db);
     // The clock is 2026-09-07, and the period follows INGEST time, not the
     // event's: this observation is dated 2026-09-12, a different month from
     // neither, and the column says September because that is when it was
@@ -692,7 +692,7 @@ describe("the retention period", () => {
     const observation = storedObservation(await observations.append(
       anEvent({ source: { ...src, ref: "op:period:2" } }),
     ));
-    const id = observation.observationId!;
+    const id = observation.observationId;
     await expect(
       db.transaction().execute(async (trx) => {
         await sql`alter table observation disable trigger observation_no_update`.execute(trx);
@@ -711,7 +711,7 @@ describe("the retention period", () => {
     const observation = storedObservation(await observations.append(
       anEvent({ source: { ...src, ref: "op:period:3" } }),
     ));
-    const id = observation.observationId!;
+    const id = observation.observationId;
     await expect(
       db.transaction().execute(async (trx) => {
         await sql`alter table observation disable trigger observation_no_update`.execute(trx);
@@ -744,7 +744,7 @@ describe("the retention period", () => {
     const observation = storedObservation(await observations.append(anEvent({
       source: { ...src, ref: "op:period:4" }, namespace: { kind: "wallet", id: "EXPIREME" },
     })));
-    const id = observation.observationId!;
+    const id = observation.observationId;
     expect(await observations.get(id)).toBeDefined();
 
     const row = await db.selectFrom("namespace_key").select(["expires_at"])
@@ -772,7 +772,7 @@ describe("the retention period", () => {
     await expect(
       db.transaction().execute(async (trx) => {
         await sql`alter table observation disable trigger observation_no_update`.execute(trx);
-        await sql`update observation set period = null where observation_id = ${observation.observationId!}`
+        await sql`update observation set period = null where observation_id = ${observation.observationId}`
           .execute(trx);
       }),
     ).rejects.toMatchObject({ code: "23502", column: "period" });
@@ -794,9 +794,9 @@ describe("the retention period", () => {
     ));
     const row = await sql<{ period: string }>`
       select to_char(period, 'YYYY-MM-DD') as period from observation
-      where observation_id = ${observation.observationId!}`.execute(db);
+      where observation_id = ${observation.observationId}`.execute(db);
     expect(row.rows[0]?.period).toBe("2026-09-01");
-    expect(await repo.get(observation.observationId!)).toBeDefined();
+    expect(await repo.get(observation.observationId)).toBeDefined();
 
     // The other side of the same boundary, and it is not redundant: 23:30 on
     // 30 September is still September WEST of Greenwich, so the first half
@@ -812,7 +812,7 @@ describe("the retention period", () => {
     );
     const row2 = await sql<{ period: string }>`
       select to_char(period, 'YYYY-MM-DD') as period from observation
-      where observation_id = ${storedObservation(october).observationId!}`.execute(db);
+      where observation_id = ${storedObservation(october).observationId}`.execute(db);
     expect(row2.rows[0]?.period).toBe("2026-10-01");
   });
 
@@ -836,7 +836,7 @@ describe("the retention period", () => {
     const row = await sql<{ period: string; dated: string }>`
       select to_char(period, 'YYYY-MM-DD') as period,
              to_char(timezone('UTC', dated_at), 'YYYY-MM-DD') as dated
-      from observation where observation_id = ${observation.observationId!}`.execute(db);
+      from observation where observation_id = ${observation.observationId}`.execute(db);
     expect(row.rows[0]?.dated).toBe("2026-08-20");
     expect(row.rows[0]?.period).toBe("2026-09-01");
   });
@@ -857,7 +857,7 @@ describe("the retention period", () => {
     });
     const observation = storedObservation(await observations.append(wire));
     const before = await sql<{ x: string }>`
-      select xmin::text as x from observation where observation_id = ${observation.observationId!}`
+      select xmin::text as x from observation where observation_id = ${observation.observationId}`
       .execute(db);
     const row = await db.selectFrom("namespace_key").select(["expires_at"])
       .where("namespace_id", "=", ns).executeTakeFirstOrThrow();
@@ -874,11 +874,11 @@ describe("the retention period", () => {
     const answer = await observations.append(wire);
     expect(answer).toMatchObject({
       created: false, readable: false,
-      observationId: observation.observationId!,
+      observationId: observation.observationId,
       periodExpired: true, namespaceErased: false,
     });
     const after = await sql<{ x: string }>`
-      select xmin::text as x from observation where observation_id = ${observation.observationId!}`
+      select xmin::text as x from observation where observation_id = ${observation.observationId}`
       .execute(db);
     expect(after.rows[0]?.x).toBe(before.rows[0]?.x);
   });
@@ -998,7 +998,7 @@ describe("a re-delivery whose payload cannot be opened", () => {
     const wire = anEvent({ namespace: { kind: "wallet", id: "R19EXPIRED" },
       source: { ...src, ref: "op:r19:expired" } });
     const first = await mar.obs.append(wire);
-    const id = storedObservation(first).observationId!;
+    const id = storedObservation(first).observationId;
     const nsId = (await mar.ns.find("wallet", "R19EXPIRED"))!.namespaceId;
     const beforeX = await xminOf(id);
     // 2027-03 expires 2027-04-08 under grace 7.
@@ -1027,7 +1027,7 @@ describe("a re-delivery whose payload cannot be opened", () => {
     const again = await at("2027-03-11T00:00:00.000Z").obs.append(wire);
     expect(again).toEqual({
       created: false, readable: false,
-      observationId: storedObservation(first).observationId!,
+      observationId: storedObservation(first).observationId,
       ingestedAt: new Date("2027-03-05T00:00:00.000Z"),
       periodExpired: false, namespaceErased: true,
     });
@@ -1731,7 +1731,7 @@ describe("a re-delivery whose payload cannot be opened", () => {
     };
     expect(await loser.obs.append(wire)).toMatchObject({
       created: false, readable: false, periodExpired: true,
-      observationId: storedObservation(first).observationId!,
+      observationId: storedObservation(first).observationId,
     });
     // Non-vacuous: both blinded reads were consumed, so the append really did
     // reach the insert and collide. With one left over, the collision never
@@ -1877,7 +1877,7 @@ describe("a re-delivery whose payload cannot be opened", () => {
     const wire = anEvent({ namespace: { kind: "wallet", id: "R19NODECRYPT" },
       source: { ...src, ref: "op:r19:nodecrypt" } });
     const first = await mar.obs.append(wire);
-    const id = storedObservation(first).observationId!;
+    const id = storedObservation(first).observationId;
     const nsId = (await mar.ns.find("wallet", "R19NODECRYPT"))!.namespaceId;
     await expireMonth(nsId, "2027-03-01", "2027-04-08T00:00:00.000Z");
     // The ciphertext is now unopenable by anyone. `get` says so; `append`
@@ -2376,7 +2376,7 @@ describe("composing on a transaction", () => {
     await db.transaction().execute(async (trx) => {
       const ns = new NamespaceRepository(trx, ring, clock, RETENTION_V0);
       const obs = new ObservationRepository(trx, ns, clock, RETENTION_V0);
-      expect((await obs.get(stored.observationId!)).channel).toBe("volume");
+      expect((await obs.get(stored.observationId)).channel).toBe("volume");
       expect(await ns.find("wallet", "GOLDADDRESS")).not.toBeNull();
     });
   });
@@ -2410,12 +2410,11 @@ describe("readClear", () => {
       source: { ...src, ref: "op:clearread:1" },
     });
     const appended = await mar.obs.append(wire);
-    // The `!` is R32 biting where the plan predicted it: `AppendResult`'s
-    // readable arms carry an `Observation` whose `observationId` is OPTIONAL while
-    // its unreadable arm declares it required, so a caller narrowing on `created`
-    // gets a different type for the same field. Task 3 gives `@nonametrust/schema`
-    // a stored-observation type with the id required and this assertion goes away.
-    const observationId = storedObservation(appended).observationId!;
+    // No `!`. Task 2's version of this line needed one, because `AppendResult`'s
+    // readable arms carried an optional id while its unreadable arm declared it
+    // required; R32 gave `@nonametrust/schema` the stored form and the assertion
+    // went away, which is the whole point of that ruling.
+    const observationId = storedObservation(appended).observationId;
     const nsId = (await mar.ns.find("wallet", "CLEARREAD"))!.namespaceId;
 
     // Before the sweep both reads work, so what changes below is the sweep and
@@ -2472,7 +2471,7 @@ describe("readClear", () => {
         source: { ...src, ref: "op:noidemkey:1" },
       }),
     );
-    const clear = await apr.obs.readClear(storedObservation(appended).observationId!); // R32, see above
+    const clear = await apr.obs.readClear(storedObservation(appended).observationId);
     for (const forbidden of ["idempotencyKey", "idempotency_key", "payload", "source", "ref"]) {
       expect(Object.keys(clear), `${forbidden} must not be in a clear read`).not.toContain(forbidden);
     }
@@ -2515,7 +2514,7 @@ describe("readClear", () => {
         source: { ...src, ref: "op:erasedclear:1" },
       }),
     );
-    const observationId = storedObservation(appended).observationId!; // R32, see above
+    const observationId = storedObservation(appended).observationId;
     const erasedNs = (await jun.ns.find("wallet", "ERASEDCLEAR"))!.namespaceId;
     await jun.ns.shred(erasedNs);
     await expect(jun.obs.get(observationId)).rejects.toBeInstanceOf(NamespaceShredded);

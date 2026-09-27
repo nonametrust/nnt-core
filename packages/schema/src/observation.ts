@@ -4,6 +4,18 @@ import { namespaceRefSchema } from "./namespace.js";
 import { sourceSchema } from "./source.js";
 import { decimalStringSchema, utcDatetimeSchema } from "./scalars.js";
 
+/**
+ * The WIRE version, which is not this package's version and moves for different
+ * reasons.
+ *
+ * This constant changes only when what a producer must send changes, and every
+ * observation names it; the package version changes whenever the package's own
+ * surface does. M3's Task 3 is the case that makes the distinction worth writing
+ * down: it took the package from 0.2.0 to 0.3.0 by adding `holdsAt` and
+ * `StoredObservation`, and neither is a wire change -- a producer's mapper still
+ * returns exactly the `WireObservation` it returned before, so this stays at
+ * 0.1.0 and the indexer needs to do nothing.
+ */
 export const OBSERVATION_SCHEMA_VERSION = "0.1.0";
 
 const common = {
@@ -101,3 +113,39 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
  * precomputed key that equals the derived one.
  */
 export type WireObservation = DistributiveOmit<Observation, "observationId" | "ingestedAt">;
+
+// NO DISTRIBUTION HELPER HERE, and the absence is deliberate. `DistributiveOmit`
+// above needs one because `Omit` is built on `keyof`, and `keyof` of a union is
+// only its COMMON keys, so omitting from a union collapses the discrimination. An
+// INTERSECTION has no such problem: TypeScript already normalises
+// `(A | B) & C` to `(A & C) | (B & C)`, so `evidenceKind` keeps narrowing.
+//
+// Written down because the first version of this type wrapped the intersection in
+// a `T extends unknown ? ... : never` and claimed the distribution was what kept
+// the discrimination working. Mutation refused that: removing the conditional
+// produced ZERO typecheck errors, because it was never doing anything. A helper
+// that can be deleted with nothing failing is a helper whose comment is wrong.
+
+/**
+ * The stored form with its identity REQUIRED: what a caller holds once ingest
+ * has run and the row exists.
+ *
+ * R32, and it is a typing defect rather than a new concept. `observationId` is
+ * optional on `Observation` because it is absent on the wire -- "assigned by the
+ * engine on ingest" -- which is right for the wire and wrong for everything
+ * downstream. The store's `AppendResult` then declared `observationId: string`
+ * on its unreadable arm while its readable arms carried an `Observation` whose
+ * id was optional, so a caller narrowing on `created` got a DIFFERENT TYPE for
+ * the same field depending on which arm it landed in, and the store's test
+ * harness grew a `storedObservation` helper whose only job was to paper over it.
+ * That helper was the only narrowing in the tree.
+ *
+ * The engine is the first real consumer, which is why this lands now: Task 2's
+ * own tests had to write `storedObservation(...).observationId!` to typecheck,
+ * and an assertion operator in a test is a rule held by nobody.
+ *
+ * `WireObservation` remains the type that REFUSES the field, so the three forms
+ * now say three different things: the wire has no id, `Observation` may have one,
+ * and this one has one.
+ */
+export type StoredObservation = Observation & { observationId: string };

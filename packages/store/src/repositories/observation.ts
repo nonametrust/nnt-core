@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   datedAt, deriveIdempotencyKey, observationSchema,
-  type Observation, type WireObservation,
+  type Observation, type StoredObservation, type WireObservation,
 } from "@nonametrust/schema";
 import type { Clock } from "../clock.js";
 import { refuseWriteInsideTransaction, type Db } from "../db.js";
@@ -37,8 +37,8 @@ import { PERIOD_TEXT, type NamespaceRepository } from "./namespace.js";
  * case and still throws; see `append`.
  */
 export type AppendResult =
-  | { created: true; observation: Observation }
-  | { created: false; readable: true; observation: Observation }
+  | { created: true; observation: StoredObservation }
+  | { created: false; readable: true; observation: StoredObservation }
   | {
       created: false;
       readable: false;
@@ -199,12 +199,16 @@ export class ObservationRepository {
     const ns = await this.namespaces.ensure(parsed.namespace);
     const observationId = randomUUID();
     const ingestedAt = this.clock.now();
+    // `StoredObservation` and not `Observation`: `observationId` is assigned two
+    // lines up, so the stronger type is the honest one. R32 -- the arms of
+    // `AppendResult` used to type this field two ways, and a caller narrowing on
+    // `created` got `string | undefined` from one arm and `string` from another.
     const stored = {
       ...parsed,
       observationId,
       idempotencyKey: key,
       ingestedAt: ingestedAt.toISOString(),
-    } as Observation;
+    } as StoredObservation;
 
     // datedAt is the single reader of a date off an observation, and calling
     // it here is why this package needs no exemption in the repository's
@@ -412,7 +416,7 @@ export class ObservationRepository {
     if (seen.periodExpired || seen.namespaceErased) {
       return { created: false, readable: false, ...seen };
     }
-    let opened: Observation | null;
+    let opened: StoredObservation | null;
     try {
       opened = await this.byIdempotencyKey(key);
     } catch (e) {
@@ -551,13 +555,13 @@ export class ObservationRepository {
     };
   }
 
-  async get(observationId: string): Promise<Observation> {
+  async get(observationId: string): Promise<StoredObservation> {
     const found = await this.read("observation_id", observationId);
     if (!found) throw new ObservationNotFound(`no observation ${observationId}`);
     return found;
   }
 
-  async byIdempotencyKey(key: string): Promise<Observation | null> {
+  async byIdempotencyKey(key: string): Promise<StoredObservation | null> {
     return this.read("idempotency_key", key);
   }
 
@@ -572,7 +576,7 @@ export class ObservationRepository {
   private async read(
     column: "observation_id" | "idempotency_key",
     value: string,
-  ): Promise<Observation | null> {
+  ): Promise<StoredObservation | null> {
     // `period` is rendered rather than selected: a `date` read back as a
     // driver Date is local midnight, which is the previous month's last day
     // east of UTC, and the key it would then look up is the wrong one.
@@ -637,6 +641,9 @@ export class ObservationRepository {
         `payload on row ${row.observation_id} carries observation id ${String(parsed.observationId)}`,
       );
     }
-    return parsed;
+    // Past that check `observationId` IS `row.observation_id`, a string, so the
+    // return type is `StoredObservation` rather than `Observation` -- the check is
+    // what earns the stronger type, and R32 is why it is worth stating.
+    return parsed as StoredObservation;
   }
 }

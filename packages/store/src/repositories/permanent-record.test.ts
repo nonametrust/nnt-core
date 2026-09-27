@@ -89,7 +89,7 @@ describe("the instant a promotion carries", () => {
     expect(observation.ingestedAt).toBe("2026-09-12T10:00:00.000Z");
     clock.advance(9 * DAY);
     const record = await records.promote({
-      observationId: observation.observationId!, namespaceId: ns,
+      observationId: observation.observationId, namespaceId: ns,
       rescuedBy: null, confidence: 0.8,
     });
     expect(record.originalDatedAt.toISOString()).toBe("2026-09-12T09:00:00.000Z");
@@ -103,7 +103,7 @@ describe("the instant a promotion carries", () => {
   it("carries the identifiers and the confidence back out as given", async () => {
     const observation = storedObservation(await observations.append(anEventOn("2026-09-12T10:00:00.000Z")));
     const record = await records.promote({
-      observationId: observation.observationId!, namespaceId: ns,
+      observationId: observation.observationId, namespaceId: ns,
       rescuedBy: null, confidence: 0.25,
     });
     expect(record.recordId).toMatch(/^[0-9a-f-]{36}$/);
@@ -133,7 +133,7 @@ describe("the invariant the table holds on its own", () => {
                   '2026-09-21T00:00:00Z', now(), 0.5)`.execute(db),
     ).rejects.toMatchObject({ code: "NNT04" });
     const rows = await db.selectFrom("permanent_record").select(["record_id"])
-      .where("observation_id", "=", observation.observationId!).execute();
+      .where("observation_id", "=", observation.observationId).execute();
     expect(rows).toEqual([]);
   });
 
@@ -146,7 +146,7 @@ describe("the invariant the table holds on its own", () => {
   it("refuses an update that moves the instant afterwards, even with append-only off", async () => {
     const observation = storedObservation(await observations.append(anEventOn("2026-09-14T09:00:00.000Z")));
     const record = await records.promote({
-      observationId: observation.observationId!, namespaceId: ns,
+      observationId: observation.observationId, namespaceId: ns,
       rescuedBy: null, confidence: 0.8,
     });
     await expect(
@@ -189,7 +189,7 @@ describe("the invariant the table holds on its own", () => {
   it("refuses an UPDATE of any column, loudly, by SQLSTATE and by class", async () => {
     const observation = storedObservation(await observations.append(anEventOn("2026-09-14T10:00:00.000Z")));
     const record = await records.promote({
-      observationId: observation.observationId!, namespaceId: ns,
+      observationId: observation.observationId, namespaceId: ns,
       rescuedBy: null, confidence: 0.8,
     });
     const failure = await sql`update permanent_record set confidence = 0.1 where record_id = ${record.recordId}`
@@ -205,7 +205,7 @@ describe("the invariant the table holds on its own", () => {
   it("refuses a DELETE", async () => {
     const observation = storedObservation(await observations.append(anEventOn("2026-09-14T11:00:00.000Z")));
     const record = await records.promote({
-      observationId: observation.observationId!, namespaceId: ns,
+      observationId: observation.observationId, namespaceId: ns,
       rescuedBy: null, confidence: 0.8,
     });
     await expect(
@@ -222,7 +222,7 @@ describe("the invariant the table holds on its own", () => {
   it("promotes an observation at most once", async () => {
     const observation = storedObservation(await observations.append(anEventOn("2026-09-15T09:00:00.000Z")));
     const input = {
-      observationId: observation.observationId!, namespaceId: ns,
+      observationId: observation.observationId, namespaceId: ns,
       rescuedBy: null, confidence: 0.8,
     };
     await records.promote(input);
@@ -238,7 +238,7 @@ describe("the invariant the table holds on its own", () => {
     const other = await namespaces.ensure({ kind: "wallet", id: "SOMEONEELSE" });
     const observation = storedObservation(await observations.append(anEventOn("2026-09-16T09:00:00.000Z")));
     const filed = records.promote({
-      observationId: observation.observationId!, namespaceId: other.namespaceId,
+      observationId: observation.observationId, namespaceId: other.namespaceId,
       rescuedBy: null, confidence: 0.8,
     });
     await expect(filed).rejects.toBeInstanceOf(ConstraintViolation);
@@ -251,7 +251,7 @@ describe("the invariant the table holds on its own", () => {
     for (const confidence of [-0.1, 1.1]) {
       const observation = storedObservation(await observations.append(anEventOn("2026-09-17T09:00:00.000Z")));
       const promoted = records.promote({
-        observationId: observation.observationId!, namespaceId: ns,
+        observationId: observation.observationId, namespaceId: ns,
         rescuedBy: null, confidence,
       });
       await expect(promoted).rejects.toBeInstanceOf(ConstraintViolation);
@@ -272,7 +272,7 @@ describe("the invariant the table holds on its own", () => {
     for (const confidence of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
       const observation = storedObservation(await observations.append(anEventOn("2026-09-17T09:00:00.000Z")));
       await expect(records.promote({
-        observationId: observation.observationId!, namespaceId: ns,
+        observationId: observation.observationId, namespaceId: ns,
         rescuedBy: null, confidence,
       })).rejects.toThrow(/confidence must be a finite number/);
     }
@@ -293,7 +293,7 @@ describe("the invariant the table holds on its own", () => {
       select ${randomUUID()}, o.observation_id, o.namespace_id, o.dated_at,
              ${new Date("2026-09-20T09:00:00.000Z")}, null, 'NaN'::double precision,
              decode('00','hex'), decode('00','hex'), decode('00','hex')
-        from observation o where o.observation_id = ${observation.observationId!}
+        from observation o where o.observation_id = ${observation.observationId}
       `.execute(db)).rejects.toMatchObject({
         code: "23514", constraint: "permanent_record_confidence",
       });
@@ -308,11 +308,11 @@ describe("what the repository refuses before writing", () => {
   it("refuses to promote a state, by class, because it has no instant to preserve", async () => {
     const observation = storedObservation(await observations.append(aState()));
     await expect(records.promote({
-      observationId: observation.observationId!, namespaceId: ns,
+      observationId: observation.observationId, namespaceId: ns,
       rescuedBy: null, confidence: 0.5,
     })).rejects.toBeInstanceOf(StateNotPromotable);
     const rows = await db.selectFrom("permanent_record").select(["record_id"])
-      .where("observation_id", "=", observation.observationId!).execute();
+      .where("observation_id", "=", observation.observationId).execute();
     expect(rows).toEqual([]);
   });
 
@@ -327,11 +327,11 @@ describe("what the repository refuses before writing", () => {
     })));
     await namespaces.shred(shredded.namespaceId);
     await expect(records.promote({
-      observationId: observation.observationId!, namespaceId: shredded.namespaceId,
+      observationId: observation.observationId, namespaceId: shredded.namespaceId,
       rescuedBy: null, confidence: 0.5,
     })).rejects.toBeInstanceOf(NamespaceShredded);
     const rows = await db.selectFrom("permanent_record").select(["record_id"])
-      .where("observation_id", "=", observation.observationId!).execute();
+      .where("observation_id", "=", observation.observationId).execute();
     expect(rows).toEqual([]);
   });
 
@@ -388,7 +388,7 @@ describe("the permanent copy outlives its month", () => {
     const o = storedObservation(await march.obs.append(anEventFor(wallet, ref)));
     const nsId = (await march.ns.find("wallet", wallet))!.namespaceId;
     const record = await march.rec.promote({
-      observationId: o.observationId!, namespaceId: nsId,
+      observationId: o.observationId, namespaceId: nsId,
       rescuedBy: null, confidence: 0.9,
     });
     return { o, nsId, record };
@@ -406,7 +406,7 @@ describe("the permanent copy outlives its month", () => {
     const after = at("2027-05-01T00:00:00.000Z");
 
     // The source is unreadable; the rescue is not. That pair IS the card.
-    await expect(after.obs.get(o.observationId!)).rejects.toBeInstanceOf(PayloadExpired);
+    await expect(after.obs.get(o.observationId)).rejects.toBeInstanceOf(PayloadExpired);
     const rescued = await after.rec.read(record.recordId);
     expect(rescued).toEqual(o);
   });
@@ -419,11 +419,11 @@ describe("the permanent copy outlives its month", () => {
 
     const after = at("2027-05-01T00:00:00.000Z");
     await expect(after.rec.promote({
-      observationId: o.observationId!, namespaceId: nsId,
+      observationId: o.observationId, namespaceId: nsId,
       rescuedBy: null, confidence: 0.5,
     })).rejects.toBeInstanceOf(PayloadExpired);
     const rows = await sql<{ n: string }>`
-      select count(*)::text as n from permanent_record where observation_id = ${o.observationId!}`
+      select count(*)::text as n from permanent_record where observation_id = ${o.observationId}`
       .execute(db);
     expect(rows.rows[0]!.n).toBe("0");
   });
@@ -463,7 +463,7 @@ describe("the permanent copy outlives its month", () => {
     const trigger = randomUUID();
     await sql`
       insert into trigger_event (trigger_id, namespace_id, observation_id, status, tier, cluster_id, surprise, created_at)
-      values (${trigger}, ${nsId}, ${sibling.observationId!}, 'candidate', null, null, 4.5,
+      values (${trigger}, ${nsId}, ${sibling.observationId}, 'candidate', null, null, 4.5,
               ${new Date("2027-03-16T00:00:00.000Z")})`.execute(db);
     const moves = {
       // record_id is part of the binding and was the one part nothing moved:
@@ -471,7 +471,7 @@ describe("the permanent copy outlives its month", () => {
       // accident, through the forgery test's incidental pin on the AAD's
       // shape. Moved here, and the read is asked for the NEW id.
       record_id: sql`record_id = ${movedRecordId}`,
-      observation_id: sql`observation_id = ${sibling.observationId!}`,
+      observation_id: sql`observation_id = ${sibling.observationId}`,
       original_dated_at: sql`original_dated_at = original_dated_at + interval '1 day'`,
       promoted_at: sql`promoted_at = promoted_at + interval '1 day'`,
       // The two the branch review found outside the envelope. Measured
@@ -596,7 +596,7 @@ describe("the permanent copy outlives its month", () => {
       });
       await lockTaken;
       const promoting = new PermanentRecordRepository(db, ring, c, grace7).promote({
-        observationId: o.observationId!, namespaceId: nsId, rescuedBy: null, confidence: 0.7,
+        observationId: o.observationId, namespaceId: nsId, rescuedBy: null, confidence: 0.7,
       }).then(() => null, (e: unknown) => e);
 
       let blocked = false;
@@ -647,7 +647,7 @@ describe("the permanent copy outlives its month", () => {
       const o = storedObservation(await obs.append(anEventFor("PERM6", "op:perm:6")));
       const nsId = (await nsRepo.find("wallet", "PERM6"))!.namespaceId;
       const record = await new PermanentRecordRepository(narrow, ring, c, grace7).promote({
-        observationId: o.observationId!, namespaceId: nsId,
+        observationId: o.observationId, namespaceId: nsId,
         rescuedBy: null, confidence: 0.7,
       });
       expect(record.observationId).toBe(o.observationId);
@@ -705,7 +705,7 @@ describe("the permanent copy outlives its month", () => {
     for (const [shape, spellNs, spellObs] of shapes) {
       const o = storedObservation(await march.obs.append(anEventFor("PERM8", `op:perm:8:${shape}`)));
       const record = await march.rec.promote({
-        observationId: spellObs(o.observationId!), namespaceId: spellNs(nsId),
+        observationId: spellObs(o.observationId), namespaceId: spellNs(nsId),
         rescuedBy: null, confidence: 0.4,
       });
       expect(await march.rec.read(record.recordId), shape).toEqual(o);

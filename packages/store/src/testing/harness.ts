@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { sql } from "kysely";
 import { openDb, type Db } from "../db.js";
 import { migrate } from "../migrate.js";
-import type { Observation } from "@nonametrust/schema";
+import type { StoredObservation } from "@nonametrust/schema";
 import type { AppendResult } from "../repositories/observation.js";
 
 const MIGRATIONS = fileURLToPath(new URL("../../migrations/", import.meta.url));
@@ -114,8 +114,14 @@ function isLiveRun(suffix: string): boolean {
  * or could read one back, so that assertion is made here, once, and fails
  * with the two flags rather than with `undefined is not an object` wherever
  * the value is first used.
+ *
+ * IT IS NO LONGER THE ONLY NARROWING, which was R32's complaint about it.
+ * `AppendResult`'s arms now carry `StoredObservation`, so the id is required in
+ * every arm and a caller narrowing on `created` gets one type for one field. This
+ * helper still earns its place -- it collapses the three arms to the one a test
+ * means -- but it no longer exists to paper over a typing defect.
  */
-export function storedObservation(result: AppendResult): Observation {
+export function storedObservation(result: AppendResult): StoredObservation {
   if (result.created) return result.observation;
   if (result.readable) return result.observation;
   throw new Error(

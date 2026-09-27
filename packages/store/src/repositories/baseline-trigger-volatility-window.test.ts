@@ -56,7 +56,7 @@ async function appendUnder(nsId: string): Promise<string> {
     source: { ...src, ref: `op:${seq}` }, payload: { amount: "500.0000000" },
     salienceHints: { amount: "500.0000000" },
   } as WireObservation));
-  return observation.observationId!;
+  return observation.observationId;
 }
 
 function aBaseline(over: Partial<BaselineState> = {}): BaselineState {
