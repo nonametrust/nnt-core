@@ -75,10 +75,20 @@ inverted, and below the floor the term R12 exists to make non-zero can never
 produce a reason — R12's own failure wearing a valid-looking policy.
 
 **Cost, stated because it is real:** this policy cannot express "only
-same-channel evidence counts" through a zero affinity. That configuration is
-reachable instead by a `relatednessFloor` of 1, which admits the
-same-`(channel, aspect)` term alone. The comparison is `>=` and not `>`, because
-a reason clears the floor at equality.
+same-channel evidence counts" through a zero affinity. The comparison is `>=` and
+not `>`, because a reason clears the floor at equality.
+
+> **CORRECTED BY THE REVIEW ROUND BELOW, and the correction is left in place
+> rather than swapped out.** This paragraph originally continued: "That
+> configuration is reachable instead by a `relatednessFloor` of 1, which admits
+> the same-`(channel, aspect)` term alone." That is FALSE. A floor of 1 is refused
+> under every admissible affinity, because the cross-field rule requires the
+> affinity to clear the floor and the affinity is itself capped below 1 —
+> measured at 0.55, 0.999 and 1. Same-channel-only relatedness is not expressible
+> under this policy at all. The sentence had an argument and no measurement, which
+> is the failure this project keeps naming; it is shown struck rather than deleted
+> because this ledger opens by warning that the storage card's own §2d went stale
+> twice and a review, not the executor, is what noticed.
 
 ### The engine's clock gate refuses identifiers, and is held against drifting from its original
 
