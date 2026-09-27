@@ -708,3 +708,158 @@ lowers the threshold, a brief can `hold` with ZERO reasons — a graded answer w
 account of itself, against design §6:270-273. If it does not, the threshold depends
 on the intent and `thresholdFor(namespaceId, at)` in Task 6 cannot have that
 signature. **Owed before Task 6, and asked of the round-three review.**
+
+## Round three, lens three: the ground Task 5 stands on
+
+Three lenses at `25e038f`. Lenses one and two are recorded above with their fixes
+(`cef11b7`, `d5660db`). This lens asked what Task 5 will trip over, and it found
+enough that Task 5 does not start until these are ruled.
+
+### R39. The set of tags that LOWERS the threshold is the set of REASONS: active AND related
+
+**Two lenses converged on this independently, which is the strongest signal a
+review gives**, and I measured both directions before ruling.
+
+Design §6:275 says "an active tag lowers that counterparty's brief threshold" and
+says nothing about relatedness. R3 makes "active" a strength comparison; R12 makes
+"reason" a relatedness comparison; **nothing tied them**, and design §6:263 is a
+conjunction the code did not implement: "keep those whose relatedness AND decayed
+strength clear their thresholds".
+
+Measured, with the real functions and a policy `assertBriefPolicy` ACCEPTS
+(`relatednessFloor: 0.9`):
+
+- the day-twelve address tag scores 0.55, so it is **not a reason**
+- it is active at its measured strength 0.4165, so it **lowers 600 to 480**
+- `gradeFor(500, 480, reasons: 0)` = **`hold`**; against the unlowered 600 the same
+  intent is `clear`
+
+**The tag decided the grade and the brief cannot cite it.** `grade.ts` calls that
+the thing design §6 exists to avoid, in its own docstring. And the other direction,
+under the SHIPPED policy: a same-aspect tag decayed to 0.01 is not active and is
+still a reason, so `watch` on evidence that has decayed below the active floor.
+
+**Ruled: a tag counts — for lowering AND for citing — iff
+`strengthAt(tag, at) >= activeFloor` AND
+`relatedness(tag, intent) >= relatednessFloor`.** R13's kept reasons are those that
+satisfy both and whose source will not open. Then a hold caused by a tag always has
+that tag among its reasons, and the only zero-reason hold is a hold on the amount
+alone. The brief's output carries `threshold: { base, applied, loweredBy }` so every
+grade has an account of itself.
+
+**What it costs, and it is not small: `thresholdFor(namespaceId, at)` cannot be Task
+6's signature.** It becomes intent-scoped, because there is no intent-free threshold
+once relatedness gates the lowering. Design §6's "the engine exposes the current
+threshold as a query" either goes or becomes a second, intent-free query that no
+brief uses — and Task 6's acceptance ("the threshold query and the brief read one
+value at one instant") and Task 9's comparison must both use the intent-scoped one.
+
+The alternatives, for the record. Lowering by every active tag and citing by
+relatedness is the status quo and produces the measured unaccounted hold. Lowering
+AND citing by activity alone makes `relatednessFloor` dead again, undoing Task 4's
+whole argument.
+
+### R40. The intent's reading is CARRIED from `observe`, not re-derived by decrypting
+
+Relatedness needs the intent's `(channel, aspect)`. `readClear` returns the channel
+and **not the aspect** — aspect comes from `readObservation`, which needs the
+decrypted payload. So the core either opens the payload itself or is handed the
+reading.
+
+Measured cost of opening it: one AEAD open per brief, and — decisively — **after a
+sweep `get(intent)` raises `PayloadExpired`, so a brief could not be replayed 90 to
+120 days later at all.** That undermines R13, whose entire design is to keep a
+reason whose source will not open; a brief that cannot read its OWN intent after
+expiry makes R13's careful handling of everything else pointless.
+
+**Ruled: `observe` returns the intent's derived reading and `brief` takes it.** The
+objection — that relatedness then rests on a caller-supplied aspect, which tagging
+refuses by design — does not apply inside one engine call: `observe` derived that
+aspect from the payload through tagging's own derivation, and carrying it forward is
+the engine remembering its own work, not an integrator asserting a quantity.
+
+**The residual risk, stated:** an integrator calling the core directly with a
+fabricated aspect gets wrong relatedness. Mitigated by the wrapper being the
+supported entry point (R1), which R20 already records is a convention rather than a
+mechanism. A gate for it would have to recognise the core's callers; if one can be
+written it should be.
+
+### R41. R22's filter is on the tags the intent TOUCHED, not the ones it opened
+
+R22 excludes "any tag whose `observation_id` is the intent's". Measured hole: a
+refresh does **not** change `observation_id` — it keeps the opening observation's —
+so a tag opened by observation A and **refreshed by the intent** survives the filter
+and reads full strength at the intent's own instant. The intent lowers its own
+threshold through the tag it just refreshed, which is exactly what R22 exists to
+prevent, one verb over.
+
+**Ruled: `observe` returns the tag ids it opened OR refreshed, and `brief` takes
+them as `ownTagIds`.** The filter is on identity, not on provenance.
+
+### R42. R1's determinism is "the same inputs AND the same store state"
+
+Measured: one tag at instant T1 reads strength 0.4243 with `refreshCount` 0; after a
+refresh at T1+3d, the same `strengthAt` at **the same T1** returns 0.9000 with
+`refreshCount` 1, because `refresh` overwrites `g0`, `tagged_at`, `refresh_count`
+and `saturation_state` and the prior state is stored nowhere (F3). Excluding tags
+whose `taggedAt` is after `at` — which the ledger owed Task 5 — removes that tag
+entirely, so a past replay sees zero tags where one existed and was active.
+
+**No filter recovers it**, because the history is not kept. So R1's replay claim is
+narrowed rather than defended: the same inputs against the same store state replay
+to the same output. **G10's two runs must not write between them**, and the reason's
+`refreshCount` and `saturationState` at any past `at` are post-refresh values.
+
+### Inside Task 5, with what each needs
+
+- **The R26 join is unheld, and three of four components accept `/`.** Measured:
+  retention, tagging and calibration all accept `version: ".../v1"`; only
+  `assertBriefPolicy` refuses. `AuditChain.append` took the malformed composite
+  unparsed. The engine's `compositePolicyVersion(...)` refuses each component, with
+  a plant per component.
+- **R25's gate must be a WHITELIST, not a blacklist.** `AuditChain.append` accepted
+  `{ payload, source, evidence: { ref } }` — a `payload`/`source` key check passes
+  `evidence.ref`. The body needs a closed type plus a runtime whitelist of key names
+  **at every depth** over the rendered canonical JSON; `canonicalForm` is exported.
+- **`at === clock.now()` is plantable and must be gated in the wrapper.** `record`
+  bounds only the future (R34), and `AuditChain.append` stamps its own `occurredAt`.
+  Measured with `at = now − 3d`: the trigger landed at day 8 and the audit row at day
+  11, no error. Rule it too: the replay entry point performs NO effects; only the
+  live wrapper reads `at` from the clock and performs them.
+- **R14 needs an observer.** "Before any tag is read" cannot be seen from outside;
+  the test counts `listLive` calls. And the refusal can only name a uuid —
+  `NamespaceRepository` has no read by uuid — so the check sits on the first read,
+  `readClear(intentObservationId)`, whose `namespaceErased` flag is what R14 acts on.
+  A brief on an erased namespace is refused whole, not served as
+  `SOURCE_UNREADABLE` reasons.
+- **The candidate trigger's `surprise` has no source.** It lives only on
+  `trigger_event`; the tag row has none; `brief` does not ingest (R22); recomputing
+  it judges against a baseline that already holds the intent's fold, which R10
+  forbids. So the input carries `surprise: number | null` out of `observe`, and
+  `null` is the one branch that is both R18 (categorical) and R29 (cold).
+- **A DB-backed engine test needs no gate change.** Measured: `kysely` and the
+  store's test harness are both refused in engine test files, and the store's
+  public surface alone is enough — `openDb(base).schema.createSchema(...)`,
+  `migrate(db, <store migrations path>)` (12 tables), and
+  `db.selectFrom(...).select(db.dynamic.ref<string>("xmin"))` for G9's snapshot.
+  One gotcha recorded: `db.dynamic.ref("xmin as xmin")` does not work, kysely quotes
+  the whole string.
+- **`maxReasons` is NOT needed, and §7's cap question dissolves.** Measured at 200
+  reasons: `listLive` 0.8 ms, `readClear` ×200 24 ms, `get` ×200 46 ms sequential
+  and 33 ms parallel. Round trips dominate, not AEAD, and the one-to-two-second
+  budget is about forty times away. What remains to decide is whether M3's reason
+  carries `source.ref` at all, since that is inside the payload and is the only
+  thing needing a `get`.
+- **The composition root takes a `Db` OR a `Transaction`.** The lexical
+  "no `new *Repository(` outside the root" rule collides with Task 8 rebuilding
+  repositories per transaction under R10; `Db` already admits a trx.
+
+### R31 is worse than "updatable", and it is measured
+
+The ledger recorded that `trigger_event` has no append-only guard. Measured on a raw
+writer: `UPDATE surprise` succeeded, **`UPDATE status = 'harm_confirmed', tier = 'A'`
+succeeded**, and `DELETE` succeeded, while the control `DELETE` on `tag` was refused
+by NNT07. So a raw writer can promote the brief's candidate into a harm-confirmed,
+tiered trigger — not merely edit it. Scope stays M4 as ruled, and it is recorded as
+a known hole in this repository's idiom: a test that asserts the hole, so the day it
+closes is noticed.
