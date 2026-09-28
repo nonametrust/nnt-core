@@ -1509,3 +1509,92 @@ where every engine-side check passes.
 It also closes, for the brief path, the one limit the walk has: a `toJSON` on the body
 or its prototype renders something the walker never saw. `brief()` builds its body from
 literals, and this is where that would now show.
+
+## Task 6 — the threshold as a query, and the sharing that makes its test mean something
+
+Engine 386 -> 419. `pnpm build`, `pnpm typecheck` and `pnpm test` all exit 0, read
+separately.
+
+Task 6's text is small because R44 already moved the arithmetic and the unit refusal
+into Task 5. What was left is the part R39 made expensive, and one refactor a review
+said was owed.
+
+### R62. `thresholdFor` takes the INTENT, and design §6's sentence has to change
+
+The plan wrote `thresholdFor(namespaceId, at)` and design §6 asks for "the current
+threshold as a query". Neither is implementable: once relatedness gates the lowering,
+**the same counterparty at the same instant has a different threshold for a `price`
+intent than for an `address_integrity` one**, because a different set of tags clears
+`relatednessFloor` against each. An intent-free query would have to pick one of those
+answers and could not say which it had picked.
+
+Held by a row that asks one counterparty with two tags for two intents under one
+floor and gets two different `loweredBy` sets at one instant.
+
+It takes `policy` and `halfLifeMs` rather than all four policies, because those are
+what a threshold reads. The other two contribute only their versions, and a version
+belongs to the audit body rather than to this arithmetic.
+
+**And it does NOT take a unit.** R27's refusal exists because an amount is graded
+against a threshold; a query that returns a threshold has no amount, so demanding a
+unit would be refusing a question nobody asked. The brief still refuses it, and a row
+asserts that half is not lost.
+
+### R63. The brief CALLS the threshold rather than repeating it
+
+The plan's last acceptance clause is "the threshold query and the brief read one value
+at one instant". A review pointed out that the brief had inlined both the exclusions
+and `base × factor^k`, so satisfying that clause would have meant **comparing two
+copies of the same arithmetic** — two things that agree today and can drift tomorrow,
+with the test passing until they do.
+
+**Ruled: one `countedTags` and one `loweredThreshold`, both in `threshold.ts`, both
+called by the brief.** Every ruling about WHICH tags count now lives in one place —
+R22 and R41 on the intent's own tags, R43 on the instant, R39's single predicate,
+R53's order — so the query and the brief cannot disagree by construction, and the
+consistency rows are what catch the day someone re-inlines it.
+
+Measured: giving the brief a second, divergent arithmetic turns four unit rows AND
+three DB rows red. Removing R22's half from the shared filter, removing R43's
+exclusion, and removing R53's sort each turn their own rows red through BOTH entry
+points.
+
+**One message moved, and its old kill is the spec.** The invalid-`taggedAt` refusal is
+now prefixed `threshold.tags[...]` rather than `brief.reasons[...]`, because the check
+is shared and a message naming a "reason" would be wrong when the caller asked for a
+threshold. What the old assertion protected — the refusal NAMES the tag, where
+`strengthAt`'s own message does not — is unchanged and is what the row still asserts.
+
+### The active floor is tested on REAL decay, which is the clause easiest to fake
+
+The plan is explicit: "tested with real decay, not with `g0 == floor`", because two
+strengths a millisecond apart differ by about 2.4e-10 at this half-life and a fixture
+whose `g0` equals the floor tests the comparison instead of the decay.
+
+The elapsed time is DERIVED — `halfLife × log2(g0/floor)` — rather than hard-coded at
+28 days, because 28 days is only right for `g0 = 1`, `floor = 0.25` and this
+half-life, and a fixture that silently stopped straddling the floor would make both
+boundary rows pass for the wrong reason. A third row checks the gap really is about
+2.4e-10, so the day the half-life moves far enough that a millisecond stops separating
+them, that row says so first.
+
+**Verified not hollow:** replacing the decayed strength with the undecayed `g0` kills
+the "one millisecond below" row and nothing else — so that row is measuring decay and
+not the comparison.
+
+The `g0 == floor` fixture is used in exactly one row, for the one thing it is right
+for: a strength landing EXACTLY on the floor, which no elapsed time produces because
+the arithmetic gives a neighbouring double. "At or above" means it counts.
+
+### What Task 6 leaves, and what it does not close
+
+`thresholdFor` is what Task 9's comparison must use. The ledger's earlier constraint
+stands and is now written where the function is: the day-eleven threshold cannot be
+produced by replaying a past `at` against a store seeded to day twenty-one, because a
+daily-refreshed state's `tagged_at` has moved to its last refresh and R43 then
+excludes it. It has to be taken live, with the clock advanced through the corpus.
+
+**The floors gate is still narrower than R49's purpose**, and this task is where that
+mattered: a `thresholdFor` lowering by a bare literal, by a computed property name, or
+by no floor at all would pass the gate. What refuses those is the consistency rows
+above, which is why they compare `loweredBy` and not only the number.

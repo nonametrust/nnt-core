@@ -12,5 +12,6 @@ export * from "./grade.js";
 export * from "./composite-version.js";
 export * from "./compose.js";
 export * from "./audit-body.js";
+export * from "./threshold.js";
 export * from "./brief.js";
 export * from "./run-brief.js";

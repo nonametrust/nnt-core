@@ -16,6 +16,7 @@ import {
 import { ADMITTED_PATHS } from "./audit-body.js";
 import { compose, type Composed } from "./compose.js";
 import { brief, type BriefInput } from "./brief.js";
+import { thresholdFor, type ThresholdReads } from "./threshold.js";
 import { briefDeps, runBrief, type BriefRequest } from "./run-brief.js";
 import { BRIEF_POLICY_V0 } from "./policy.js";
 import type { IdSource } from "./ids.js";
@@ -438,6 +439,82 @@ describe("G10: the same inputs replay to the same output", () => {
     const atSeed = await brief(coreInput({ at: SEED_NOW }), reads);
     const atStart = await brief(coreInput(), reads);
     expect(JSON.stringify(atSeed)).not.toBe(JSON.stringify(atStart));
+  });
+});
+
+describe("G14: the threshold query and the brief, on real rows", () => {
+  /** The same question asked both ways, at one instant. */
+  const bothWays = async (at: Date, ownTagIds: readonly string[] = []) => {
+    const input = coreInput({ at, ownTagIds });
+    const out = await brief(input, briefDeps(composed, ids()).reads);
+    const q = await thresholdFor(
+      {
+        at,
+        intent: input.intent,
+        observationId: input.observationId,
+        ownTagIds,
+        policy: input.policies.brief,
+        halfLifeMs: input.policies.calibration.halfLifeMs,
+      },
+      { listLive: (namespaceId: string) => composed.tags.listLive(namespaceId) },
+    );
+    return { out, q };
+  };
+
+  it("read ONE value and name the SAME tags, at the brief's instant", async () => {
+    const { out, q } = await bothWays(AT);
+    expect(q.base).toBe(out.threshold.base);
+    expect(q.applied).toBe(out.threshold.applied);
+    expect(q.loweredBy).toEqual(out.threshold.loweredBy);
+    expect(out.reasons.length, "an empty agreement is not an agreement").toBeGreaterThan(0);
+  });
+
+  it("agree at a LATER instant, where R43 admits a tag the earlier one excluded", async () => {
+    const { out, q } = await bothWays(SEED_NOW);
+    expect(q.applied).toBe(out.threshold.applied);
+    expect(q.loweredBy).toEqual(out.threshold.loweredBy);
+    // The instant really does change the answer, so the agreement is not a constant.
+    const earlier = await bothWays(AT);
+    expect(q.loweredBy.length).toBeGreaterThan(earlier.q.loweredBy.length);
+  });
+
+  it("agree when the caller filters a tag out", async () => {
+    const { out, q } = await bothWays(AT, [tags["sameAspect"]!.tagId]);
+    expect(q.applied).toBe(out.threshold.applied);
+    expect(q.loweredBy).toEqual(out.threshold.loweredBy);
+    expect(q.loweredBy).not.toContain(tags["sameAspect"]!.tagId);
+  });
+
+  it("costs the query ONE read where the brief pays one per reason", async () => {
+    // The type says the query needs no `readClear`; this measures it. The brief opens
+    // a clear row per reason because a reason reports its dated instant and its source
+    // code, and a threshold reports neither.
+    const calls: string[] = [];
+    const counted: ThresholdReads = {
+      listLive: async (namespaceId: string) => {
+        calls.push("listLive");
+        return composed.tags.listLive(namespaceId);
+      },
+    };
+    const input = coreInput();
+    await thresholdFor(
+      {
+        at: AT,
+        intent: input.intent,
+        observationId: input.observationId,
+        ownTagIds: [],
+        policy: input.policies.brief,
+        halfLifeMs: input.policies.calibration.halfLifeMs,
+      },
+      counted,
+    );
+    expect(calls).toEqual(["listLive"]);
+  });
+
+  it("writes nothing, either of them", async () => {
+    const before = await rowVersions();
+    await bothWays(AT);
+    expect(await rowVersions()).toBe(before);
   });
 });
 

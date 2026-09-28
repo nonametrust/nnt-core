@@ -1,7 +1,6 @@
 import { assertCalibration, assertPolicy, type Calibration, type Policy } from "@nonametrust/tagging";
 import {
   assertRetentionPolicy,
-  strengthAt,
   type AuditEntryInput,
   type ClearObservation,
   type RecordTriggerEvent,
@@ -18,7 +17,8 @@ import {
 import { compositePolicyVersion } from "./composite-version.js";
 import { gradeFor, type Grade } from "./grade.js";
 import { assertBriefPolicy, type BriefPolicy } from "./policy.js";
-import { isReason, relatedness, relatednessCase, type Related, type RelatednessCase } from "./relatedness.js";
+import { relatedness, relatednessCase, type Related, type RelatednessCase } from "./relatedness.js";
+import { countedTags, loweredThreshold } from "./threshold.js";
 
 /**
  * The reads the core is allowed to make, and nothing else.
@@ -308,61 +308,26 @@ export async function brief(input: BriefInput, reads: BriefReads): Promise<Brief
     );
   }
 
-  const own = new Set(input.ownTagIds);
-  const live = await reads.listLive(intent.namespaceId);
-
-  const counted: { tag: StoredTag; strength: number }[] = [];
-  for (const t of live) {
-    // BOTH FILTERS, and two review lenses converged on that independently.
-    //
-    // R41 ruled that the filter is on tag IDENTITY, because a refresh keeps the
-    // OPENING observation's id, so a tag the intent refreshed survives an
-    // observation-id filter and lowers the intent's own threshold. That ADDED a
-    // filter; it did not retire R22's, and the plan's Task 5 acceptance still says
-    // in bold "no reason's observation is the intent's own".
-    //
-    // The two are complementary rather than alternative: a tag the intent OPENED
-    // carries the intent's `observation_id` and one it REFRESHED does not. On the
-    // supported path `ownTagIds` covers both, and this changes nothing there. What
-    // it closes is a caller that passes an incomplete list -- `assertInput` accepts
-    // `[]` -- which reintroduced exactly the failure R22 exists to prevent. One
-    // comparison against a value the core already holds is not a cost worth
-    // declining.
-    if (own.has(t.tagId) || t.observationId === input.observationId) continue;
-    // R43. `strengthAt` returns `g0` for EVERY non-positive elapsed, so a tag
-    // stamped after `at` reports full strength: a past brief counting it would be
-    // reporting evidence that did not exist yet, at a strength it never had.
-    // NECESSARY AND NOT SUFFICIENT (R42): a refreshed tag's earlier state is not
-    // recoverable, because `refresh` overwrites it and keeps no history. So a
-    // past-`at` brief is correct about what existed and approximate about its
-    // strength, and both sentences are true of different things.
-    if (t.taggedAt.getTime() > at.getTime()) continue;
-    // NAMED, like the `dated_at` guard below. `strengthAt` refuses an invalid instant
-    // with a bare "instant and taggedAt must be valid dates" that says nothing about
-    // WHICH tag, and this value comes from the store rather than from the caller. Note
-    // the exclusion above cannot catch it either: `NaN > x` is false, so an invalid
-    // `taggedAt` walks straight past a comparison.
-    if (Number.isNaN(t.taggedAt.getTime())) {
-      throw new RangeError(
-        `brief.reasons[${t.tagId}].taggedAt from the store is not a valid instant: ${String(t.taggedAt)}`,
-      );
-    }
-    const strength = strengthAt(t, at, policies.calibration.halfLifeMs);
-    // ONE PREDICATE FOR BOTH JOBS (R39): whatever fails this neither lowers the
-    // threshold nor is citable, so a hold caused by a tag always has that tag among
-    // its reasons and the only zero-reason hold is a hold on the amount alone.
-    // `no-floor-outside-relatedness.test.ts` refuses any second comparison.
-    if (!isReason({ ...t, strength }, intent, policy)) continue;
-    counted.push({ tag: t, strength });
-  }
-
-  // DETERMINISTIC ORDER, and it is R1 rather than presentation. `listLive` orders
-  // by `tagged_at desc`, and two tags stamped at one instant have no order at all,
-  // so a brief that passed the store's order through would render a different body
-  // on two runs over the same rows. Strength descending because that is the order a
-  // reader wants, `tagId` ascending because a total order needs a tiebreak on
-  // something unique and a tag id is.
-  counted.sort((a, b) => b.strength - a.strength || (a.tag.tagId < b.tag.tagId ? -1 : 1));
+  // THE THRESHOLD'S OWN MODULE DOES THE FILTERING, and that is Task 6's real work.
+  // An earlier version of this function inlined both the exclusions and the
+  // arithmetic, so `thresholdFor` would have been a SECOND copy and the plan's
+  // "the threshold query and the brief read one value at one instant" would have
+  // compared two things that can drift. A review said so; they are one now.
+  //
+  // Every ruling about WHICH tags count therefore lives in `countedTags`: R22 and
+  // R41 on the intent's own tags, R43 on the instant, R39's single predicate, and
+  // R53's order.
+  const counted = await countedTags(
+    {
+      at,
+      intent,
+      observationId: input.observationId,
+      ownTagIds: input.ownTagIds,
+      policy,
+      halfLifeMs: policies.calibration.halfLifeMs,
+    },
+    reads,
+  );
 
   const reasons: Reason[] = [];
   for (const { tag, strength } of counted) {
@@ -400,7 +365,9 @@ export async function brief(input: BriefInput, reads: BriefReads): Promise<Brief
   // threshold is an amount in value units and a subtraction would have to name a
   // currency while a factor does not.
   const base = policy.briefThreshold;
-  const applied = base * Math.pow(policy.activeTagFactor, reasons.length);
+  // ONE arithmetic, shared with `thresholdFor`. R4's multiplicative lowering and
+  // R60's underflow both live there.
+  const applied = loweredThreshold(policy, reasons.length);
   // THE LOWERED THRESHOLD CAN UNDERFLOW TO EXACTLY ZERO, and `gradeFor` refuses a
   // non-positive threshold. Found by measurement rather than by reading: timing the
   // real brief at 200 reasons showed a threshold of 2.5e-17, and following that to

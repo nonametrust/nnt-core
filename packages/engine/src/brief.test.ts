@@ -578,9 +578,15 @@ describe("brief", () => {
     it("refuses an instant the store returned invalid on the TAG, by name", async () => {
       // `NaN > x` is false, so the R43 exclusion does not catch this and `strengthAt`
       // refuses it with a message that names no tag.
+      //
+      // The prefix is `threshold.tags` and not `brief.reasons` because Task 6 moved
+      // the check into `countedTags`, which the threshold query calls too -- a message
+      // naming a "reason" would be wrong when the caller asked for a threshold. What
+      // the old assertion protected is unchanged and is what this still asserts: the
+      // refusal NAMES the tag, where `strengthAt`'s own message does not.
       const bad = tag({ tagId: "bad-tagged-at", aspect: "quoted/USDC", taggedAt: new Date("nonsense") });
       await expect(brief(input(), reads([bad]))).rejects.toThrow(
-        /brief\.reasons\[bad-tagged-at\]\.taggedAt from the store is not a valid instant/,
+        /threshold\.tags\[bad-tagged-at\]\.taggedAt from the store is not a valid instant/,
       );
     });
 
