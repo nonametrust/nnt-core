@@ -67,9 +67,51 @@ post-refresh value.
    8 repository classes take an unchecked clock, and §8's claim that the store
    refuses a foreign one is false.*
 
-2. **The brief core**, pure, taking
-   `{ at, briefId, triggerId, intent, amount, unit, riskTier, ownTagIds, surprise, policies }`
-   and returning `{ grade, reasons, threshold, effects }`.
+2. **The brief core**, pure. **THE WHOLE SHAPE IS HERE**, because a review
+   assembling it from the plan and five ledger entries had to guess — the plan's
+   input is stale (it predates R39-R42) and `ownTagIds` appears once in the entire
+   docs tree.
+
+```ts
+interface BriefInput {
+  at: Date;                      // the wrapper's clock.now(); the core never reads one
+  briefId: string;               // from IdSource, minted by the wrapper (R1)
+  triggerId: string;             // likewise
+  intent: Related;               // carried from observe (R40): namespaceId, channel, aspect
+  observationId: string;         // the intent's own, for readClear and R22
+  amount: number;                // R8; 0 admissible, negative refused
+  unit: string;                  // refused unless === policies.brief.thresholdUnit (R27, R44)
+  riskTier: "low" | "medium" | "high";   // refused at runtime too (R45)
+  ownTagIds: readonly string[];  // tags this intent opened OR refreshed (R41)
+  surprise: number | null;       // from observe; null => no trigger effect (R18, R29)
+  policies: { retention; tagging; calibration; brief };  // four versions, R26
+}
+
+interface BriefOutput {
+  grade: Grade;                                  // clear | watch | hold (R38)
+  reasons: readonly Reason[];
+  threshold: { base: number; applied: number; loweredBy: readonly string[] };  // R39
+  effects: readonly [TriggerToRecord?, AuditBodyToAppend?];  // in that order (R1)
+}
+
+interface Reason {
+  tagId: string;
+  observationId: string;         // the tag's OPENING observation (R30)
+  channel: string;
+  aspect: string;
+  datedAt: Date | null;          // null for a state (R19)
+  strength: number;              // strengthAt(tag, at), from the store
+  relatedness: number;
+  relatednessCase: RelatednessCase;
+  refreshCount: number;          // R30; a post-refresh value at any past at (R42)
+  source:
+    | { code: "SOURCE_PRESENT" }
+    | { code: "SOURCE_UNREADABLE"; periodExpired: boolean; namespaceErased: boolean };
+}                                // no source.ref in M3 (R47)
+```
+
+   `loweredBy` is redundant with `reasons[].tagId` under R39 — they are the same set
+   — and a test should assert that equality rather than let the two drift.
    - `intent` is the reading carried from `observe` (R40).
    - `surprise: number | null` — it lives only on `trigger_event`, the tag row has
      none, and recomputing it would judge against a baseline already holding the
@@ -130,19 +172,29 @@ post-refresh value.
 - **`AuditChain.append` can carry what R25 requires**, and `policyVersion` is the
   R26 composite, which `compositePolicyVersion` now builds and refuses.
 
-## Open questions this task inherits
+## Settled since this file was first written (R43-R48 in the ledger)
 
-- **Whether M3's reason carries `source.ref`.** It is inside the payload, so
-  carrying it costs one `get` per readable reason and makes the reason unbuildable
-  after the month expires. Design §6:270-273 says each reason carries its sources.
-  R13 already rules what happens when a source will not open; this is the narrower
-  question of whether a source that WILL open is dereferenced.
-- **§7's grade vocabulary is still provisional.** `clear | watch | hold` with R38's
-  rule. Kerem has a veto and it has not been exercised.
-- **R12's fifth cases** are stated limits, not rulings: unnormalised aspect strings
-  (`usdc` against `USDC` are two aspects), compound aspects with no partial-match
-  term, and a `cluster_proximity` intent that reads into TWO aspects — Task 5 must
-  rule max-over-readings or per-reading, which is unruled today.
+- **The reason carries a CODE and no `source.ref`** (R47), with three measured
+  reasons. Outward-facing: design §6:270-273 says each reason carries its sources,
+  and in M3 it carries a code and the clear columns.
+- **An intent with more than one reading is REFUSED by name** (R46).
+  `cluster_proximity` yields two, so it cannot be briefed in M3 — also
+  outward-facing.
+- **Task 5 computes the threshold AND performs the unit refusal** (R44); Task 6
+  becomes the intent-scoped query and its consistency test.
+- **`riskTier` is `"low" | "medium" | "high"`, refused at runtime** (R45), because
+  the value is hashed forever.
+- **The audit body is a closed type whose whitelist WALKS the object** (R48), and it
+  admits the named numbers a grade cannot be recomputed without.
+- **The `taggedAt > at` exclusion stands** (R43).
+
+## Open questions this task still inherits
+
+- **§7's grade vocabulary is provisional.** `clear | watch | hold` with R38's rule.
+  Kerem has a veto and has not exercised it.
+- **R12's other fifth cases** are stated limits, not rulings: unnormalised aspect
+  strings (`usdc` against `USDC` are two aspects) and compound aspects with no
+  partial-match term. Both M4's.
 
 ## Non-negotiables carried from the plan
 
