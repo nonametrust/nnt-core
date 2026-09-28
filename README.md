@@ -136,22 +136,75 @@ decision depends on, tagging is arithmetic provable over a fixed corpus with no
 cluster -- and a root gate holds the separation in both directions and in the
 manifests.
 
-As of M3's first task it holds two values and no behaviour yet. `BriefPolicy`
-is the brief's own versioned numbers, kept out of tagging's `Policy` because a
-brief field there is a number that package never reads, and because three
-fields of the tagging policy are all `3`, which once made a wrong-field read
-invisible. **None of its numbers is measured**: each was chosen so the design's
-section 9 scenario behaves, which is the same admission the design makes about
-its own defaults, and each carries a comment saying what it is, what it is not
-and what would replace it. `ids.ts` is the single place an identifier is
-minted, and the engine's own gate refuses `randomUUID` everywhere else --
-because the brief is a pure function of its inputs, so that the same inputs
-replay to the same output, and one identifier reached for inside it breaks that
-while leaving the output well-formed.
+`BriefPolicy` is the brief's own versioned numbers, kept out of tagging's
+`Policy` because a brief field there is a number that package never reads, and
+because three fields of the tagging policy are all `3`, which once made a
+wrong-field read invisible. **None of its numbers is measured**: each was chosen
+so the design's section 9 scenario behaves, which is the same admission the
+design makes about its own defaults, and each carries a comment saying what it
+is, what it is not and what would replace it. `ids.ts` is the single place an
+identifier is minted, and the engine's own gate refuses `randomUUID` everywhere
+else -- because the brief is a pure function of its inputs, so that the same
+inputs replay to the same output, and one identifier reached for inside it
+breaks that while leaving the output well-formed.
 
 The engine reads no clock of its own either. Its instant is the `Clock` object
 the store already holds, injected, so `clock.now()` is an ordinary call here
 and there is nothing to exempt.
+
+`compose` is the one place a store class is constructed, so a whole composition
+shares one clock. That is the engine's property to hold rather than the store's:
+of the store's nine clock-bearing classes, seven take their clock unchecked, and
+the one pair that is checked is checked by `ObservationRepository` against its
+own namespace repository.
+
+The brief itself is split in two. A pure core takes its instant, its identifiers
+and its four policies as arguments, reads through a port with two read methods
+and no writer, and returns a grade, its reasons, the threshold with what lowered
+it, and the effects it did not perform. A thin wrapper reads the instant off the
+clock, mints the identifiers, and performs them. The wrapper is the supported
+entry point; the core is what a replay calls, and it cannot write because it was
+never handed anything that writes.
+
+### Four things the brief does not do, each measured rather than reasoned
+
+These are limits of M3, not of the design, and each is written here because a
+reader of the design would otherwise expect otherwise.
+
+1. **The brief reads TAGS only.** Permanent records are evidence the design
+   expects a brief to cite, and citing them is M4's. So a counterparty whose
+   evidence has been promoted out of the tag table and into a permanent record
+   has that evidence absent from its brief.
+
+2. **A reason carries a CODE, not a reference to its source.** The design says
+   each reason carries its sources; in M3 it carries a code -- source present, or
+   source unreadable -- plus the columns the store keeps in the clear. Three
+   reasons, and the third is the one that decided it: the audit chain outlives
+   both the month key and the namespace key, so a body naming a source would
+   defeat erasure through the audit table; a tag refreshed forty times names one
+   observation and records the other thirty-nine nowhere, so a reference that is
+   right about one event in forty is worse than an honest absence; and opening
+   the payload is the only real cost in a brief.
+
+3. **An intent with more than one reading cannot be briefed.** Relatedness needs
+   the intent's channel and aspect, and `cluster_proximity` derives two readings
+   -- hops and amount. Choosing between them would invent a rule nobody has
+   measured, so such an intent is refused by name and M4 gets the ruling with a
+   population to measure it against.
+
+4. **`clear` is not a reassurance, and twice over.** A first-ever brief on no
+   evidence grades `clear` only BELOW the base threshold: a pristine
+   counterparty asking for the base amount or more grades `hold` with zero
+   reasons, because a threshold is what a threshold is. And for a counterparty
+   whose producer emits any standing state, `clear` is unreachable at any amount
+   below the bar -- a state is refreshed every morning, so it never decays out of
+   the active floor and it is related to everything in its own namespace.
+
+A fifth limit belongs with them, and it is about replay rather than about
+evidence. The same inputs replay to the same output **against the same store
+state**. A refresh overwrites a tag's `g0`, its instant, its refresh count and
+its saturation state and keeps no history, so a brief asked about a past instant
+is correct about which evidence existed and approximate about how strong it was.
 
 ## Tagging
 

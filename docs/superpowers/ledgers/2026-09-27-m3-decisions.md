@@ -1049,3 +1049,244 @@ threshold.
   it. Moving a trigger to another namespace succeeds when its observation moves too.
   A raw writer can manufacture graded evidence that downstream tables then trust,
   not merely edit a candidate.
+
+## Task 5 — the brief, and the ten decisions its requirements did not carry
+
+Commits `ad5a3fe`, `c83f7ec`, `18d8782`. Engine 190 -> 362, root gates 64 unchanged.
+`pnpm build`, `pnpm typecheck` and `pnpm test` all exit 0, read separately, and the
+suite is green under `Pacific/Kiritimati`, `Etc/GMT+12`, `America/St_Johns`,
+`LC_ALL=tr_TR.UTF-8` and a database whose session timezone was altered to
+`Pacific/Kiritimati`.
+
+Task 5's requirements file exists because a review had to GUESS the input shape
+from five places. It succeeded at that and still left ten decisions to be made on
+the day, which are ruled here rather than left to whichever branch catches them
+first. Four of them contradict the requirements file; each says so and why.
+
+### R50. The core takes a narrow READS PORT, not the repositories
+
+The plan says the core "reads through repositories handed to it". Measured against
+what that hands over: an `ObservationRepository` carries `append`, a
+`TagRepository` carries `open`, `refresh` and `suppress`. G9's claim — the core
+writes nothing — would then rest on the core not calling methods it holds, which
+is convention, and this milestone has now measured four separate conventions to be
+false.
+
+**Ruled: `BriefReads` has `readClear` and `listLive` and nothing else.** Three
+consequences, all wanted: G9 is structural before it is measured; R14's "before any
+tag is read" observer is a counting wrapper over two functions rather than a proxy
+over a class with private fields; and the core's entire read surface is two calls a
+reader can see at once.
+
+**The xmin measurement stays.** A type property is not a measurement, and the
+measurement found something the type could not — see the survivors below.
+
+### R51. `effects` is a RECORD, not a tuple
+
+The requirements give `readonly [TriggerToRecord?, AuditBodyToAppend?]`, "in that
+order (R1)". Measured against the store's types: `RecordTriggerEvent.surprise` is
+required, so a null surprise really does mean no trigger and the trigger really is
+optional. The audit entry is **not** optional — R24 rules that a committed write
+with no chain entry is a named inconsistency, and this ledger already extends R24
+to the brief verbatim.
+
+A tuple of two optional elements admits `[]` and `[trigger]`. **So the type makes
+R24's inconsistency expressible**, which is the one thing a closed type is for.
+
+**Ruled: `{ trigger: RecordTriggerEvent | null; audit: AuditEntryInput }`.** The
+order the tuple was carrying moves to a test over the wrapper that records the
+order the two calls actually happen in — which is where it always was, since a
+tuple cannot make a caller perform its elements in sequence.
+
+### R52. `policies` carries the four policy OBJECTS, not four version strings
+
+The requirements annotate it "four versions, R26". It cannot be four strings:
+`strengthAt(tag, instant, halfLifeMs)` takes the half-life as an argument and it
+lives on tagging's `Calibration.halfLifeMs`, and the brief needs every number on
+`BriefPolicy`.
+
+**Ruled: all four are the objects, and `compositePolicyVersion` reads `.version`
+off each.** Not a mixed shape and not four strings plus a separate half-life
+argument, because **a version string decoupled from the object it names can lie**:
+the audit row would claim `calibration-v0` while the half-life that produced every
+strength came from somewhere else, and nothing in the row would contradict it.
+Taking the objects makes the body's claim true by construction, which is what R48
+says an audit row is for. Each is refused by its own package's predicate, so the
+brief restates no other package's ranges.
+
+### R53. Reasons are ordered (strength descending, tagId ascending), and that is R1
+
+`listLive` orders by `tagged_at desc`, and two tags stamped at one instant have no
+order at all. A brief that passed the store's order through would render a
+different body on two runs over the same rows, and R1's replay claim is
+byte-identical output.
+
+**Ruled: strength descending, `tagId` ascending.** Strength because that is the
+order a reader wants; the id because a total order needs a tiebreak on something
+unique, and a tag id is. Held by a test that runs the same three tags through in
+two different arrival orders.
+
+### R54. R43's exclusion is ENGINE-side, because `listLive`'s bound points the other way
+
+The requirements say "`listLive` needs an upper bound on the instant". Measured:
+`TagRepository.listLive(namespaceId, since?)` applies `tagged_at >= since` — a
+LOWER bound, and its own docstring records that `tagged_at` moves on every refresh,
+so `since` selects on the last refresh instant rather than the opening one.
+
+There is no store parameter to pass `at` to, and Task 2 is closed. **Ruled: the
+exclusion is applied to what the port returns**, and needs no store change. Gated
+with a real tag stamped after `at`, which the DB test can open because its seeding
+clock runs ten days ahead of the brief's instant.
+
+### R55. R49's gate is the BARE IDENTIFIER, and it is built now rather than in Task 6
+
+R49 asks for a lexical rule refusing `.activeFloor` and `.relatednessFloor`. A
+dotted rule has three holes and each is one line: `const { activeFloor } = policy`
+destructures past it, `policy["activeFloor"]` indexes past it, and a renamed
+binding hides it. **Ruled: the rule is the bare identifier in a module's code.**
+Keeping string contents unblanked is what catches the bracket form, so that choice
+is load-bearing rather than inherited.
+
+**Modules only**, in the idiom of this package's clock gate: a test asserting
+`BRIEF_POLICY_V0.relatednessFloor` is the assertion R36 MOVED onto the shipped
+default when it retired the cross-field rule, and `policy.test.ts` is where it
+belongs. Measured: deleting the `isTest` skip turns the tree scan red, so that
+decision is load-bearing too.
+
+**Built in Task 5 rather than Task 6**, against R49's own "owed before Task 6",
+because Task 5 is the first code that relies on one predicate doing both jobs. The
+gate holds Task 5's own core, not only Task 6's future `thresholdFor`.
+
+### R56. The audit body's whitelist is over PATHS, and what it omits is ruled
+
+A flat set of admitted key NAMES would let `unit` — admitted at the top level —
+appear inside `threshold`, where it means nothing and where a reader would take it
+for the threshold's own unit. **Ruled: a path whitelist, held equal to the shipped
+body's own paths in BOTH directions**, because a dead entry admits a path nothing
+produces today, which is a path a later body can start producing unnoticed.
+
+What the body does NOT carry, each ruled rather than omitted:
+
+- **no `refreshCount`**, which the OUTPUT does carry under R30. It is not an id, a
+  code, a version, an instant or one of R48's six numbers — and R42 measured that at
+  any past `at` it is a post-refresh value, so a permanent row asserting it would
+  assert what the store can already contradict.
+- **no channel and no aspect.** A grade is recomputable without them, because each
+  reason carries the relatedness VALUE the decision used rather than the inputs it
+  was derived from.
+- **no `periodExpired` / `namespaceErased` booleans.** The CODE is the fact about
+  the brief; the two flags are a read of the store's state at one instant, and
+  retention moves them afterwards.
+
+### R57. The brief cross-checks the intent's namespace against the observation's
+
+The caller hands both `intent.namespaceId` and `observationId`, and relatedness is
+computed against the intent. If the two disagree every tag is compared against a
+counterparty the intent is not about, and **the brief is wrong in a way no output
+field shows**. Refused by name, on the row R14 already reads.
+
+### R58. The `at === clock.now()` rule is STRUCTURAL, not a comparison
+
+`at` is an input to the core, which is what makes replay possible and therefore
+makes it plantable. Measured with `at = now - 3d`: `record` bounds only the FUTURE
+(R34) and `AuditChain.append` stamps its own `occurredAt`, so the trigger landed at
+day 8 and the audit row at day 11 with no error at all.
+
+A comparison would be the wrong instrument. **Ruled: the replay entry point IS the
+core**, which holds a read-only port and cannot write, and `BriefRequest` has no
+`at` and no ids. A caller who plants an `at` is not half-obeyed, and a row asserts
+it is ignored.
+
+Recorded as a known property, unchanged: under `systemClock` the production
+property is `at <= occurredAt`, not equality.
+
+### R59. The 23505-as-landed branch is unreachable through `runBrief`, and is kept anyway
+
+This ledger says a retry whose first `record` landed sees 23505 and the wrapper
+must read it as "landed" and continue to the audit append. It also says two briefs
+on one intent writing two candidate triggers is CORRECT. Those two entries only
+agree if an id can be carried across a retry — and `runBrief` mints fresh ids on
+every call, so a retry through it is a new brief with new ids and a second
+candidate trigger.
+
+**Ruled: the branch is implemented and held by tests, and recorded as Task 8's
+path** rather than this one's. It admits `trigger_event_pkey` and
+`trigger_event_in_namespace`, because both cover `trigger_id` and which one
+Postgres reports depends on index order. A 23503, a 23514 or a `Deadlocked` is NOT
+read as landed: reading a refusal as "landed" would turn it into a brief that
+silently recorded nothing. And what it cannot tell, because the store says so: the
+same id with DIFFERENT contents raises the same 23505 on the same constraint as an
+identical retry, so "landed" means a row with this id exists, not a row with these
+contents.
+
+### What the mutation runs found, and the two that were real
+
+Eighty mutants across five files. Seventy-six died on the test that claims the
+rule; two were deliberate CONTROLS that survived as designed; two survived that
+should not have, and both were the same lesson.
+
+**A control is what makes the other seventy-six mean something.** A no-op filter
+added beside `isReason` survived, and swapping two statements whose order cannot be
+observed survived. Without those, a mutation run cannot distinguish "the rule is
+held" from "the suite is brittle".
+
+**B22: deleting `assertAuditBody(body)` from the core turned NOTHING red.** Every
+field of the body came from an input `assertInput` had already refused, so the call
+was unobservable — a green check proving nothing, which is this milestone's second
+lesson exactly. The uncovered direction is what the STORE hands back, and that is
+also the direction that matters, because the body is what becomes permanent and the
+store is not the brief's to validate at source. Three rows hold it now: a `tagId` or
+`observationId` returned blank is refused naming the body path, and a `dated_at`
+returned as an invalid Date is refused BY NAME, where `toISOString()` would have
+thrown a bare "Invalid time value" with nothing in it to say which row.
+
+**D2: degrading G9's `rowVersions()` to a row COUNT survived.** Every write any
+other row performed was an INSERT, which a count also catches — so nothing in the
+suite distinguished `xmin` from `length`, while the comment above it claimed the
+distinction was the whole point. Held now by an UPDATE that writes the value the row
+already carries: the count is unchanged, `tags.get` returns an identical row, and
+`xmin` moves.
+
+**D4: deleting `clock.advance(...)` from G10's replay row survived**, because the
+core has no clock to read. The advance was an unheld claim, and the plan requires
+it precisely because a frozen clock would let a planted `clock.now()` return the
+same instant twice. The advance is now shown POTENT against something that does
+read the clock: two `runBrief` bodies across the same advance differ by exactly
+three days.
+
+### Three things measurement found that reasoning did not
+
+- **M11 and M12 kill every test in `compose.test.ts`, and that is not evidence.**
+  Both make `ObservationRepository`'s constructor throw, because it refuses a clock
+  and a policy that are not its `NamespaceRepository`'s by identity. So `build()`
+  throws and the whole file dies. Under §3b's first lesson a test of another rule
+  going red is not evidence: the namespaces-observations pair is held by the STORE,
+  the other six clock-bearing classes are held by this test, and **M2 is the only
+  mutant that proves it does its own work**.
+
+- **A guard whose copied comment described a guard that was not written.**
+  `statSync(abs).isFile()` arrived from `single-date-reader.test.ts` with its
+  comment, "the dirent's own isFile() is false for a symlink" — which explains a
+  guard against `entry.isFile()`, and the enumeration never calls that. Deleting the
+  line survived. It is two rules now, each with a synthetic violation: a symlinked
+  module IS scanned, and an entry that cannot be stat'd fails the gate by NAME
+  rather than crashing with a raw ENOENT or being skipped into silence.
+
+- **A gate that wrote into the tree it scans broke a different gate.** The first
+  symlink probe created `*.ts` files inside `packages/engine/src`, and the engine's
+  suite runs its files in PARALLEL: the floors gate stat'd the probe between its
+  creation and its removal and died with ENOENT. Invisible when either file ran
+  alone, which is this milestone's sixth lesson arriving at test level.
+  `boundary.test.ts` gets away with the same trick only because its probe is a
+  directory with no source extension — luck, not design. The probes now live outside
+  every scanned tree.
+
+### Owed, and not done by Task 5
+
+- **R46 is not implemented anywhere.** An intent with more than one reading is
+  refused by name in M3 — but `BriefInput.intent` is already a single `Related`
+  carried from `observe` under R40, so the refusal belongs where readings are
+  derived, which is `observe`, which is Task 8. Recorded here so Task 8 does not
+  have to rediscover that it owns it.
+- **The three outward-facing sentences (R33, R46, R47) are still owed to the
+  README.**
