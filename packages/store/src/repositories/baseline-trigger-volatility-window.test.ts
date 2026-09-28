@@ -10,6 +10,7 @@ import { fixedClock } from "../clock.js";
 import { RETENTION_V0 } from "../retention.js";
 import { ConstraintViolation, HotWindowNotFound, StoreError, TriggerEventNotFound } from "../errors.js";
 import { NamespaceRepository } from "./namespace.js";
+import { TagRepository } from "./tag.js";
 import { ObservationRepository } from "./observation.js";
 import { PermanentRecordRepository } from "./permanent-record.js";
 import { BaselineRepository, type BaselineState } from "./baseline.js";
@@ -461,8 +462,14 @@ describe("trigger_event", () => {
       status: "candidate", surprise: 1.5,
     });
 
-    // 1. the surprise can be rewritten
-    await sql`update trigger_event set surprise = 99 where trigger_id = ${triggerId}`.execute(db);
+    // 1. the surprise can be rewritten. Wrapped so the day M4 adds the guard this
+    //    fails with a sentence naming R31 rather than with a kysely stack trace --
+    //    measured by review, which installed the guard and got the raw driver error.
+    await expect(
+      sql`update trigger_event set surprise = 99 where trigger_id = ${triggerId}`.execute(db),
+      "R31 has been closed: trigger_event now refuses an UPDATE. Delete this test and " +
+        "gate the table properly.",
+    ).resolves.toBeDefined();
     expect((await triggers.get(triggerId)).surprise).toBe(99);
 
     // 2. and the STATUS can be promoted, with a tier -- the check constraint
@@ -481,12 +488,21 @@ describe("trigger_event", () => {
     // THE CONTROL, which is what makes this a measurement of `trigger_event` and
     // not of the test's own SQL: the same DELETE against `tag` is refused by the
     // append-only guard.
-    const live = await db.selectFrom("tag").select("tag_id").executeTakeFirst();
-    if (live !== undefined) {
-      await expect(
-        sql`delete from tag where tag_id = ${live.tag_id}`.execute(db),
-      ).rejects.toThrow();
-    }
+    //
+    // IT USED TO BE GUARDED BY `if (live !== undefined)` AND NEVER RAN. This file
+    // writes no tag rows, so the select returned undefined and the whole control was
+    // skipped -- measured by review, which asserted `live` defined and watched the
+    // test fail. A control inside a conditional that is never true is not a control;
+    // it is a comment that looks like one. The row is written here so the DELETE
+    // actually happens.
+    const tags = new TagRepository(db, clock);
+    const controlTag = await tags.open({
+      namespaceId: ns, observationId: obs, channel: "volume", aspect: "amount",
+      g0: 0.5, taggedAt: clock.now(),
+    });
+    await expect(
+      sql`delete from tag where tag_id = ${controlTag.tagId}`.execute(db),
+    ).rejects.toThrow(/a tag is never deleted/);
   });
 
   // A tier is the evidence grade of a harm-confirmed trigger and of nothing

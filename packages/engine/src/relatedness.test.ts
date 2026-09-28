@@ -228,6 +228,18 @@ describe("isReason", () => {
   it("admits a tag exactly AT each floor, because both comparisons are >=", () => {
     const atActive = withStrength(intent, policy.activeFloor);
     expect(isReason(atActive, intent, policy)).toBe(true);
+    // A STRENGTH BETWEEN THE TWO FLOORS, which is what makes a swap visible. The
+    // fixture sets `relatednessFloor: 0.2` and inherits `activeFloor: 0.25`, and no
+    // other case sat between them -- so comparing the strength against the WRONG
+    // floor passed every test in the engine. Measured by review, and it is the M2
+    // collision map again: this fixture's own comment claims every number is
+    // distinct "so a swapped term is visible", which was false for this pair.
+    expect(policy.relatednessFloor).toBeLessThan(policy.activeFloor);
+    expect(isReason(withStrength(intent, 0.22), intent, policy)).toBe(false);
+    // And a strength of exactly ZERO is admissible as an input and is not a reason.
+    // `strengthAt` really returns 0 for a live row at about 1100 half-lives, so a
+    // guard that refused 0 would crash a brief on a legitimate tag.
+    expect(isReason(withStrength(intent, 0), intent, policy)).toBe(false);
     const atRelated: BriefPolicy = { ...policy, relatednessFloor: policy.crossChannelAffinity };
     const crossChannel = withStrength(tag("ns-provider", "address_integrity", "transition"), 0.9);
     expect(isReason(crossChannel, intent, atRelated)).toBe(true);

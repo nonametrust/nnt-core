@@ -47,10 +47,19 @@ describe("compositePolicyVersion", () => {
   it("refuses EACH component that carries the separator, by name", () => {
     // One plant per component, because a check that names only the field it was
     // written for is a check three components walk past.
+    // THE REGEX MATCHED THE MESSAGE'S OWN TAIL. The refusal ends with "joined as
+    // retention/tagging/calibration/brief", so `separator.*${component}` found the
+    // component's name in that list for EVERY component -- and review measured the
+    // consequence: hard-coding the message to always say `policyVersion.retention`
+    // passed all six tests in this file. The very principle this test states, that a
+    // check naming only the field it was written for is a check three components
+    // walk past, was what it could not detect.
+    //
+    // The assertion is the literal prefix now, which the ORDER list cannot supply.
     for (const component of ["retention", "tagging", "calibration", "brief"] as const) {
       const bad = { ...shipped, [component]: `${shipped[component]}/v1` };
       expect(() => compositePolicyVersion(bad), component).toThrow(
-        new RegExp(`${component}.*separator|separator.*${component}`),
+        `policyVersion.${component} must not contain`,
       );
     }
   });
@@ -65,8 +74,15 @@ describe("compositePolicyVersion", () => {
   });
 
   it("refuses a padded component, so the composite cannot be split into a padded field", () => {
-    expect(() => compositePolicyVersion({ ...shipped, tagging: " policy-v0" }))
-      .toThrow(/tagging/);
+    // Leading AND trailing, and per component: review found the padded plant was one
+    // component where the separator plant was four, so a check padded-for-tagging-only
+    // would have survived.
+    for (const component of ["retention", "tagging", "calibration", "brief"] as const) {
+      for (const padded of [` ${shipped[component]}`, `${shipped[component]} `]) {
+        expect(() => compositePolicyVersion({ ...shipped, [component]: padded }), padded)
+          .toThrow(`policyVersion.${component} must not be padded`);
+      }
+    }
   });
 
   it("holds the three OTHER packages' shipped versions to the rule today", () => {
