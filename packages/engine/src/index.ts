@@ -10,3 +10,4 @@ export * from "./ids.js";
 export * from "./relatedness.js";
 export * from "./grade.js";
 export * from "./composite-version.js";
+export * from "./compose.js";

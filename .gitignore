@@ -22,3 +22,8 @@ packages/indexer/out/
 packages/indexer/*.txt
 packages/indexer/*.log
 packages/indexer/out*/
+
+# `compose-gate.test.ts` builds a throwaway tree here to hold its symlink rules,
+# outside `src/` so no other gate's scan can see it, and removes it in a
+# `finally`. Ignored so an interrupted run cannot leave a probe in `git status`.
+packages/engine/.compose-gate-probe/
