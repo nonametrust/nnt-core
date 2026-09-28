@@ -9,3 +9,4 @@ export * from "./policy.js";
 export * from "./ids.js";
 export * from "./relatedness.js";
 export * from "./grade.js";
+export * from "./composite-version.js";

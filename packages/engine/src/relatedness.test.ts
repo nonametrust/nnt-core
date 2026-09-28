@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { BRIEF_POLICY_V0, type BriefPolicy } from "./policy.js";
-import { clearsRelatednessFloor, relatedness, relatednessCase, type RelatednessCase } from "./relatedness.js";
+import {
+  clearsRelatednessFloor,
+  isReason,
+  relatedness,
+  relatednessCase,
+  type RelatednessCase,
+} from "./relatedness.js";
 
 // R12: how related a piece of evidence is to the intent being briefed.
 //
@@ -176,5 +182,78 @@ describe("clearsRelatednessFloor", () => {
     expect(relatednessCase(intent, tag("ns-provider", "address_integrity", "transition")))
       .toBe("same_namespace");
     expect(relatednessCase(intent, tag("ns-wallet", "price", "quoted/USDC"))).toBe("unrelated");
+  });
+});
+
+// R39: the predicate that decides BOTH what lowers the threshold and what the
+// brief may cite. Two review lenses converged on this independently.
+describe("isReason", () => {
+  const intent = tag("ns-provider", "price", "quoted/USDC");
+  const withStrength = (t: ReturnType<typeof tag>, strength: number) => ({
+    ...t, tagId: `tag-${strength}`, strength,
+  });
+
+  it("wants BOTH floors, which is design §6:263's conjunction", () => {
+    // "keep those whose relatedness AND decayed strength clear their thresholds".
+    // Related and active: a reason.
+    expect(isReason(withStrength(intent, 0.9), intent, policy)).toBe(true);
+    // Related and NOT active.
+    expect(isReason(withStrength(intent, 0.01), intent, policy)).toBe(false);
+    // Active and NOT related: a different namespace scores zero, which clears no
+    // floor.
+    expect(isReason(withStrength(tag("ns-other", "price", "quoted/USDC"), 0.9), intent, policy))
+      .toBe(false);
+    // Neither.
+    expect(isReason(withStrength(tag("ns-other", "price", "quoted/USDC"), 0.01), intent, policy))
+      .toBe(false);
+  });
+
+  it("closes the unaccounted hold that the two halves apart allowed", () => {
+    // MEASURED BEFORE THIS EXISTED, with a policy `assertBriefPolicy` accepts: at
+    // `relatednessFloor` 0.9 the day-twelve address tag scores 0.55 -- not a reason
+    // -- and is active at its real strength 0.4165, so it lowered 600 to 480 and
+    // `gradeFor(500, 480, 0)` returned `hold` while the unlowered bar gave `clear`.
+    // The tag decided the grade and the brief could not cite it, which `grade.ts`
+    // calls the thing design §6 exists to avoid.
+    //
+    // With one predicate for both jobs the case cannot arise: a tag that does not
+    // clear this test does not lower anything either.
+    const strict: BriefPolicy = { ...BRIEF_POLICY_V0, relatednessFloor: 0.9 };
+    const address = withStrength(tag("ns-provider", "address_integrity", "transition"), 0.4165);
+    expect(isReason(address, intent, strict)).toBe(false);
+    // And under the shipped policy the same tag counts, which is what §9 needs.
+    expect(isReason(address, intent, BRIEF_POLICY_V0)).toBe(true);
+  });
+
+  it("admits a tag exactly AT each floor, because both comparisons are >=", () => {
+    const atActive = withStrength(intent, policy.activeFloor);
+    expect(isReason(atActive, intent, policy)).toBe(true);
+    const atRelated: BriefPolicy = { ...policy, relatednessFloor: policy.crossChannelAffinity };
+    const crossChannel = withStrength(tag("ns-provider", "address_integrity", "transition"), 0.9);
+    expect(isReason(crossChannel, intent, atRelated)).toBe(true);
+  });
+
+  it("refuses a strength that is not a number the comparison can trust", () => {
+    // A NaN strength fails `>=` and would report "not a reason" -- the SOFTEST
+    // answer from the worst input, which is what `holdsAt` and `gradeFor` both
+    // refuse instead.
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -0.1]) {
+      expect(() => isReason(withStrength(intent, bad), intent, policy), `strength ${bad}`)
+        .toThrow(RangeError);
+    }
+  });
+
+  it("is the LOWERING set as well as the citing set, and says so", () => {
+    // R39's whole point. Held as a documented identity rather than as two
+    // functions that might drift: `loweringTags` is `reasons`, so the count that
+    // lowers the threshold is the count `gradeFor` receives.
+    const tags = [
+      withStrength(tag("ns-provider", "price", "quoted/USDC"), 0.9),
+      withStrength(tag("ns-provider", "address_integrity", "transition"), 0.4165),
+      withStrength(tag("ns-provider", "price", "quoted/XLM"), 0.01),
+      withStrength(tag("ns-other", "price", "quoted/USDC"), 0.9),
+    ];
+    const reasons = tags.filter((t) => isReason(t, intent, BRIEF_POLICY_V0));
+    expect(reasons.map((r) => r.strength)).toEqual([0.9, 0.4165]);
   });
 });

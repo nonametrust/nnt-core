@@ -1,4 +1,5 @@
 import { requirePositive, requireUnitInterval } from "@nonametrust/tagging";
+import { VERSION_SEPARATOR } from "./composite-version.js";
 
 /**
  * The brief's numbers, versioned, and the third such value in the tree.
@@ -231,11 +232,11 @@ export interface BriefPolicy {
   readonly maxRetries: number;
 }
 
-/**
- * The separator R26 joins the four policy versions with. Declared here
- * because this module is what refuses a version containing it.
- */
-export const VERSION_SEPARATOR = "/";
+// The separator comes from `composite-version.ts`, which is the module that
+// performs the join. It used to be declared here, and the build caught the
+// duplicate the moment the join existed: `index.ts` promises that each module is
+// the single origin of the names it exports, and two origins for one constant is
+// how the two ends of a format drift apart.
 
 /**
  * v0. Fitted so that BOTH scenarios' assertions hold, and that is the whole

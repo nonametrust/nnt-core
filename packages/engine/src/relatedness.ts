@@ -145,3 +145,61 @@ export function relatedness(a: Related, b: Related, policy: BriefPolicy): number
 export function clearsRelatednessFloor(a: Related, b: Related, policy: BriefPolicy): boolean {
   return relatedness(a, b, policy) >= policy.relatednessFloor;
 }
+
+/**
+ * A tag as the brief compares it: which counterparty and quantity it is about,
+ * its identity, and its DECAYED STRENGTH at the brief's instant.
+ *
+ * The strength is an input rather than something computed here, for the reason
+ * `@nonametrust/tagging` gives: `strengthAt` lives in the store, so a live tag's
+ * decayed strength is handed to the arithmetic and never derived inside it.
+ */
+export interface TagFacts extends Related {
+  tagId: string;
+  /** `strengthAt(tag, at)` from the store, at the brief's own instant. */
+  strength: number;
+}
+
+/**
+ * Whether this tag is a REASON for this intent — and therefore also whether it
+ * LOWERS this intent's threshold. **One predicate for both jobs (R39).**
+ *
+ * DESIGN §6:263 IS A CONJUNCTION and the code did not implement it: "keep those
+ * whose relatedness AND decayed strength clear their thresholds". R3 made
+ * "active" a strength comparison, R12 made "reason" a relatedness comparison,
+ * and nothing tied them — so the two sets could diverge, and two review lenses
+ * converged independently on the same finding.
+ *
+ * MEASURED, with a policy `assertBriefPolicy` accepts (`relatednessFloor: 0.9`):
+ * the day-twelve address tag scores 0.55 and is therefore NOT a reason, while at
+ * its real strength of 0.4165 it IS active — so it lowered 600 to 480 and a
+ * 500-unit intent graded `hold` where the unlowered bar gave `clear`. **The tag
+ * decided the grade and the brief could not cite it**, which `grade.ts` calls the
+ * thing design §6 exists to avoid. The other direction was reachable under the
+ * SHIPPED policy: a same-aspect tag decayed to 0.01 is not active and was still a
+ * reason, so `watch` on evidence that had decayed below the active floor.
+ *
+ * With one predicate the divergence cannot occur: a tag that fails this does not
+ * lower anything either, so a hold caused by a tag always has that tag among its
+ * reasons and the only zero-reason hold is a hold on the amount alone.
+ *
+ * WHAT IT COSTS, recorded where the rule lives: there is no intent-free threshold
+ * once relatedness gates the lowering, so `thresholdFor(namespaceId, at)` cannot
+ * be Task 6's signature — it has to take the intent. Design §6's "the engine
+ * exposes the current threshold as a query" either goes or becomes a second query
+ * no brief uses.
+ *
+ * Both comparisons are `>=`, matching how both floors are declared: "at or
+ * above". A strength that is not a number the comparison can trust is REFUSED
+ * rather than reported as "not a reason" — the softest answer from the worst
+ * input is what `holdsAt` and `gradeFor` both refuse.
+ */
+export function isReason(tag: TagFacts, intent: Related, policy: BriefPolicy): boolean {
+  if (!Number.isFinite(tag.strength) || tag.strength < 0) {
+    throw new RangeError(
+      `tag ${tag.tagId} has a strength that is not a non-negative finite number: ${tag.strength}`,
+    );
+  }
+  if (tag.strength < policy.activeFloor) return false;
+  return clearsRelatednessFloor(intent, tag, policy);
+}

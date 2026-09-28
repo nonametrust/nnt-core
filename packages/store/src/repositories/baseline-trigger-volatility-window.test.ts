@@ -4,7 +4,7 @@ import type { WireObservation } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db } from "../db.js";
 import { withSchema, storedObservation } from "../testing/harness.js";
-import { BaselineStale } from "../errors.js";
+import { BaselineStale, TriggerEventNotFound } from "../errors.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import { RETENTION_V0 } from "../retention.js";
@@ -441,6 +441,52 @@ describe("trigger_event", () => {
       });
       await expect(recorded).rejects.toBeInstanceOf(RangeError);
     });
+  });
+
+
+  // R31, AS A KNOWN HOLE. This test asserts that the hole is OPEN, so the day it
+  // closes something fails and somebody notices.
+  //
+  // `0006` puts no append-only trigger on `trigger_event`, unlike every other
+  // table in this schema. The plan records that as "updatable and deletable from
+  // any raw writer" and leaves it to M4, because the brief only writes this table
+  // and the guard belongs with the milestone that reads it. Review measured that
+  // the hole is WORSE than "updatable": a raw writer can PROMOTE the brief's
+  // candidate into a harm-confirmed, tiered trigger -- which is the status the
+  // whole tiered-evidence vocabulary rests on.
+  it("lets a raw writer promote a candidate to harm_confirmed, which M4 must close", async () => {
+    const triggerId = randomUUID();
+    await triggers.record({
+      triggerId, at: clock.now(), namespaceId: ns, observationId: obs,
+      status: "candidate", surprise: 1.5,
+    });
+
+    // 1. the surprise can be rewritten
+    await sql`update trigger_event set surprise = 99 where trigger_id = ${triggerId}`.execute(db);
+    expect((await triggers.get(triggerId)).surprise).toBe(99);
+
+    // 2. and the STATUS can be promoted, with a tier -- the check constraint
+    //    `trigger_event_tier_needs_harm` permits a tier once the status says
+    //    harm_confirmed, and nothing refuses the update that makes it say so.
+    await sql`update trigger_event set status = 'harm_confirmed', tier = 'A'
+      where trigger_id = ${triggerId}`.execute(db);
+    const promoted = await triggers.get(triggerId);
+    expect(promoted.status).toBe("harm_confirmed");
+    expect(promoted.tier).toBe("A");
+
+    // 3. and the row can be deleted outright
+    await sql`delete from trigger_event where trigger_id = ${triggerId}`.execute(db);
+    await expect(triggers.get(triggerId)).rejects.toBeInstanceOf(TriggerEventNotFound);
+
+    // THE CONTROL, which is what makes this a measurement of `trigger_event` and
+    // not of the test's own SQL: the same DELETE against `tag` is refused by the
+    // append-only guard.
+    const live = await db.selectFrom("tag").select("tag_id").executeTakeFirst();
+    if (live !== undefined) {
+      await expect(
+        sql`delete from tag where tag_id = ${live.tag_id}`.execute(db),
+      ).rejects.toThrow();
+    }
   });
 
   // A tier is the evidence grade of a harm-confirmed trigger and of nothing
