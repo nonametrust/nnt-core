@@ -1,5 +1,21 @@
 # M3 Task 5: what the brief must be built on
 
+> **EXECUTED, 28 September 2026.** Commits `ad5a3fe`..`a9bc1a6`. Counts after:
+> schema 117, tagging 329, indexer 122, store 532, **engine 384**, root gates 64 —
+> the "state Task 5 starts from" block below is therefore pre-execution and is left
+> as it was written.
+>
+> **Four things in this file turned out to be wrong, and the ledger says why:** the
+> `effects` tuple (R51 — it makes R24's inconsistency typecheck), `policies` as four
+> versions (R52 — it needs the objects), "`listLive` needs an upper bound" (R54 — its
+> `since` is a LOWER bound, so the exclusion is engine-side), and the `Reason` shape,
+> which had quietly dropped `evidenceKind` from R13's clear columns. The core also
+> takes a narrow read port rather than repositories (R50).
+>
+> **Read `docs/superpowers/ledgers/2026-09-27-m3-decisions.md` sections "Task 5" and
+> "Task 5's review round" before trusting anything below.** R60 in particular: the
+> lowered threshold underflows to zero and the brief used to throw rather than grade.
+
 > **Why this file exists.** Task 5's text in
 > `docs/superpowers/plans/2026-09-27-m3-sync-path.md` was written before Tasks 1-4
 > ran and before four review rounds. Seventeen rulings the plan does not have (R33-R49)
