@@ -4,7 +4,7 @@ import type { WireObservation } from "@nonametrust/schema";
 import { sql } from "kysely";
 import type { Db } from "../db.js";
 import { withSchema, storedObservation } from "../testing/harness.js";
-import { BaselineStale, TriggerEventNotFound } from "../errors.js";
+import { BaselineStale } from "../errors.js";
 import { keyRingFromEnv } from "../crypto.js";
 import { fixedClock } from "../clock.js";
 import { RETENTION_V0 } from "../retention.js";
