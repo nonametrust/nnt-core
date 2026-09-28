@@ -14,12 +14,22 @@ import { fileURLToPath } from "node:url";
 // tag lowers).
 //
 // So this gate refuses NAMING a floor, which is what R49 asks for and what stops the
-// obvious mistake. What would refuse a lowering set that differs from the reason set
-// is Task 6's own consistency test -- `thresholdFor(...)` and the brief reading one
-// value at one instant -- and that does not exist yet. The brief's own enumeration
-// (`brief.test.ts`, "never produces a hold no reason accounts for") is what holds it
-// today, and it now contains tags that are active and NOT reasons, because a review
-// measured that without them it was blind to exactly this mutant.
+// obvious mistake.
+//
+// WHAT REFUSES A DIVERGENT LOWERING SET IS NOT THE CONSISTENCY TEST, and an earlier
+// version of this header said it was. Task 6's consistency rows compare
+// `thresholdFor` against the brief -- but the brief CALLS the same `countedTags`, so a
+// strength-only lowering placed inside that shared function satisfies them perfectly:
+// both sides are wrong together. Measured by a review, which is how the claim was
+// corrected rather than reasoned.
+//
+// What holds R39 is three things, all value assertions rather than agreements:
+// `brief.test.ts`'s enumeration ("never produces a hold no reason accounts for"),
+// which now contains tags that are active and NOT reasons because without them it was
+// blind to exactly this mutant; `threshold.test.ts`'s intent-scoped rows, which pin
+// WHICH tags lower a threshold under two different floors; and `brief-db.test.ts`'s
+// row under a policy where a seeded tag is active and not a reason, which is the same
+// property on real rows.
 //
 // WHAT IT PROTECTS. R39 rules that one predicate decides both what lowers the
 // threshold and what the brief may cite -- active AND related -- and `isReason`'s

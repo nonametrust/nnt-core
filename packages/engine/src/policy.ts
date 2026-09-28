@@ -104,16 +104,21 @@ export interface BriefPolicy {
    * WHAT IT IS NOT: a measured number. Nothing in the study speaks to how
    * related two pieces of evidence must be before one bears on the other.
    *
-   * Strictly below 1, and that bound is a CORRECTION. It was declared `(0, 1]`
-   * on the argument that a floor of 1 expresses "only same-channel evidence
-   * counts". It does not, twice over: the cross-field rule in
-   * `assertBriefPolicy` requires `crossChannelAffinity >= relatednessFloor`
-   * while the affinity is itself capped below 1, so a floor of 1 is refused
-   * under EVERY affinity — measured at 0.55, at 0.999 and at 1 — and even were
-   * it reachable, a floor of 1 with an affinity of 1 would still make
-   * cross-channel evidence a reason. The effective range was always `(0, 1)`;
-   * it is declared that way now so the refusal names this field rather than
-   * arriving from the pair.
+   * `(0, 1]`, CLOSED at 1, and the history of that bound is worth the lines because
+   * two rulings moved it. It was closed; then declared OPEN, on the measurement that
+   * the cross-field rule `crossChannelAffinity >= relatednessFloor` refused a floor of
+   * 1 under every admissible affinity, so the closed end was unreachable and the
+   * declared interval said otherwise. R36 then RETIRED that cross-field rule, which
+   * made 1 reachable again, and the bound closed for a second time — because "only the
+   * same aspect counts" is a configuration a challenger policy should be able to
+   * choose.
+   *
+   * So the sentence to trust is the code: `requireUnitInterval(..., true)` admits 1,
+   * `policy.test.ts` asserts it does, and Task 6's own threshold rows build a fixture
+   * on a floor of exactly 1. An earlier version of this docstring still described the
+   * open interval and the retired rule that justified it — and the patch that was
+   * supposed to fix it silently matched nothing, which is why it survived one round
+   * longer than the others.
    *
    * WHAT WOULD REPLACE IT: a measured rate of how often same-namespace
    * cross-channel evidence precedes a loss, from the shadow evaluation.

@@ -462,11 +462,49 @@ describe("G14: the threshold query and the brief, on real rows", () => {
   };
 
   it("read ONE value and name the SAME tags, at the brief's instant", async () => {
+    // NAMES THE TAGS, which a review found this row did not. Titled "name the SAME
+    // tags", it asserted only that the two sides agreed -- so it could not tell the
+    // right set from any other set both sides agreed on.
     const { out, q } = await bothWays(AT);
     expect(q.base).toBe(out.threshold.base);
     expect(q.applied).toBe(out.threshold.applied);
     expect(q.loweredBy).toEqual(out.threshold.loweredBy);
-    expect(out.reasons.length, "an empty agreement is not an agreement").toBeGreaterThan(0);
+    expect([...q.loweredBy].sort(), "the expected tags, by name").toEqual(
+      [tags["sameAspect"]!.tagId, tags["sameChannel"]!.tagId, tags["sameNamespace"]!.tagId].sort(),
+    );
+    expect(q.applied).toBe(BRIEF_POLICY_V0.briefThreshold * Math.pow(BRIEF_POLICY_V0.activeTagFactor, 3));
+  });
+
+  it("agree under a policy where a seeded tag is ACTIVE and NOT a reason", async () => {
+    // The fixture shape a review caught: under `BRIEF_POLICY_V0` every seeded tag that
+    // survives R22 and R43 clears `relatednessFloor` (0.3 < 0.55 < 0.75), so the
+    // lowering set equalled the reason set on these rows whether or not the code
+    // enforced R39 -- measured, a mutant lowering by strength alone left all five DB
+    // rows green.
+    //
+    // A floor above `crossAspectAffinity` admits only the same aspect, so two of the
+    // three seeded reasons become active non-reasons on real rows.
+    const strict = { ...BRIEF_POLICY_V0, relatednessFloor: 0.9 };
+    const input = coreInput({ policies: { ...coreInput().policies, brief: strict } });
+    const out = await brief(input, briefDeps(composed, ids()).reads);
+    const q = await thresholdFor(
+      {
+        at: AT,
+        intent: input.intent,
+        observationId: input.observationId,
+        ownTagIds: [],
+        policy: strict,
+        halfLifeMs: input.policies.calibration.halfLifeMs,
+      },
+      { listLive: (namespaceId: string) => composed.tags.listLive(namespaceId) },
+    );
+    expect(q.loweredBy).toEqual([tags["sameAspect"]!.tagId]);
+    expect(q.loweredBy).toEqual(out.threshold.loweredBy);
+    expect(q.applied).toBe(out.threshold.applied);
+    // And strictly fewer than the permissive policy counted, so the floor really moved
+    // something on these rows rather than the fixture being insensitive to it.
+    const permissive = await bothWays(AT);
+    expect(q.loweredBy.length).toBeLessThan(permissive.q.loweredBy.length);
   });
 
   it("agree at a LATER instant, where R43 admits a tag the earlier one excluded", async () => {

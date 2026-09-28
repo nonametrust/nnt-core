@@ -77,10 +77,16 @@ const query = (over: Partial<ThresholdQuery> = {}): ThresholdQuery => ({
 /**
  * The instant at which a tag's decayed strength is EXACTLY the active floor.
  *
- * `g0 × 0.5^(elapsed / halfLife) = floor`, so `elapsed = halfLife × log2(g0/floor)`.
- * Derived rather than hard-coded, because a hard-coded 28 days is only right for
- * `g0 = 1`, `floor = 0.25` and this half-life, and a test that silently stops
- * straddling the floor when a number moves is the fixture-collision failure again.
+ * `strengthAt` is `g0 × 0.5^(elapsed × suppressionFactor / halfLife)`, so at a factor
+ * of 1 the floor is reached at `elapsed = halfLife × log2(g0/floor)`. **The factor is
+ * omitted here and every caller of this helper must pass an unsuppressed tag** -- the
+ * suppression rows below build their own instants, because suppression multiplies
+ * elapsed time and would move this boundary.
+ *
+ * Derived rather than hard-coded, because 28 days is only right for `g0 = 1`,
+ * `floor = 0.25` and this half-life. A review confirmed the straddle survives from a
+ * one-second to a hundred-year half-life, so it cannot silently stop; what announces
+ * a move is the value pin in the gap row.
  */
 const elapsedAtFloor = (g0: number, floor: number): number =>
   HALF_LIFE * Math.log2(g0 / floor);
@@ -168,28 +174,62 @@ describe("thresholdFor", () => {
       expect(out.applied).toBe(1000);
     });
 
-    it("straddles the floor by about 2.4e-10, which is why one millisecond is enough", async () => {
-      // The number the plan quotes, checked rather than trusted. If the half-life ever
-      // moves far enough that a millisecond stops separating the two, this row says so
-      // before the two rows above start passing for the wrong reason.
+    it("straddles the floor by 2.865e-10, and the PLAN's 2.4e-10 is wrong", async () => {
+      // MEASURED, not quoted. The plan says "about 2.4e-10" and an earlier version of
+      // this row repeated it while asserting only `1e-11 < gap < 1e-9` -- a window two
+      // orders of magnitude wide, which passes 2.4e-10, 2.87e-10 and anything from a
+      // 1.4-day to a 400-day half-life. It checked nothing it claimed to check.
+      //
+      // The real value follows from the derivative: one millisecond of decay at the
+      // floor moves the strength by `floor × ln2 / halfLife` = 1.4326e-10, so two
+      // milliseconds apart differ by 2.8652e-10. 2.4e-10 would need a 16.7-day
+      // half-life; this one is 14 days.
       const base = elapsedAtFloor(1, POLICY.activeFloor);
       const above = strengthAt(tag({ tagId: "x", taggedAt: new Date(AT.getTime() - (base - 1)) }), AT, HALF_LIFE);
       const below = strengthAt(tag({ tagId: "y", taggedAt: new Date(AT.getTime() - (base + 1)) }), AT, HALF_LIFE);
+
+      expect(above).toBe(0.25000000014325957);
+      expect(below).toBe(0.2499999998567404);
       const gap = above - below;
-      expect(gap).toBeGreaterThan(0);
-      expect(gap).toBeLessThan(1e-9);
-      expect(gap).toBeGreaterThan(1e-11);
+      expect(gap).toBe(2.8651916950117595e-10);
+      // Pinned against the analytic form too, so a change to the half-life or the floor
+      // announces itself as a disagreement between the two rather than as a number
+      // drifting inside a wide window.
+      //
+      // RELATIVE, to seven significant figures, because the derivative is a FIRST-ORDER
+      // approximation: the true difference carries second-order terms and the two
+      // disagree at the eighteenth decimal. An exact comparison failed, which is how
+      // that was learned rather than assumed.
+      const analytic = (2 * POLICY.activeFloor * Math.LN2) / HALF_LIFE;
+      expect(Math.abs(gap - analytic) / analytic).toBeLessThan(1e-7);
     });
 
-    it("counts a tag AT the floor exactly, because the floor is declared 'at or above'", async () => {
-      // A strength landing exactly on the floor is not reachable by choosing an
-      // elapsed time -- the arithmetic gives a neighbouring double -- so this uses a
-      // `g0` that IS the floor at zero elapsed. That is the `g0 == floor` fixture the
-      // rows above deliberately avoid, used here for the one thing it is right for.
-      const atFloor = tag({ tagId: "exact", g0: POLICY.activeFloor, taggedAt: AT });
+    it("counts a tag AT the floor exactly, reached by real decay", async () => {
+      // An earlier version of this row said a strength landing exactly on the floor
+      // "is not reachable by choosing an elapsed time -- the arithmetic gives a
+      // neighbouring double", and used a `g0` equal to the floor instead. That
+      // sentence is FALSE and a review measured it: at `g0 = 1` and floor 0.25 the
+      // elapsed time is exactly two half-lives, 2,419,200,000 ms, so the exponent is
+      // exactly 2 and `Math.pow(0.5, 2)` is exactly 0.25.
+      //
+      // So the row now does what it claims: real decay landing exactly on the floor,
+      // which counts, because the floor is declared "at or above".
+      const exactElapsed = elapsedAtFloor(1, POLICY.activeFloor);
+      expect(Number.isInteger(exactElapsed), "the elapsed time is not a whole millisecond").toBe(true);
+      const atFloor = tag({ tagId: "exact", g0: 1, taggedAt: new Date(AT.getTime() - exactElapsed) });
       expect(strengthAt(atFloor, AT, HALF_LIFE)).toBe(POLICY.activeFloor);
+
       const out = await thresholdFor(query(), reads([atFloor]));
       expect(out.loweredBy).toEqual(["exact"]);
+    });
+
+    it("counts one at the floor reached with no decay at all, which is the other way there", async () => {
+      // The `g0 == floor` fixture, kept for the one thing it is right for: `strengthAt`
+      // returns `g0` for a non-positive elapsed, so this exercises the comparison
+      // rather than the decay. Both paths to the floor count.
+      const atFloor = tag({ tagId: "fresh", g0: POLICY.activeFloor, taggedAt: AT });
+      expect(strengthAt(atFloor, AT, HALF_LIFE)).toBe(POLICY.activeFloor);
+      expect((await thresholdFor(query(), reads([atFloor]))).loweredBy).toEqual(["fresh"]);
     });
   });
 
@@ -274,6 +314,115 @@ describe("thresholdFor", () => {
       await expect(thresholdFor(query({ halfLifeMs: 0 }), reads([]))).rejects.toThrow(
         /threshold\.halfLifeMs must be a positive finite number/,
       );
+    });
+
+    it("refuses an invalid instant", async () => {
+      // Deleting this check SURVIVED a review's mutation run: no row asked the QUERY
+      // for an invalid `at`, and the brief's row is killed by `assertInput` instead.
+      await expect(thresholdFor(query({ at: new Date("nonsense") }), reads([]))).rejects.toThrow(
+        /threshold\.at must be a valid instant/,
+      );
+    });
+
+    it("refuses a blank observationId, because a blank one turns R22 OFF", async () => {
+      // The finding that made all of these rows exist. With `observationId: ""` the
+      // R22 comparison matches nothing, so the intent's own tag lowers the intent's own
+      // threshold -- measured at 250 where the brief throws. And `""` is exactly what a
+      // caller reaches for when asking Task 9's "a counterparty with no active tag".
+      const own = tag({ tagId: "own", observationId: INTENT_OBS });
+      await expect(thresholdFor(query({ observationId: "" }), reads([own]))).rejects.toThrow(
+        /threshold\.observationId must not be blank/,
+      );
+      for (const bad of [undefined, null, 42]) {
+        await expect(
+          thresholdFor(query({ observationId: bad as unknown as string }), reads([own])),
+          String(bad),
+        ).rejects.toThrow(/threshold\.observationId must be a string/);
+      }
+    });
+
+    it("refuses an ownTagIds that is a STRING, which would filter by character", async () => {
+      // `new Set("own")` is `{o, w, n}`, so a string silently filters by letter and the
+      // tag actually named `own` counts.
+      const own = tag({ tagId: "own" });
+      await expect(
+        thresholdFor(query({ ownTagIds: "own" as unknown as readonly string[] }), reads([own])),
+      ).rejects.toThrow(/threshold\.ownTagIds must be an array/);
+    });
+
+    it("refuses a blank entry inside ownTagIds, naming its index", async () => {
+      await expect(thresholdFor(query({ ownTagIds: ["ok", " "] }), reads([]))).rejects.toThrow(
+        /threshold\.ownTagIds\[1\] must not be blank/,
+      );
+    });
+
+    it("refuses a blank namespace, channel or aspect on the intent, each by name", async () => {
+      for (const field of ["namespaceId", "channel", "aspect"] as const) {
+        await expect(
+          thresholdFor(query({ intent: { ...query().intent, [field]: " " } }), reads([])),
+          field,
+        ).rejects.toThrow(new RegExp(`threshold\\.intent\\.${field} must not be blank`));
+      }
+    });
+
+    it("breaks a tie on the TAG id, on tags that SHARE an observation", async () => {
+      // Two review lenses converged on this independently: the fixture above derives
+      // `observationId` from `tagId`, so a tiebreak on the observation sorts
+      // identically and a mutant using one SURVIVED every row in this file. That is
+      // the collision `countedTags`'s own docstring describes, reintroduced one file
+      // over -- and the commit claimed the tiebreak was held "through both entry
+      // points" when it was held only through the brief.
+      const shared = "one-observation";
+      const first = tag({ tagId: "aaa", observationId: shared });
+      const second = tag({ tagId: "bbb", aspect: "quoted/XLM", observationId: shared });
+      const forward = await thresholdFor(query(), reads([first, second]));
+      const reversed = await thresholdFor(query(), reads([second, first]));
+      expect(forward.loweredBy).toEqual(["aaa", "bbb"]);
+      expect(reversed.loweredBy).toEqual(["aaa", "bbb"]);
+    });
+
+    it("counts a SUPPRESSED tag on its suppressed decay, and reports that strength", async () => {
+      // Every fixture in the engine suite used `suppressionFactor: 1`, so two mutants
+      // survived: dropping suppression from the decay, and multiplying the REPORTED
+      // strength by it after the decision. A suppressed tag is the reason that column
+      // exists. Suppression multiplies ELAPSED time rather than reducing g0, so a
+      // doubly-suppressed tag at half a half-life has decayed a full one.
+      const half = HALF_LIFE / 2;
+      const suppressed = tag({
+        tagId: "suppressed",
+        g0: 1,
+        suppressionFactor: 2,
+        taggedAt: new Date(AT.getTime() - half),
+      });
+      const plain = tag({
+        tagId: "plain",
+        aspect: "quoted/XLM",
+        g0: 1,
+        suppressionFactor: 1,
+        taggedAt: new Date(AT.getTime() - half),
+      });
+      expect(strengthAt(suppressed, AT, HALF_LIFE)).toBeCloseTo(0.5, 12);
+      expect(strengthAt(plain, AT, HALF_LIFE)).toBeCloseTo(Math.SQRT1_2, 12);
+
+      const out = await thresholdFor(query(), reads([suppressed, plain]));
+      // The plain tag is stronger, so R53 puts it first -- which a strength that
+      // ignored suppression would reverse.
+      expect(out.loweredBy).toEqual(["plain", "suppressed"]);
+    });
+
+    it("drops a suppressed tag below the floor that its unsuppressed twin clears", async () => {
+      // The direction that matters: suppression is accelerated decay, so it can move a
+      // tag across `activeFloor`. Under a factor of 4 this tag has decayed four
+      // half-lives where the clock shows one.
+      const elapsed = HALF_LIFE;
+      const hard = tag({ tagId: "hard", suppressionFactor: 4, taggedAt: new Date(AT.getTime() - elapsed) });
+      expect(strengthAt(hard, AT, HALF_LIFE)).toBeCloseTo(0.0625, 12);
+      expect(strengthAt(hard, AT, HALF_LIFE)).toBeLessThan(POLICY.activeFloor);
+      expect((await thresholdFor(query(), reads([hard]))).loweredBy).toEqual([]);
+
+      const soft = tag({ tagId: "soft", suppressionFactor: 1, taggedAt: new Date(AT.getTime() - elapsed) });
+      expect(strengthAt(soft, AT, HALF_LIFE)).toBeGreaterThan(POLICY.activeFloor);
+      expect((await thresholdFor(query(), reads([soft]))).loweredBy).toEqual(["soft"]);
     });
 
     it("orders loweredBy the way the brief orders its reasons (R53)", async () => {
@@ -382,6 +531,36 @@ describe("the query and the brief read ONE value at ONE instant", () => {
       const r = await both(tags);
       expect(r.fromQuery, label).toBe(r.fromBrief);
       expect(r.queryBy, label).toEqual(r.briefBy);
+    }
+  });
+
+  it("agree across every riskTier, amount band and reason count a fixture had missed", async () => {
+    // FIVE MUTANTS SURVIVED here. Every fixture in the engine suite used
+    // `riskTier: "high"`, an amount under 2000, `ownTagIds` of length 0 or 1, and
+    // reason counts of 0-3 (or 161/162). So a brief that dropped a reason only for a
+    // low or medium tier, or only above 5000, and a `thresholdFor` that disagreed only
+    // between 5 and 99 reasons or only when `ownTagIds` had two entries, all passed the
+    // whole suite.
+    //
+    // The consistency rows cannot be "one value by construction" if anything can run
+    // AFTER the shared call, and something always can. This sweeps the dimensions the
+    // survivors used.
+    const many = (n: number): StoredTag[] =>
+      Array.from({ length: n }, (_, i) =>
+        tag({ tagId: `t${String(i).padStart(3, "0")}`, aspect: `quoted/A${i}`, observationId: `o${i}` }),
+      );
+    for (const riskTier of ["low", "medium", "high"] as const) {
+      for (const amount of [0, 100, 5001, 100000]) {
+        for (const count of [0, 1, 5, 7, 40]) {
+          for (const ownTagIds of [[], ["t000"], ["t000", "t001"]]) {
+            const tags = many(count);
+            const r = await both(tags, { riskTier, amount, ownTagIds });
+            const label = `${riskTier} amount ${amount} count ${count} own ${ownTagIds.length}`;
+            expect(r.fromQuery, label).toBe(r.fromBrief);
+            expect(r.queryBy, label).toEqual(r.briefBy);
+          }
+        }
+      }
     }
   });
 

@@ -7,9 +7,12 @@ import { isReason, type Related } from "./relatedness.js";
  *
  * Narrower than `BriefReads` on purpose. A threshold is a count of reasons, and a
  * count needs no `readClear` — that call exists to give a REASON its dated instant
- * and its source code, which a threshold does not report. So the query costs one
- * round trip where the brief costs one plus one per reason, and the difference is
- * visible in the type rather than in a comment.
+ * and its source code, which a threshold does not report.
+ *
+ * So the query costs ONE round trip where the brief costs TWO plus one per reason:
+ * `readClear(intent)` for R14's liveness check, `listLive`, then one `readClear` per
+ * reason. An earlier version of this sentence said "one plus one per reason" and
+ * forgot the R14 read, which `brief.test.ts` pins the order of.
  */
 export interface ThresholdReads {
   listLive(namespaceId: string): Promise<readonly StoredTag[]>;
@@ -32,6 +35,14 @@ export interface ThresholdReads {
  * It takes `policy` and `halfLifeMs` rather than all four policies, because those
  * are what a threshold reads: the other two contribute only their versions, and a
  * version belongs to the audit body rather than to this arithmetic.
+ *
+ * THE RESIDUAL RISK, STATED because the query cannot close it. The brief refuses an
+ * `intent.namespaceId` that is not its observation's, by reading the observation's
+ * clear row; `ThresholdReads` deliberately has no `readClear`, so this function
+ * answers about whichever namespace it is handed. A caller that names one namespace
+ * and one observation belonging to another gets a truthful answer to the wrong
+ * question. The brief is the path that checks; this is the same class of risk R40
+ * records for a fabricated aspect.
  */
 export interface ThresholdQuery {
   readonly at: Date;
@@ -91,6 +102,13 @@ export function loweredThreshold(policy: BriefPolicy, reasonCount: number): numb
   return policy.briefThreshold * Math.pow(policy.activeTagFactor, reasonCount);
 }
 
+function requireNonBlank(field: string, value: unknown): void {
+  if (typeof value !== "string") {
+    throw new RangeError(`threshold.${field} must be a string, got ${typeof value}`);
+  }
+  if (value.trim().length === 0) throw new RangeError(`threshold.${field} must not be blank`);
+}
+
 /**
  * The tags that count, in the order R53 fixes.
  *
@@ -104,6 +122,20 @@ export async function countedTags(
   query: ThresholdQuery,
   reads: ThresholdReads,
 ): Promise<readonly CountedTag[]> {
+  // EVERY FIELD, BY NAME, and this is a review finding rather than symmetry for its
+  // own sake. An earlier version refused only the policy, the half-life and `at`, so
+  // the exported query -- which Task 9 calls directly -- accepted the rest silently,
+  // and two of the silences turned a ruling off:
+  //
+  //   `observationId: ""`  -> R22's exclusion matches nothing, so the intent's OWN
+  //                           tag lowers the intent's own threshold. Measured: 250
+  //                           where the brief throws. And `""` is exactly what a
+  //                           caller passes for Task 9's "counterparty with no
+  //                           active tag" query.
+  //   `ownTagIds: "own"`   -> `new Set("own")` is `{o, w, n}`, so a string filters by
+  //                           CHARACTER and the tag named `own` counts.
+  //   blank intent strings -> relatedness computed against a blank channel or aspect,
+  //                           or a threshold for a namespace that is not one.
   assertBriefPolicy(query.policy);
   if (!Number.isFinite(query.halfLifeMs) || query.halfLifeMs <= 0) {
     throw new RangeError(
@@ -113,6 +145,17 @@ export async function countedTags(
   if (!(query.at instanceof Date) || Number.isNaN(query.at.getTime())) {
     throw new RangeError(`threshold.at must be a valid instant, got ${String(query.at)}`);
   }
+  requireNonBlank("observationId", query.observationId);
+  requireNonBlank("intent.namespaceId", query.intent.namespaceId);
+  requireNonBlank("intent.channel", query.intent.channel);
+  requireNonBlank("intent.aspect", query.intent.aspect);
+  if (!Array.isArray(query.ownTagIds)) {
+    throw new RangeError(
+      `threshold.ownTagIds must be an array, got ${typeof query.ownTagIds}: a string would ` +
+        `filter by character, because a Set of one is a Set of its letters`,
+    );
+  }
+  query.ownTagIds.forEach((id, i) => requireNonBlank(`ownTagIds[${i}]`, id));
 
   const own = new Set(query.ownTagIds);
   const live = await reads.listLive(query.intent.namespaceId);

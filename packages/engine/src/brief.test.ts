@@ -160,6 +160,37 @@ describe("brief", () => {
       ).rejects.toThrow(/briefPolicy\.activeTagFactor must lie in/);
     });
 
+    it("a policy UP FRONT, before any read, which is what assertInput exists for", async () => {
+      // Deleting `assertBriefPolicy` from `assertInput` SURVIVED a review's mutation
+      // run, because `countedTags` re-asserts it -- so the brief's two policy rows were
+      // being killed by the OTHER module's check. The property the docstring claims is
+      // not "it throws" but "it throws BEFORE anything is read", and with the check
+      // deleted a bad factor is discovered only after `readClear` has already run.
+      //
+      // The port counts, so the ordering is observed rather than argued.
+      const port = reads([tag({ tagId: "t1", aspect: "quoted/USDC" })]);
+      await expect(
+        brief(input({ policies: { ...input().policies, brief: { ...POLICY, activeTagFactor: 1 } } }), port),
+      ).rejects.toThrow(/briefPolicy\.activeTagFactor must lie in/);
+      expect(port.calls, "the brief read something before refusing its policy").toEqual([]);
+    });
+
+    it("every one of the four policies up front, before any read", async () => {
+      // The same property for the other three, since `assertInput` refuses each by its
+      // own package's predicate and nothing observed that any of them ran early.
+      const base = input().policies;
+      const cases: [string, BriefInput["policies"], RegExp][] = [
+        ["brief", { ...base, brief: { ...POLICY, briefThreshold: 0 } }, /briefPolicy\.briefThreshold/],
+        ["calibration", { ...base, calibration: { ...CALIBRATION_V0, halfLifeMs: 0 } }, /calibration\.halfLifeMs/],
+        ["retention", { ...base, retention: { ...RETENTION_V0, graceDays: -1 } }, /graceDays/],
+      ];
+      for (const [label, policies, message] of cases) {
+        const port = reads([tag({ tagId: "t1", aspect: "quoted/USDC" })]);
+        await expect(brief(input({ policies }), port), label).rejects.toThrow(message);
+        expect(port.calls, `${label} was refused only after a read`).toEqual([]);
+      }
+    });
+
     it("a surprise that is neither null nor a finite number", async () => {
       await expect(brief(input({ surprise: Number.NaN }), reads([]))).rejects.toThrow(
         /brief\.surprise must be null or a finite number/,

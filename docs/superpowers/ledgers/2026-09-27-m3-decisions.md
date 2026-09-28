@@ -1598,3 +1598,106 @@ excludes it. It has to be taken live, with the clock advanced through the corpus
 mattered: a `thresholdFor` lowering by a bare literal, by a computed property name, or
 by no floor at all would pass the gate. What refuses those is the consistency rows
 above, which is why they compare `loweredBy` and not only the number.
+
+### Task 6's review round, and the claim of mine it refuted
+
+Two lenses at `8e0d76e` — a correctness/completeness reviewer and a mutation auditor
+whose brief was to disbelieve this branch. 74 mutants between them. The review was
+owed and I had skipped it, having announced I was moving to Task 7; Kerem asked
+whether Task 6 had been reviewed, which is the only reason it was.
+
+**R63's closing claim is FALSE, and it is the most important thing this round found.**
+It said a `thresholdFor` lowering by a bare literal "would pass the [floors] gate" and
+that "what refuses those is the consistency rows above". The first half is right. The
+second is wrong, and wrong for a reason that follows from R63 itself: **once the brief
+CALLS `countedTags`, every consistency assertion compares a function's output with
+itself.** A strength-only lowering placed inside the shared function satisfies them
+perfectly — measured, it left all five DB rows and the whole consistency block green
+except one row that happened to pin a value.
+
+So the sharing that made the code stronger made that test weaker, and the ledger
+claimed the opposite. What actually holds R39 is three VALUE assertions, not
+agreements: `brief.test.ts`'s enumeration, `threshold.test.ts`'s intent-scoped rows,
+and — added this round — a `brief-db.test.ts` row under a policy where a seeded tag is
+active and NOT a reason. Under `BRIEF_POLICY_V0` every seeded tag that survives R22 and
+R43 clears `relatednessFloor`, so the DB rows had been vacuous for R39 in exactly the
+fixture shape the enumeration's own comment warns about.
+
+The consistency rows still earn their place: they hold the brief's PLUMBING into
+`countedTags`, and a re-inlined query that has drifted. A faithful re-inlining survives
+them, which is recorded rather than fixed — it is equivalent code until it drifts.
+
+### Eleven more rules that were stated and held by nothing
+
+- **`thresholdFor` validated almost nothing**, and two of the silences turned a ruling
+  off. `observationId: ""` makes R22's comparison match nothing, so the intent's OWN
+  tag lowers the intent's own threshold — measured at 250 where the brief throws. And
+  `""` is exactly what a caller reaches for when asking Task 9's "a counterparty with no
+  active tag". `ownTagIds: "own"` is worse than useless: `new Set("own")` is
+  `{o, w, n}`, so a string filters by CHARACTER and the tag actually named `own` counts.
+  Blank intent strings gave relatedness against a blank, or a threshold for a namespace
+  that is not one. All refused by name now.
+- **The query's `at` validity check** was held by nothing: no row asked the QUERY for an
+  invalid instant, and the brief's row is killed by `assertInput`.
+- **The brief's own up-front policy refusal** was held by nothing. Deleting
+  `assertBriefPolicy` from `assertInput` survived, because `countedTags` re-asserts it —
+  so the brief's two policy rows were being killed by the OTHER module's check. And the
+  property the docstring claims is not "it throws" but "it throws BEFORE anything is
+  read"; with the check gone, a bad factor is discovered after `readClear` has run.
+  Held now by a port that counts, for all four policies.
+- **Suppression was invisible to the entire engine suite.** Every fixture used
+  `suppressionFactor: 1`, so two mutants survived: dropping suppression from the decay,
+  and multiplying the REPORTED strength by it after the decision. A suppressed tag is
+  the reason that column exists, and suppression is accelerated decay, so it can move a
+  tag across `activeFloor` — which is now a row.
+- **The seam could diverge for inputs no fixture used.** Five survivors: a brief that
+  drops a reason only for a `low` or `medium` tier, only above 5000, and a
+  `thresholdFor` that disagrees only between 5 and 99 reasons or only when `ownTagIds`
+  has two entries. Every fixture in the engine used `riskTier: "high"`, amounts under
+  2000, reason counts 0-3, and `ownTagIds` of length 0 or 1. **"They cannot disagree by
+  construction" is only true while nothing runs after the shared call, and something
+  always can.** Swept now across all four dimensions.
+- **R53's tiebreak was blind in `threshold.test.ts`**, whose fixture derives
+  `observationId` from `tagId` — the bijection collision `countedTags`'s own docstring
+  describes, reintroduced one file over. Both lenses found it independently. The commit
+  claimed the tiebreak was held "through both entry points"; it was held only through
+  the brief.
+
+### Three numbers and two sentences of mine that were wrong
+
+- **"about 2.4e-10" is 2.865e-10.** The number came from the plan, and I copied it into
+  a test title, the commit message and this ledger without measuring it. Worse, the row
+  that claimed to check it asserted `1e-11 < gap < 1e-9` — a window two orders of
+  magnitude wide that passes anything from a 1.4-day to a 400-day half-life. Both
+  strengths are pinned to their exact doubles now, and the gap is pinned against
+  `floor × ln2 / halfLife` to seven significant figures — RELATIVE, because the
+  derivative is a first-order approximation and an exact comparison failed at the
+  eighteenth decimal, which is how that was learned.
+- **"A strength landing exactly on the floor is not reachable by choosing an elapsed
+  time" is false.** At `g0 = 1` and floor 0.25 the elapsed time is exactly two
+  half-lives — 2,419,200,000 ms — so the exponent is exactly 2 and `Math.pow(0.5, 2)`
+  is exactly 0.25. The row now reaches the floor by real decay, and keeps the
+  `g0 == floor` fixture as a second row for the other path there.
+- **"Using the undecayed `g0` kills the one-millisecond-below row and nothing else"**
+  kills four rows across two files. True of `threshold.test.ts` alone.
+- **G14's third planted violation** per §5 is "the unit check removed", and my commit
+  message listed a different third. The plan's plant IS gated: removing it turns four
+  rows red, including Task 6's own "does not need the unit".
+- **R62's "neither is implementable" overclaims.** An intent-free query returning one
+  NUMBER is impossible; one returning a TABLE keyed by reading is not, and would be a
+  pure function of the same rows. What makes even that intent-dependent is R22/R41 —
+  the exclusion of the intent's own observation and tags — which R62 did not cite and
+  which is the stronger argument for the signature. The signature stands; the argument
+  is corrected.
+
+### A process failure worth more than one of the findings
+
+The `relatednessFloor` docstring fix from the previous round **silently did nothing**:
+the patch matched on `--` where the file had an em dash, and the script called
+`.replace()` with no assertion, so it no-op'd and I reported it as fixed. Four of the
+five fixes in that batch landed; this one did not, and a reviewer found the sentence
+still standing a round later.
+
+Every text patch from here asserts its match and exits non-zero when it fails to find
+it. A silent no-op in a docs patch is indistinguishable from a lie in the commit
+message that reports it.
