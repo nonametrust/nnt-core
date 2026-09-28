@@ -22,7 +22,7 @@ const REASON = {
   tagId: "e3a1c6de-0000-4000-8000-000000000001",
   observationId: "e3a1c6de-0000-4000-8000-000000000002",
   relatednessCase: "same_channel" as const,
-  source: "SOURCE_PRESENT" as const,
+  sourceCode: "SOURCE_PRESENT" as const,
   datedAt: "2026-09-12T00:00:00.000Z",
   strength: 0.4165,
   relatedness: 0.75,
@@ -63,7 +63,7 @@ describe("the audit body", () => {
     expect(() =>
       assertAuditBody({
         ...BODY,
-        reasons: [{ ...REASON, source: "SOURCE_UNREADABLE", datedAt: null }],
+        reasons: [{ ...REASON, sourceCode: "SOURCE_UNREADABLE", datedAt: null }],
       }),
     ).not.toThrow();
   });
@@ -79,7 +79,7 @@ describe("the audit body", () => {
       );
     });
 
-    it("at the top level, named `source`", () => {
+    it("at the top level, named `source` -- the WIRE source's name, which no body may carry", () => {
       expect(() => assertAuditBody(plus({ source: "wire" }))).toThrow(
         /auditBody\.source is not admitted/,
       );
@@ -195,8 +195,10 @@ describe("the audit body", () => {
     });
 
     it("a source code outside the two R47 names", () => {
-      expect(() => assertAuditBody(plus({ reasons: [{ ...REASON, source: "SOURCE_MAYBE" }] }))).toThrow(
-        /auditBody\.reasons\[\]\.source must be one of SOURCE_PRESENT, SOURCE_UNREADABLE/,
+      expect(() =>
+        assertAuditBody(plus({ reasons: [{ ...REASON, sourceCode: "SOURCE_MAYBE" }] })),
+      ).toThrow(
+        /auditBody\.reasons\[\]\.sourceCode must be one of SOURCE_PRESENT, SOURCE_UNREADABLE/,
       );
     });
 

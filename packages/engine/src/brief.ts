@@ -449,7 +449,7 @@ export async function brief(input: BriefInput, reads: BriefReads): Promise<Brief
     tagId: r.tagId,
     observationId: r.observationId,
     relatednessCase: r.relatednessCase,
-    source: r.source.code,
+    sourceCode: r.source.code,
     datedAt: iso(`reasons[${r.tagId}].datedAt`, r.datedAt),
     strength: r.strength,
     relatedness: r.relatedness,

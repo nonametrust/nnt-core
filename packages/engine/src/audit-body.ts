@@ -40,7 +40,19 @@ export interface BriefAuditReason {
   /** The tag's OPENING observation, R30. */
   readonly observationId: string;
   readonly relatednessCase: RelatednessCase;
-  readonly source: SourceCode;
+  /**
+   * NAMED `sourceCode` AND NOT `source`, which is not fussiness. In this system's
+   * vocabulary a `source` is the WIRE source -- `{producer, producerVersion, network,
+   * ref, fetchedAt}` -- and G13's acceptance forbids a key of that name in an audit
+   * body by name, for the same reason R25 does: the chain outlives every key, so a row
+   * whose `source` is not the wire source is a row that misleads whoever reads it in
+   * five years.
+   *
+   * Caught by reading an audit row BACK out of the database and looking at the keys the
+   * chain really hashed. The walk before the append could not see it, because the walk
+   * checks paths against a whitelist that contained the wrong name.
+   */
+  readonly sourceCode: SourceCode;
   /** `null` for a state, R19. An ISO instant otherwise. */
   readonly datedAt: string | null;
   /** R48's named number: the decayed strength this decision used. */
@@ -178,7 +190,7 @@ export const ADMITTED_PATHS: ReadonlySet<string> = new Set([
   "reasons[].tagId",
   "reasons[].observationId",
   "reasons[].relatednessCase",
-  "reasons[].source",
+  "reasons[].sourceCode",
   "reasons[].datedAt",
   "reasons[].strength",
   "reasons[].relatedness",
@@ -297,13 +309,13 @@ export function assertAuditBody(body: BriefAuditBody): void {
     // The path is written without an index on purpose: it is the path the
     // whitelist names, and a reader chasing a refusal should be handed the same
     // string in both messages.
-    for (const key of ["tagId", "observationId", "relatednessCase", "source", "datedAt", "strength", "relatedness"] as const) {
+    for (const key of ["tagId", "observationId", "relatednessCase", "sourceCode", "datedAt", "strength", "relatedness"] as const) {
       requirePresent(`reasons[].${key}`, reason, key);
     }
     requireId("reasons[].tagId", reason.tagId, false);
     requireId("reasons[].observationId", reason.observationId, false);
     requireOneOf("reasons[].relatednessCase", reason.relatednessCase, RELATEDNESS_CASES);
-    requireOneOf("reasons[].source", reason.source, SOURCE_CODES);
+    requireOneOf("reasons[].sourceCode", reason.sourceCode, SOURCE_CODES);
     requireAt("reasons[].datedAt", reason.datedAt, true);
     requireFiniteNumber("reasons[].strength", reason.strength);
     requireFiniteNumber("reasons[].relatedness", reason.relatedness);

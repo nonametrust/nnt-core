@@ -13,6 +13,7 @@ import {
   type FixedClock,
   type StoredTag,
 } from "@nonametrust/store";
+import { ADMITTED_PATHS } from "./audit-body.js";
 import { compose, type Composed } from "./compose.js";
 import { brief, type BriefInput } from "./brief.js";
 import { briefDeps, runBrief, type BriefRequest } from "./run-brief.js";
@@ -331,6 +332,52 @@ describe("G9: the core writes nothing", () => {
       briefDeps(composed, ids()).reads,
     );
     expect(await rowVersions()).toBe(before);
+  });
+});
+
+describe("G13: the audit row as the chain really stored it", () => {
+  it("carries no forbidden key in its RENDERED canonical JSON", async () => {
+    // G13 as the plan words it: "asserted over the rendered canonical JSON". R48
+    // replaced the regex with a path WALK for a measured reason -- a string value
+    // containing `":` fools a regex -- but the walk runs in the engine BEFORE the
+    // append, so it cannot see what the chain actually hashed. This reads the row
+    // back.
+    //
+    // It also closes, for the brief path, the one limit the walk has: a `toJSON` on
+    // the body or its prototype renders something the walker never saw. `brief()`
+    // builds its body from literals so none exists, and this is where that would show.
+    const out = await runBrief(briefDeps(composed, ids()), request({ surprise: 2.5 }));
+    const stored = await composed.audit.head();
+    expect(stored, "the chain has no head, so nothing was appended").not.toBeNull();
+    expect(stored!.kind).toBe("brief");
+
+    const canonical = stored!.canonical;
+    // Keys, not substrings: a unit or a producer may legitimately contain any text,
+    // which is why R48 refused the regex in the first place.
+    const keys = [...canonical.matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"\s*:/g)].map((m) => m[1]!);
+    for (const forbidden of ["payload", "source", "ref", "sourceRef", "evidence", "ciphertext"]) {
+      expect(keys, `${forbidden} reached the chain`).not.toContain(forbidden);
+    }
+    // And every key it DOES carry is one the whitelist admits, at some path.
+    const admitted = new Set(
+      [...ADMITTED_PATHS].flatMap((path) => path.split(".").map((seg) => seg.replace("[]", ""))),
+    );
+    for (const key of keys) {
+      if (["occurredAt", "policyVersion", "kind", "body"].includes(key)) continue;
+      expect(admitted.has(key), `the chain carries a key nobody admitted: ${key}`).toBe(true);
+    }
+    // The row describes the brief it came from.
+    expect(canonical).toContain(out.effects.audit.policyVersion);
+  });
+
+  it("stamps its OWN occurredAt, which is why the body carries `at` itself", async () => {
+    // `AuditChain.append` takes no instant, so the brief's own `at` has to travel in
+    // the body. Under this fixed clock the two are equal; in production `occurredAt`
+    // trails `at` by milliseconds, so the property outside a test is `at <= occurredAt`.
+    const out = await runBrief(briefDeps(composed, ids()), request());
+    const stored = await composed.audit.head();
+    const bodyAt = (out.effects.audit.body as { at: string }).at;
+    expect(stored!.occurredAt.getTime()).toBeGreaterThanOrEqual(Date.parse(bodyAt));
   });
 });
 

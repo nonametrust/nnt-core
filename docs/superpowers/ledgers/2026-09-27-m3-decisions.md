@@ -1481,3 +1481,31 @@ is by identity.
 - **An invalid `taggedAt` from the store was refused without naming the tag**, by
   `strengthAt`'s own bare message -- and the R43 exclusion could not catch it either,
   because `NaN > x` is false. Named now, like the `dated_at` guard beside it.
+
+### R61. G13 is asserted over the audit row READ BACK, and it found a key named `source`
+
+The plan words G13 as "the audit body contains no key named `payload` or `source`,
+asserted over the rendered canonical JSON". R48 replaced the regex with a path walk for
+a measured reason — a string value containing `":` fools a regex — and that walk runs in
+the ENGINE, before the append. So nothing looked at what the chain actually hashed.
+
+Added: a row that runs a real `runBrief`, reads the head entry back with
+`AuditChain.head()`, extracts the KEYS from its stored `canonical` string, and refuses
+the forbidden names plus any key the whitelist does not admit.
+
+**It failed on the first run, on a key named `source`** — `BriefAuditReason.source`,
+carrying the R47 code. The field is now `sourceCode`, and the rename is not fussiness:
+in this system's vocabulary a `source` is the WIRE source, `{producer, producerVersion,
+network, ref, fetchedAt}`, which is exactly what G13 names as forbidden and what R25
+keeps out of a row that outlives every key. **A permanent row whose `source` is not the
+wire source misleads whoever reads it in five years**, and the audit table is the one
+place that reader cannot be corrected.
+
+The walk could not have caught this, because the walk compares against a whitelist that
+contained the wrong name. Only reading the row back could. Verified by smuggling a `ref`
+into every audit reason and admitting it in the whitelist: the read-back row goes red
+where every engine-side check passes.
+
+It also closes, for the brief path, the one limit the walk has: a `toJSON` on the body
+or its prototype renders something the walker never saw. `brief()` builds its body from
+literals, and this is where that would now show.
