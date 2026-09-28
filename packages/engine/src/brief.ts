@@ -362,7 +362,37 @@ export async function brief(input: BriefInput, reads: BriefReads): Promise<Brief
   // currency while a factor does not.
   const base = policy.briefThreshold;
   const applied = base * Math.pow(policy.activeTagFactor, reasons.length);
-  const grade = gradeFor({ amount: input.amount, threshold: applied, reasonCount: reasons.length });
+  // THE LOWERED THRESHOLD CAN UNDERFLOW TO EXACTLY ZERO, and `gradeFor` refuses a
+  // non-positive threshold. Found by measurement rather than by reading: timing the
+  // real brief at 200 reasons showed a threshold of 2.5e-17, and following that to
+  // its end gives the counts at which `base × factor^k` stops being a positive
+  // double. At a base of 600: factor 0.8 underflows at 3340 reasons, 0.5 at 1075,
+  // and 0.01 -- which `assertBriefPolicy` accepts -- at 162.
+  //
+  // 162 is reachable, and the consequence was the worst available one: **the
+  // counterparty with the most evidence got no decision at all**, a RangeError out
+  // of the grade arithmetic, which is not a grade and is not R7's unavailability
+  // either.
+  //
+  // `hold` IS THE SAME RULE AT ITS LIMIT, not a new one. `gradeFor` holds when
+  // `amount >= threshold`, and with a threshold of zero that is true of every
+  // admissible amount including zero. So the grade moves clear -> watch -> hold as
+  // reasons accumulate and never back, which is exactly the monotonicity `gradeFor`
+  // promises -- and which a throw broke precisely at the boundary.
+  //
+  // FIXED HERE AND NOT IN `gradeFor`, deliberately. This is the one caller that
+  // computed the number itself and therefore knows the case is an arithmetic limit
+  // rather than a garbage input; `gradeFor`'s refusal is what protects it from a NaN
+  // handed in by anyone else, and weakening it would trade a named defect for an
+  // unnamed one. A test asserts that refusal still stands.
+  //
+  // The collapsed threshold is REPORTED as the zero it is, in the output and in the
+  // audit body, rather than replaced by a substituted number -- which would be an
+  // uncalibrated value R5 would have to declare.
+  const grade =
+    applied > 0
+      ? gradeFor({ amount: input.amount, threshold: applied, reasonCount: reasons.length })
+      : "hold";
 
   const trigger: RecordTriggerEvent | null =
     input.surprise === null

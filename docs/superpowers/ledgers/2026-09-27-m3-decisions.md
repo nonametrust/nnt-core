@@ -1290,3 +1290,55 @@ three days.
   have to rediscover that it owns it.
 - **The three outward-facing sentences (R33, R46, R47) are still owed to the
   README.**
+
+### R60. The lowered threshold UNDERFLOWS, and the brief graded nothing when it did
+
+**Found by the latency measurement §7 asked for, not by reading the code.** Timing
+the real brief at 200 reasons reported a threshold of 2.5e-17, which is the
+multiplicative lowering doing exactly what it is supposed to do, far enough to be
+worth following. `base × factor^k` stops being a positive double at, for a base of
+600: **3340 reasons at factor 0.8, 1075 at 0.5, and 162 at 0.01** — and
+`assertBriefPolicy` accepts 0.01.
+
+`gradeFor` refuses a non-positive threshold, so at 162 reasons under an admissible
+policy the brief threw `grade threshold must be a positive finite number, got 0`.
+**The counterparty with the most evidence got no decision at all.** A RangeError out
+of the grade arithmetic is not a grade, and it is not R7's unavailability either; it
+is the worst available answer for the one case a brief matters most for. Measured
+through the real core at 161 (graded, threshold 5.9e-320) and 162 (threw).
+
+**Ruled: a collapsed threshold grades `hold`.** That is the SAME rule at its limit
+rather than a new one: `gradeFor` holds when `amount >= threshold`, and with a
+threshold of zero that is true of every admissible amount, zero included. So the
+grade still moves clear -> watch -> hold as reasons accumulate and never back, which
+is the monotonicity `gradeFor` promises and which the throw broke precisely at the
+boundary. Held by a row that grades a zero amount `watch` at 161 reasons and `hold`
+at 162.
+
+**Fixed in the brief and NOT in `gradeFor`.** The brief is the one caller that
+computed the number itself and therefore knows the case is an arithmetic limit
+rather than a garbage input; `gradeFor`'s refusal is what protects it from a NaN
+handed in by anyone else. A test asserts that refusal still stands, because trading
+a named defect for an unnamed one is not a fix.
+
+**The zero is REPORTED, in the output and in the audit body, not replaced.** A
+substituted floor would be an uncalibrated number R5 would have to declare, and a
+mutant that clamps to `Number.MIN_VALUE` instead is killed — so the tests pin the
+honest zero rather than merely "does not throw".
+
+**What this does NOT close**, and `mediumCeiling`'s own comment already said so:
+nothing in M3 bounds the number of active tags, so no rule over `briefThreshold`
+and `mediumCeiling` can keep a heavily-tagged counterparty from being treated more
+permissively when a store is unavailable. That needs a floor under the lowered
+threshold, which is a number nobody has measured.
+
+### The latency §7 asked for, measured
+
+The real brief, 200 reasons, one `readClear` per reason plus one for the intent,
+against the local Postgres: **median 32.5 ms**, min 28.6, max 180.8 over twelve
+runs after a warm-up. The one-to-two-second budget is roughly thirty to sixty times
+away, and the earlier review measurement stands: round trips dominate, not AEAD.
+
+So **§7's cap question stays dissolved and `maxReasons` is still not needed.** What
+the measurement did produce is R60, which is the real cost of an unbounded reason
+count — not latency but arithmetic.

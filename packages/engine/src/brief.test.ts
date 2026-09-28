@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { CALIBRATION_V0, POLICY_V0 } from "@nonametrust/tagging";
 import { RETENTION_V0, type ClearObservation, type StoredTag } from "@nonametrust/store";
 import { BRIEF_POLICY_V0, type BriefPolicy } from "./policy.js";
+import { gradeFor } from "./grade.js";
 import { brief, type BriefInput, type BriefReads } from "./brief.js";
 
 // Task 5's core: R1, R8, R13, R18, R19, R22, R25, R27, R29, R30, R39-R45.
@@ -579,6 +580,83 @@ describe("brief", () => {
       expect(body.reasons.map((r) => r.tagId)).toEqual(["a", "b"]);
       expect(body.threshold).toEqual({ base: 1000, applied: 250 });
       expect(body.reasons[0]!.strength).toBe(out.reasons[0]!.strength);
+    });
+  });
+
+  describe("a threshold the lowering has collapsed to zero", () => {
+    // FOUND BY MEASUREMENT, not by reading. Timing the real brief at 200 reasons
+    // showed a threshold of 2.5e-17, and following that to its end: the lowered
+    // threshold is `base × factor^k`, so it UNDERFLOWS to exactly 0, and `gradeFor`
+    // refuses a non-positive threshold. Measured counts, under a base of 600:
+    // factor 0.8 underflows at 3340 reasons, 0.5 at 1075, and 0.01 -- which
+    // `assertBriefPolicy` accepts -- at 162.
+    //
+    // 162 is reachable. The consequence was that **the counterparty with the most
+    // evidence got no decision at all**: a RangeError out of the grade arithmetic,
+    // which is not a grade, is not R7's unavailability, and is the worst possible
+    // answer for the one case a brief matters most for.
+    const collapsing = { ...POLICY, activeTagFactor: 0.01 };
+    const manyTags = (n: number): StoredTag[] =>
+      Array.from({ length: n }, (_, i) =>
+        tag({ tagId: `t${String(i).padStart(4, "0")}`, aspect: "quoted/USDC", observationId: `o${i}` }),
+      );
+    const collapsingInput = (over: Partial<BriefInput> = {}): BriefInput =>
+      input({ policies: { ...input().policies, brief: collapsing }, ...over });
+
+    it("still grades one reason BEFORE the underflow, at the smallest positive threshold", async () => {
+      const out = await brief(collapsingInput(), reads(manyTags(161)));
+      expect(out.reasons).toHaveLength(161);
+      expect(out.threshold.applied).toBeGreaterThan(0);
+      expect(out.threshold.applied).toBeLessThan(1e-300);
+      expect(out.grade).toBe("hold");
+    });
+
+    it("grades HOLD rather than throwing once it underflows", async () => {
+      const out = await brief(collapsingInput(), reads(manyTags(162)));
+      expect(out.threshold.applied).toBe(0);
+      expect(out.grade).toBe("hold");
+    });
+
+    it("still cites every reason, so the collapsed threshold has an account of itself", async () => {
+      const out = await brief(collapsingInput(), reads(manyTags(162)));
+      expect(out.reasons).toHaveLength(162);
+      expect(out.threshold.loweredBy).toHaveLength(162);
+      expect(out.threshold.base).toBe(1000);
+    });
+
+    it("holds a ZERO amount there too, which is the same comparison at the limit", async () => {
+      // `amount >= threshold` with a threshold of 0 is true for every admissible
+      // amount, zero included. That is not a new rule for the collapsed case -- it is
+      // the rule `gradeFor` already applies, at the limit of the arithmetic.
+      const out = await brief(collapsingInput({ amount: 0 }), reads(manyTags(162)));
+      expect(out.grade).toBe("hold");
+    });
+
+    it("is MONOTONE across the boundary, which is what makes hold the right answer", async () => {
+      // A zero amount is `watch` one reason earlier and `hold` after, so adding a
+      // reason moved the grade in the one direction `gradeFor` promises it can move.
+      // A throw would have broken that promise exactly at the boundary.
+      const before = await brief(collapsingInput({ amount: 0 }), reads(manyTags(161)));
+      const after = await brief(collapsingInput({ amount: 0 }), reads(manyTags(162)));
+      expect(before.grade).toBe("watch");
+      expect(after.grade).toBe("hold");
+    });
+
+    it("writes the collapsed threshold into the audit body, not a substituted number", async () => {
+      const out = await brief(collapsingInput(), reads(manyTags(162)));
+      expect((out.effects.audit.body as { threshold: { applied: number } }).threshold.applied).toBe(0);
+    });
+
+    it("leaves gradeFor's own refusal intact for every other caller", async () => {
+      // The fix is in the brief, which computed the number and therefore knows the
+      // case, and NOT in `gradeFor`, whose refusal protects it from garbage handed in
+      // by anyone. Weakening that would trade a named defect for an unnamed one.
+      expect(() => gradeFor({ amount: 1, threshold: 0, reasonCount: 0 })).toThrow(
+        /grade threshold must be a positive finite number/,
+      );
+      expect(() => gradeFor({ amount: 1, threshold: Number.NaN, reasonCount: 0 })).toThrow(
+        /grade threshold must be a positive finite number/,
+      );
     });
   });
 
