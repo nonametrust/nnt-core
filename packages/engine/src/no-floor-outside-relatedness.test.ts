@@ -3,8 +3,23 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// G-floors, R49: the only way to lower a threshold or cite a reason is
-// `isReason`.
+// G-floors, R49: no module but `relatedness.ts` and `policy.ts` may NAME a floor.
+//
+// WHAT IT DOES NOT HOLD, measured, and stated first because an earlier version of
+// this header claimed "the only way to lower a threshold or cite a reason is
+// `isReason`" -- which is wider than any lexical rule can be. A review wrote a
+// `thresholdFor` six ways and three of them passed this gate while reaching the
+// identical defect: a bare literal (`strength >= 0.25`), a computed property name
+// (`policy["active" + "Floor"]`), and no floor at all (`strength > 0`, so every live
+// tag lowers).
+//
+// So this gate refuses NAMING a floor, which is what R49 asks for and what stops the
+// obvious mistake. What would refuse a lowering set that differs from the reason set
+// is Task 6's own consistency test -- `thresholdFor(...)` and the brief reading one
+// value at one instant -- and that does not exist yet. The brief's own enumeration
+// (`brief.test.ts`, "never produces a hold no reason accounts for") is what holds it
+// today, and it now contains tags that are active and NOT reasons, because a review
+// measured that without them it was blind to exactly this mutant.
 //
 // WHAT IT PROTECTS. R39 rules that one predicate decides both what lowers the
 // threshold and what the brief may cite -- active AND related -- and `isReason`'s
@@ -29,7 +44,11 @@ import { fileURLToPath } from "node:url";
 //
 // STRING CONTENTS ARE KEPT, and that is load-bearing rather than inherited:
 // `policy["activeFloor"]` IS a string, so a stripper that blanked strings would
-// reopen the bypass it was written to close.
+// reopen the bypass it was written to close. Its limit, measured: a unicode escape
+// inside the string (`"activeFlo\u006Fr"`) reads the same at runtime and walks past
+// the pattern. So does an alias assigned from `policy` under another name. Both are
+// recorded rather than chased -- a lexical rule cannot follow a value, and the thing
+// that can is Task 6's consistency test.
 //
 // MODULES ONLY, in the idiom of this package's clock gate. A test that asserts
 // `BRIEF_POLICY_V0.relatednessFloor` is not a second comparison site -- it is the

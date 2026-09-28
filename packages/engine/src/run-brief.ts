@@ -1,7 +1,6 @@
 import {
   ConstraintViolation,
   type AuditEntryInput,
-  type Clock,
   type RecordTriggerEvent,
 } from "@nonametrust/store";
 import { brief, type BriefInput, type BriefOutput, type BriefPolicies, type BriefReads } from "./brief.js";
@@ -20,16 +19,40 @@ import type { Related } from "./relatedness.js";
  * outside the composition root.
  */
 export interface BriefWrites {
+  /**
+   * The instant, from the SAME object that performs the writes.
+   *
+   * THIS IS NOT TIDINESS, it closes a plant a review reproduced against the real
+   * store. When the clock was a separate field of `BriefDeps`, no second `compose`
+   * was needed to defeat the rule -- `{ ...briefDeps(composed, ids), clock:
+   * fixedClock(now - 3d) }` was enough, and measured: `trigger_event.created_at`
+   * landed three days early, `audit_entry.occurred_at` was stamped at the real now,
+   * and nothing raised. `record` bounds only the FUTURE (R34), so a past instant
+   * simply lands.
+   *
+   * There is no privileged clock object to compare against, so identity cannot close
+   * it. Putting the instant on the WRITER narrows it instead: substituting the clock
+   * now means substituting the thing that writes, which is no longer "the same
+   * composition with a different clock" but a different writer entirely -- and a
+   * caller who has replaced the writer has left the supported path in a way a reader
+   * of the call site can see.
+   */
+  now(): Date;
   record(input: RecordTriggerEvent): Promise<unknown>;
   append(input: AuditEntryInput): Promise<unknown>;
 }
 
-/** Everything the wrapper needs. Built from a composition by `briefDeps`. */
+/**
+ * Everything the wrapper needs. Built from a composition by `briefDeps`.
+ *
+ * NO `clock` FIELD. It was one, and a review showed that made the `at` rule
+ * defeatable without a second `compose`: the clock could simply be replaced in the
+ * deps. The instant now travels on `writes`, so it cannot be swapped independently
+ * of the thing that performs the writes.
+ */
 export interface BriefDeps {
   readonly reads: BriefReads;
   readonly writes: BriefWrites;
-  /** The composition's clock. `at` is read from it, once per brief. */
-  readonly clock: Clock;
   readonly ids: IdSource;
 }
 
@@ -44,7 +67,8 @@ export interface BriefDeps {
  *
  * The rule that closes it is structural, not a comparison: the replay entry point
  * is the core, which is handed a read-only port and cannot write, and the only
- * thing that can write takes its instant from the clock.
+ * thing that can write takes its instant from the SAME object that writes -- see
+ * `BriefWrites.now`, which is where a review's reproduced plant put it.
  */
 export interface BriefRequest {
   readonly intent: Related;
@@ -121,10 +145,11 @@ export function briefDeps(composed: Composed, ids: IdSource): BriefDeps {
       listLive: (namespaceId: string) => composed.tags.listLive(namespaceId),
     },
     writes: {
+      // The composition's own clock, the same object every repository in it holds.
+      now: () => composed.clock.now(),
       record: (input: RecordTriggerEvent) => composed.triggers.record(input),
       append: (input: AuditEntryInput) => composed.audit.append(input),
     },
-    clock: composed.clock,
     ids,
   };
 }
@@ -145,7 +170,7 @@ export function briefDeps(composed: Composed, ids: IdSource): BriefDeps {
 export async function runBrief(deps: BriefDeps, request: BriefRequest): Promise<BriefOutput> {
   // ONE read of the clock per brief, so the trigger's `at` and the body's `at` are
   // the same instant rather than two instants a slow brief pulls apart.
-  const at = deps.clock.now();
+  const at = deps.writes.now();
   // Both minted unconditionally, so the sequence does not depend on the outcome. An
   // id sequence that skipped whenever a brief found no surprise would make two runs
   // over different corpora impossible to line up.

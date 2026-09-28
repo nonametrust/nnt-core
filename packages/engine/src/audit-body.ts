@@ -122,6 +122,24 @@ export function auditBodyPaths(body: unknown): Set<string> {
     }
     if (typeof value !== "object" || value === null) return;
     for (const [key, child] of Object.entries(value)) {
+      // A KEY MAY NOT CONTAIN THE PATH PUNCTUATION, and this is a real bypass a
+      // review demonstrated rather than a precaution. `.`, `[` and `]` are legal in
+      // a JSON key, and a path is built by joining with them -- so a single
+      // top-level key literally named `threshold.base` renders the path
+      // `threshold.base`, which `ADMITTED_PATHS` contains, and the value checks then
+      // read the REAL `body.threshold.base` and never look at the impostor. Measured:
+      // `{ ...body, "threshold.base": "tx/deadbeef" }` passed, and
+      // `JSON.stringify` carried the reference into what the chain hashes.
+      //
+      // Refused rather than escaped, because escaping would make the whitelist's
+      // entries unreadable and no legitimate body has such a key: every admitted key
+      // is a TypeScript identifier.
+      if (key.includes(".") || key.includes("[") || key.includes("]")) {
+        throw new RangeError(
+          `auditBody key ${JSON.stringify(key)} contains path punctuation, so it could ` +
+            `impersonate an admitted path; every admitted key is a plain identifier`,
+        );
+      }
       const path = prefix === "" ? key : `${prefix}.${key}`;
       paths.add(path);
       walk(child, path);

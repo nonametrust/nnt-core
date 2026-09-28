@@ -4,7 +4,7 @@ import { VERSION_SEPARATOR } from "./composite-version.js";
 /**
  * The brief's numbers, versioned, and the third such value in the tree.
  *
- * WHY A THIRD VALUE rather than seven more fields on `Policy`. `Policy`
+ * WHY A THIRD VALUE rather than ten fields on `Policy`. `Policy`
  * belongs to `@nonametrust/tagging` and the brief belongs to the engine, so a
  * brief field there is a number that package never reads. And the M2
  * collision map is the harder reason: `thresholdBase`, `surpriseScale` and
@@ -55,9 +55,9 @@ export interface BriefPolicy {
    * a coercion here would need an exchange rate, which is a price feed and a
    * trust assumption this system does not have.
    *
-   * Refused if it is not already trimmed. Task 6 compares this against the
-   * intent's unit, and against a padded policy that comparison refuses a
-   * CORRECT intent -- the coercion problem arriving as a false refusal instead
+   * Refused if it is not already trimmed. The BRIEF compares this against the
+   * intent's unit (R44 moved that from Task 6), and against a padded policy the
+   * comparison refuses a CORRECT intent -- the coercion problem arriving as a false refusal instead
    * of a wrong answer. Trimming on read would be the coercion; refusing where
    * the value is declared is not.
    */
@@ -118,20 +118,19 @@ export interface BriefPolicy {
    * WHAT WOULD REPLACE IT: a measured rate of how often same-namespace
    * cross-channel evidence precedes a loss, from the shadow evaluation.
    *
-   * IT DECIDES NOTHING IN M3, and that is worth knowing before anyone tunes it.
-   * Under R11 and R12 relatedness takes exactly three values -- 0 for a
-   * different namespace, `crossChannelAffinity` for a different channel, 1 for
-   * the same `(channel, aspect)` -- and the cross-field rule forces this floor
-   * at or below the affinity. So every admissible policy partitions those three
-   * values identically, and two policies differing only in this field return
-   * byte-identical briefs. Measured at floors 0.01, 0.3 and 0.55. It becomes
-   * load-bearing when M4 makes relatedness continuous, or sooner if the fourth
-   * case below is given a value beneath the affinity.
+   * IT DECIDES THREE DIFFERENT BRIEFS, and it decided nothing before R35. With
+   * three relatedness values and the cross-field rule in force, the floor had
+   * exactly one admissible position, so every policy partitioned those values
+   * identically and two policies differing only here returned byte-identical
+   * briefs -- measured at 0.01, 0.3 and 0.55. R35's `crossAspectAffinity` made a
+   * fourth value and R36 retired the rule, so it now has three positions:
    *
-   * THE FOURTH CASE R12 DOES NOT RULE: same namespace, same channel, DIFFERENT
-   * ASPECT -- `volume/amount/USDC/in` against `volume/amount/XLM/in`, which the
-   * corpus really produces. R12 names three terms and the data model has four, and
-   * design §1 puts aspect matching inside `rel()`. Owed a ruling before Task 4.
+   * - at or below `crossChannelAffinity`: every same-namespace term counts
+   * - above it, at or below `crossAspectAffinity`: cross-channel evidence excluded
+   * - above `crossAspectAffinity`: only the same aspect counts
+   *
+   * An earlier version of this docstring said it decides nothing and described the
+   * three-value world, and it went stale the moment R35 was ruled.
    */
   readonly relatednessFloor: number;
   /**
@@ -146,12 +145,11 @@ export interface BriefPolicy {
    * exactly as much as the same channel, which is the term deleted rather than
    * declared.
    *
-   * It must also clear `relatednessFloor`, or the term is in range and dead.
-   * Its own `> 0` bound is REDUNDANT given that rule -- a floor is always
-   * positive, so an affinity of 0 fails the pair before it fails the bound --
-   * and is kept because a refusal that names this field is what a reader of the
-   * message needs. Said here because the test row for 0 is killed by the pair
-   * and not by this bound, and a comment claiming otherwise would be false.
+   * Its own `> 0` bound is what kills a zero, and that is a CORRECTION. While the
+   * cross-field rule `crossChannelAffinity >= relatednessFloor` existed the bound
+   * was redundant -- a floor is always positive, so a zero affinity failed the pair
+   * first -- and this comment said so. R36 retired the rule, so the bound is now
+   * the only thing refusing a zero, and the test row for 0 is killed by it.
    */
   readonly crossChannelAffinity: number;
   /**
@@ -168,11 +166,16 @@ export interface BriefPolicy {
    * decided on the day Task 4 met a second aspect, by whichever branch happened to
    * catch it.
    *
-   * Strictly between `crossChannelAffinity` and 1, because relatedness is ordered
-   * by SPECIFICITY: evidence about the same quantity is more related than evidence
-   * about another quantity on the same channel, which is more related than
-   * evidence on another channel. A policy that inverted the two middle terms would
-   * be saying a different channel is closer than a different aspect.
+   * Strictly between 0 and 1, and NOT required to exceed `crossChannelAffinity`.
+   * The ordering by specificity -- same quantity closer than another quantity on
+   * the same channel, closer than another channel -- is the SHIPPED DEFAULT'S
+   * assumption and not a law, because nobody has measured it: under those numbers
+   * a payment address CHANGING scores 0.55 against a price intent while a quote in
+   * another currency scores 0.75, so identity evidence ranks lower, which is at
+   * least arguable. `assertBriefPolicy` therefore does not impose it, and the
+   * ordering is asserted on `BRIEF_POLICY_V0` in `policy.test.ts` instead. An
+   * earlier version of this docstring stated the ordering as a bound on every
+   * policy, which the code has never enforced since that rule was removed.
    *
    * AND IT IS WHAT MAKES `relatednessFloor` DECIDE ANYTHING. With three values the
    * floor had one admissible position and every policy partitioned them the same
@@ -327,8 +330,8 @@ export function assertBriefPolicy(policy: BriefPolicy): void {
     );
   }
   requireNonBlank(label("thresholdUnit"), policy.thresholdUnit);
-  // Refused rather than trimmed: Task 6 compares this against the intent's unit
-  // and a padded policy refuses a correct intent.
+  // Refused rather than trimmed: the brief compares this against the intent's unit
+  // (R44) and a padded policy refuses a correct intent.
   if (policy.thresholdUnit !== policy.thresholdUnit.trim()) {
     throw new RangeError(
       `${label("thresholdUnit")} must not be padded, got ${JSON.stringify(policy.thresholdUnit)}`,
@@ -355,19 +358,18 @@ export function assertBriefPolicy(policy: BriefPolicy): void {
   // largest categorical g0 is 0.774 -- but the bound admits a policy where one
   // does.
   requireUnitInterval(label("activeFloor"), policy.activeFloor, true);
-  // OPEN at 1, and this is a correction. It was closed, on the argument that a
-  // floor of 1 expresses "only same-channel evidence counts". Measured: the
-  // cross-field rule below refuses a floor of 1 under EVERY admissible affinity,
-  // so the closed end was unreachable and the declared interval said otherwise.
   // CLOSED at 1: "only the same aspect counts" is a reachable configuration now
-  // that no rule pins this field below the smallest affinity term.
+  // that R36 has retired the rule pinning this field below the smallest affinity
+  // term. It was briefly declared OPEN, on the measurement that the retired rule
+  // made 1 unreachable; both sentences sat here at once until a review read them
+  // together.
   requireUnitInterval(label("relatednessFloor"), policy.relatednessFloor, true);
   // Open at 1 by R12: at 1 the term is not a cross-channel affinity.
   requireUnitInterval(label("crossChannelAffinity"), policy.crossChannelAffinity, false);
   requireUnitInterval(label("crossAspectAffinity"), policy.crossAspectAffinity, false);
   requirePositive(label("mediumCeiling"), policy.mediumCeiling);
   requirePositiveInteger(label("maxRetries"), policy.maxRetries);
-  // Two cross-field rules, and one that used to be here is gone.
+  // ONE cross-field rule, and one that used to be here is gone.
   //
   // RETIRED: `crossChannelAffinity >= relatednessFloor`. It was added on the
   // argument that a floor above the affinity leaves the cross-channel term "in
@@ -405,7 +407,7 @@ export function assertBriefPolicy(policy: BriefPolicy): void {
   // §6:281's prohibition -- degrading availability is not a way to bypass the
   // layer. Necessary and not sufficient: the lowered threshold can still fall
   // under the ceiling, and `mediumCeiling`'s own comment carries the measured
-  // seven-tag case.
+  // active-tag count, which the test computes rather than recalls.
   if (!(policy.mediumCeiling < policy.briefThreshold)) {
     throw new RangeError(
       `${label("mediumCeiling")} ${policy.mediumCeiling} must be below ` +

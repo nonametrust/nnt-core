@@ -114,6 +114,31 @@ describe("the audit body", () => {
       ).toThrow(/auditBody\.threshold\.unit is not admitted/);
     });
 
+    it("SPELLED like an admitted path, which is how a whitelist of joined strings is fooled", () => {
+      // A review demonstrated this against the shipped walker: `.`, `[` and `]` are
+      // legal in a JSON key, and a path is built by joining with them, so a single
+      // top-level key named `threshold.base` rendered the admitted path
+      // `threshold.base` and passed -- while the value checks read the REAL
+      // `body.threshold.base` and never looked at the impostor. `JSON.stringify`
+      // then carried the reference into what the chain hashes.
+      //
+      // Not reachable through `brief()`, whose body has literal keys. Reachable
+      // through `assertAuditBody`, which is exported and which Task 8 will reuse for
+      // its own kinds -- and the docstring claimed it refuses any key nobody
+      // admitted.
+      for (const key of ["threshold.base", "reasons[].tagId", "threshold.applied", "a]b"]) {
+        expect(() => assertAuditBody(plus({ [key]: "tx/deadbeef" })), key).toThrow(
+          /contains path punctuation/,
+        );
+      }
+    });
+
+    it("refuses the punctuation NESTED, not only at the top level", () => {
+      expect(() =>
+        assertAuditBody(plus({ threshold: { base: 600, applied: 384, "a.b": 1 } })),
+      ).toThrow(/contains path punctuation/);
+    });
+
     it("three levels down", () => {
       expect(() =>
         assertAuditBody(plus({ reasons: [{ ...REASON, origin: { evidence: { ref: "x" } } }] })),
@@ -130,6 +155,16 @@ describe("the audit body", () => {
       expect(() => assertAuditBody(plus({ at: new Date("2026-09-21T00:00:00.000Z") }))).toThrow(
         /auditBody\.at must be an ISO instant string/,
       );
+    });
+
+    it("an instant SHAPED like one that no calendar has", () => {
+      // The shape regex passes `2026-13-45T99:99:99.999Z`; `Date.parse` is what
+      // refuses it, and dropping that call SURVIVED because no row planted one.
+      for (const bad of ["2026-13-45T00:00:00.000Z", "2026-02-30T25:61:61.000Z"]) {
+        expect(() => assertAuditBody(plus({ at: bad })), bad).toThrow(
+          /auditBody\.at must be an ISO instant string/,
+        );
+      }
     });
 
     it("an instant that is a string but not an instant", () => {

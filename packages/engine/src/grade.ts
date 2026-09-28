@@ -47,17 +47,19 @@ export interface GradeInput {
  * - **`hold`** -- the amount is at or above the threshold. Evidence has already
  *   done its work by then, because an active tag LOWERED that threshold (R4); once
  *   the amount clears it, no count of reasons can un-hold it.
- * - **`watch`** -- it is not, and at least one piece of evidence cleared the
- *   relatedness floor. "There is evidence about this counterparty and your amount
- *   is below the bar."
+ * - **`watch`** -- it is not, and at least one piece of evidence is a REASON,
+ *   meaning it cleared BOTH floors (R39). "There is evidence about this
+ *   counterparty and your amount is below the bar." An earlier version of this
+ *   line said "cleared the relatedness floor", which `GradeInput.reasonCount`'s
+ *   own docstring in this file already contradicted.
  * - **`clear`** -- it is not, and nothing did.
  *
  * IT NEEDS NO NUMBER, and that is why it was chosen over the alternative. A
  * fraction of the threshold -- `watch` above `threshold × watchFraction` -- would
- * have added a tenth uncalibrated field with no measurement behind it, which §6
+ * have added an eleventh uncalibrated field with no measurement behind it, which §6
  * would then declare and R5 would have to defend. This rule reuses two things
- * already ruled: the threshold by R3, R4 and R27, and the reasons by R12 and
- * `relatednessFloor`. It also says something a caller can act on, where a
+ * already ruled: the threshold by R3, R4 and R27, and the reasons by R39, which is
+ * both floors through `isReason`. It also says something a caller can act on, where a
  * fraction would only have said "your amount is largish", which the caller knew.
  *
  * MONOTONE IN BOTH INPUTS, held by tests rather than by this sentence: raising the

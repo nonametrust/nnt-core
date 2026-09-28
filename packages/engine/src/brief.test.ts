@@ -3,7 +3,7 @@ import { CALIBRATION_V0, POLICY_V0 } from "@nonametrust/tagging";
 import { RETENTION_V0, type ClearObservation, type StoredTag } from "@nonametrust/store";
 import { BRIEF_POLICY_V0, type BriefPolicy } from "./policy.js";
 import { gradeFor } from "./grade.js";
-import { brief, type BriefInput, type BriefReads } from "./brief.js";
+import { brief, NamespaceErased, type BriefInput, type BriefReads } from "./brief.js";
 
 // Task 5's core: R1, R8, R13, R18, R19, R22, R25, R27, R29, R30, R39-R45.
 //
@@ -166,6 +166,36 @@ describe("brief", () => {
       );
     });
 
+    it("a blank tag id inside ownTagIds, naming its index", async () => {
+      // Deleting this check SURVIVED. A blank entry silently filters nothing, so the
+      // intent's own tag would count -- R22's failure arriving through a typo.
+      await expect(brief(input({ ownTagIds: ["ok", " "] }), reads([]))).rejects.toThrow(
+        /brief\.ownTagIds\[1\] must not be blank/,
+      );
+    });
+
+    it("an ownTagIds that is not an array at all", async () => {
+      // Deleting this check SURVIVED too. `new Set("abc")` yields the CHARACTERS, so a
+      // string would filter by letter and silently exclude nothing the caller meant.
+      await expect(
+        brief(input({ ownTagIds: "abc" as unknown as readonly string[] }), reads([])),
+      ).rejects.toThrow(/brief\.ownTagIds must be an array/);
+    });
+
+    it("a blank channel or aspect on the intent, each by name", async () => {
+      // Deleting these SURVIVED. A blank aspect makes every same-channel tag look like
+      // a DIFFERENT aspect, which silently changes every relatedness score.
+      for (const field of ["channel", "aspect"] as const) {
+        await expect(
+          brief(input({ intent: { ...input().intent, [field]: " " } }), reads([])),
+          field,
+        ).rejects.toThrow(new RegExp(`brief\\.intent\\.${field} must not be blank`));
+      }
+      await expect(
+        brief(input({ intent: { ...input().intent, namespaceId: "" } }), reads([])),
+      ).rejects.toThrow(/brief\.intent\.namespaceId must not be blank/);
+    });
+
     it("an intent whose namespace is not the observation's own", async () => {
       // The caller hands both, and relatedness is computed against `intent`. If the
       // two disagree, every tag is compared against a counterparty the intent is not
@@ -199,10 +229,18 @@ describe("brief", () => {
     });
 
     it("is not served as SOURCE_UNREADABLE reasons instead", async () => {
-      const port = reads([tag({ tagId: "t1" })], {
+      // Asserts the CLASS and that nothing came back, not merely that something threw
+      // -- an earlier version used a bare `rejects.toThrow()`, which any error
+      // satisfies and which made this row a duplicate of the one above it.
+      const port = reads([tag({ tagId: "t1", aspect: "quoted/USDC" })], {
         [INTENT_OBS]: clear({ observationId: INTENT_OBS, namespaceErased: true }),
       });
-      await expect(brief(input(), port)).rejects.toThrow();
+      const result = await brief(input(), port).then(
+        (out) => ({ threw: false as const, out }),
+        (e: unknown) => ({ threw: true as const, e }),
+      );
+      expect(result.threw, "a brief on an erased namespace came back with reasons").toBe(true);
+      expect(result.threw && result.e).toBeInstanceOf(NamespaceErased);
     });
 
     it("does NOT refuse for an expired month on the intent, which is R13's business", async () => {
@@ -221,13 +259,29 @@ describe("brief", () => {
   });
 
   describe("which tags count", () => {
+    it("excludes a tag whose observation IS the intent's, even with an empty ownTagIds (R22)", async () => {
+      // R22 as the plan's acceptance states it, in bold: "no reason's observation is
+      // the intent's own". Two review lenses converged on this independently -- the
+      // core filtered on `ownTagIds` alone, so a caller passing `[]` (which
+      // `assertInput` accepts) reintroduced the exact failure R22 exists to prevent,
+      // and a DB row asserted the wrong behaviour as correct.
+      const opened = tag({ tagId: "opened", aspect: "quoted/USDC", observationId: INTENT_OBS });
+      const other = tag({ tagId: "other", aspect: "quoted/USDC", observationId: "obs-other" });
+      const out = await brief(input({ ownTagIds: [] }), reads([opened, other]));
+      expect(out.reasons.map((r) => r.tagId)).toEqual(["other"]);
+      expect(out.threshold.applied).toBe(500);
+    });
+
     it("excludes a tag the intent itself opened OR refreshed (R41, R22)", async () => {
       // R22 excludes "any tag whose observation_id is the intent's", and a refresh
       // does NOT change observation_id -- it keeps the opening observation's. So a
       // tag the intent refreshed survives an observation-id filter and lowers the
       // intent's own threshold, which is exactly what R22 exists to prevent, one
       // verb over. The filter is on tag IDENTITY.
-      const own = tag({ tagId: "own", aspect: "quoted/USDC", channel: "price" });
+      // The REFRESHED case, which only the identity filter catches: this tag keeps
+      // its opening observation's id, which is NOT the intent's, so R22's filter
+      // cannot see it.
+      const own = tag({ tagId: "own", aspect: "quoted/USDC", channel: "price", observationId: "obs-opened-elsewhere" });
       const other = tag({ tagId: "other", aspect: "quoted/USDC", channel: "price" });
 
       const without = await brief(input({ ownTagIds: [] }), reads([own, other]));
@@ -333,27 +387,65 @@ describe("brief", () => {
     });
 
     it("never produces a hold no reason accounts for, below the base threshold", async () => {
-      // R39's claim, checked rather than asserted: enumerate every subset of four
-      // tags against a range of amounts and confirm that a hold below base always
-      // has a reason to point at.
+      // R39's claim, checked rather than asserted.
+      //
+      // THE FIXTURE CONTAINS TAGS THAT ARE ACTIVE AND NOT REASONS, and that is the
+      // whole point of it. An earlier version used four tags that all cleared
+      // `relatednessFloor`, so the lowering set and the reason set were identical for
+      // every mask **whether or not the code enforced it** -- and a review measured
+      // exactly that: a mutant lowering by strength alone left this enumeration GREEN
+      // and turned only one other test red. A test that cannot fail for the defect it
+      // is named after is the failure this branch keeps paying for.
+      //
+      // `e` is in another namespace (relatedness 0, R11) and `f` is cross-channel
+      // under a floor above `crossChannelAffinity`. Both are well above
+      // `activeFloor`, so a brief that lowered by activity alone would drop the
+      // threshold further than its citable reasons account for.
+      const strict = { ...POLICY, relatednessFloor: 0.75 };
       const all = [
-        tag({ tagId: "a", aspect: "quoted/USDC" }),
-        tag({ tagId: "b", aspect: "quoted/USDC" }),
+        tag({ tagId: "a", channel: "price", aspect: "quoted/USDC" }),
+        tag({ tagId: "b", channel: "price", aspect: "quoted/USDC" }),
         tag({ tagId: "c", channel: "price", aspect: "quoted/XLM" }),
         tag({ tagId: "d", channel: "address_integrity", aspect: "transition" }),
+        tag({ tagId: "e", namespaceId: "77777777-0000-4000-8000-000000000007", aspect: "quoted/USDC" }),
+        tag({ tagId: "f", channel: "latency", aspect: "rtt" }),
       ];
-      for (let mask = 0; mask < 16; mask++) {
+      let sawActiveNonReason = false;
+      for (let mask = 0; mask < 64; mask++) {
         const subset = all.filter((_, i) => (mask & (1 << i)) !== 0);
-        for (const amount of [0, 1, 100, 249, 250, 499, 500, 999, 1000, 2000]) {
-          const out = await brief(input({ amount }), reads(subset));
-          if (out.grade === "hold" && amount < out.threshold.base) {
+        for (const policy of [POLICY, strict]) {
+          for (const amount of [0, 1, 100, 249, 250, 499, 500, 999, 1000, 2000]) {
+            const out = await brief(
+              input({ amount, policies: { ...input().policies, brief: policy } }),
+              reads(subset),
+            );
+            // The two sets are the same set under R39, checked on EVERY mask rather
+            // than in one two-tag row.
             expect(
-              out.reasons.length,
-              `mask ${mask} amount ${amount}: held below base with nothing to cite`,
-            ).toBeGreaterThan(0);
+              [...out.threshold.loweredBy].sort(),
+              `mask ${mask} floor ${policy.relatednessFloor}: loweredBy drifted from reasons`,
+            ).toEqual(out.reasons.map((r) => r.tagId).sort());
+            // The threshold is lowered by the REASONS and by nothing else.
+            expect(out.threshold.applied).toBeCloseTo(
+              out.threshold.base * Math.pow(policy.activeTagFactor, out.reasons.length),
+              12,
+            );
+            if (out.grade === "hold" && amount < out.threshold.base) {
+              expect(
+                out.reasons.length,
+                `mask ${mask} amount ${amount}: held below base with nothing to cite`,
+              ).toBeGreaterThan(0);
+            }
+            if (subset.length > out.reasons.length) sawActiveNonReason = true;
           }
         }
       }
+      // The guard that keeps the enumeration honest: if every tag in every mask were
+      // a reason, the three assertions above would hold vacuously.
+      expect(
+        sawActiveNonReason,
+        "no mask contained a tag that was active and NOT a reason, so this enumeration is blind again",
+      ).toBe(true);
     });
   });
 
@@ -463,6 +555,35 @@ describe("brief", () => {
       expect(out.threshold.applied).toBe(500);
     });
 
+    it("carries the clear columns R13 names, evidence kind included", async () => {
+      // `evidenceKind` was dropped from the requirements' `Reason` shape with nobody
+      // recording the narrowing; R13 lists it among the columns that survive in the
+      // clear. It comes from the observation, where the other three come from the tag
+      // or are the tag's own.
+      // The tag's channel and aspect come from the TAG; only `evidenceKind` and
+      // `datedAt` come from the clear row. Set them to values that differ from the
+      // clear row's, so a read from the wrong side is visible.
+      const t = tag({ tagId: "a", channel: "price", aspect: "quoted/USDC", observationId: "o-a" });
+      const out = await brief(
+        input(),
+        reads([t], {
+          "o-a": clear({ observationId: "o-a", evidenceKind: "state", channel: "latency" }),
+        }),
+      );
+      expect(out.reasons[0]!.evidenceKind).toBe("state");
+      expect(out.reasons[0]!.channel).toBe("price");
+      expect(out.reasons[0]!.aspect).toBe("quoted/USDC");
+    });
+
+    it("refuses an instant the store returned invalid on the TAG, by name", async () => {
+      // `NaN > x` is false, so the R43 exclusion does not catch this and `strengthAt`
+      // refuses it with a message that names no tag.
+      const bad = tag({ tagId: "bad-tagged-at", aspect: "quoted/USDC", taggedAt: new Date("nonsense") });
+      await expect(brief(input(), reads([bad]))).rejects.toThrow(
+        /brief\.reasons\[bad-tagged-at\]\.taggedAt from the store is not a valid instant/,
+      );
+    });
+
     it("carries no source reference, in any spelling (R47)", async () => {
       const out = await brief(input(), reads([tag({ tagId: "a", aspect: "quoted/USDC" })]));
       const keys = Object.keys(out.reasons[0]!);
@@ -494,6 +615,26 @@ describe("brief", () => {
       const weak = tag({ tagId: "aaa", aspect: "quoted/USDC", g0: 0.5 });
       const out = await brief(input(), reads([weak, strong]));
       expect(out.reasons.map((r) => r.tagId)).toEqual(["zzz", "aaa"]);
+    });
+
+    it("breaks a tie on the TAG id, on tags that SHARE an observation", async () => {
+      // The fixture used to hide this: `tag()` derives `observationId` from `tagId`,
+      // so the two were a bijection and a tiebreak on the observation sorted
+      // identically. A mutant doing exactly that SURVIVED.
+      //
+      // Two tags on ONE observation at equal strength is the case the docstring names
+      // -- a total order needs a tiebreak on something UNIQUE, and an observation id
+      // is not unique across tags. Reachable in the store: two tags on different
+      // (channel, aspect) pairs may share an opening observation.
+      const shared = "one-observation";
+      const first = tag({ tagId: "aaa", aspect: "quoted/USDC", observationId: shared });
+      const second = tag({ tagId: "bbb", aspect: "quoted/XLM", observationId: shared });
+      const forward = await brief(input(), reads([first, second]));
+      const reversed = await brief(input(), reads([second, first]));
+      expect(forward.reasons[0]!.strength).toBe(forward.reasons[1]!.strength);
+      expect(forward.reasons.map((r) => r.tagId)).toEqual(["aaa", "bbb"]);
+      expect(reversed.reasons.map((r) => r.tagId)).toEqual(["aaa", "bbb"]);
+      expect(JSON.stringify(reversed)).toBe(JSON.stringify(forward));
     });
 
     it("renders byte-identically on two runs with the same inputs", async () => {
@@ -566,6 +707,48 @@ describe("brief", () => {
     it("carries a NULL trigger id in the body when it recorded none", async () => {
       const out = await brief(input({ surprise: null }), reads([]));
       expect((out.effects.audit.body as { triggerId: string | null }).triggerId).toBeNull();
+    });
+
+    it("carries the INPUT amount into the body, not the threshold or anything else", async () => {
+      // A mutant writing `applied` instead of `input.amount` SURVIVED: nothing
+      // asserted the body's amount at all. The two numbers are deliberately far apart
+      // so a swap is visible, and the unit travels with it.
+      const out = await brief(input({ amount: 137 }), reads([tag({ tagId: "a", aspect: "quoted/USDC" })]));
+      const body = out.effects.audit.body as { amount: number; unit: string; threshold: { applied: number } };
+      expect(body.amount).toBe(137);
+      expect(body.unit).toBe("USDC");
+      expect(body.threshold.applied).toBe(500);
+    });
+
+    it("carries the reason's strength into the body EXACTLY, not rounded", async () => {
+      // A mutant rounding to three decimals SURVIVED, because the only body-strength
+      // assertion used `g0: 1` at the brief's own instant -- a strength of exactly 1,
+      // where rounding is the identity. A third of a half-life gives a long decimal.
+      const third = CALIBRATION_V0.halfLifeMs / 3;
+      const decayed = tag({
+        tagId: "decayed",
+        aspect: "quoted/USDC",
+        g0: 1,
+        taggedAt: new Date(AT.getTime() - third),
+      });
+      const out = await brief(input(), reads([decayed]));
+      const body = out.effects.audit.body as { reasons: { strength: number }[] };
+      expect(out.reasons[0]!.strength).toBeCloseTo(0.7937005259840998, 15);
+      expect(body.reasons[0]!.strength).toBe(out.reasons[0]!.strength);
+      // The digits the rounding mutant would have dropped.
+      expect(String(body.reasons[0]!.strength).length).toBeGreaterThan(10);
+    });
+
+    it("names the INTENT's observation on the trigger, even when reasons exist", async () => {
+      // A mutant using `reasons[0].observationId` SURVIVED, because the only
+      // trigger-shape row ran with no reasons at all and the fallback hid it.
+      const out = await brief(
+        input({ surprise: 2.5 }),
+        reads([tag({ tagId: "a", aspect: "quoted/USDC", observationId: "not-the-intent" })]),
+      );
+      expect(out.reasons).toHaveLength(1);
+      expect(out.effects.trigger!.observationId).toBe(INTENT_OBS);
+      expect((out.effects.audit.body as { observationId: string }).observationId).toBe(INTENT_OBS);
     });
 
     it("carries every reason into the body, with the strengths the grade used", async () => {
@@ -721,16 +904,33 @@ describe("brief", () => {
   });
 
   describe("the core writes nothing, structurally", () => {
-    it("is handed a port with exactly two read methods and no writer", async () => {
-      // G9 is measured against every table's `xmin` in `brief-db.test.ts`. This is
-      // the other half: the core cannot write because it was never given anything
-      // that writes. Handing it whole repositories would have handed it `append`,
-      // `open`, `refresh` and `suppress`, and "the core writes nothing" would rest
-      // on it not calling methods it holds.
-      const port = reads([]);
-      await brief(input(), port);
-      const surface = Object.keys(port).filter((k) => k !== "calls").sort();
-      expect(surface).toEqual(["listLive", "readClear"]);
+    it("touches only the two reads even when handed a port that also writes", async () => {
+      // G9 is measured against every table's `xmin` in `brief-db.test.ts`; the
+      // structural half is the `BriefReads` type and `tsc`. An earlier version of this
+      // row asserted `Object.keys` of the TEST'S OWN STUB, which measured the fixture
+      // and would have stayed green for any core at all.
+      //
+      // This hands the core a port that DOES carry writers, at runtime, past the type
+      // -- the arrangement the plan's "reads through repositories" would really have
+      // produced -- and records that none of them is called.
+      const touched: string[] = [];
+      const withWriters = {
+        readClear: async (observationId: string): Promise<ClearObservation> => {
+          touched.push("readClear");
+          return clear({ observationId });
+        },
+        listLive: async (): Promise<readonly StoredTag[]> => {
+          touched.push("listLive");
+          return [tag({ tagId: "a", aspect: "quoted/USDC" })];
+        },
+        append: async (): Promise<void> => void touched.push("append"),
+        open: async (): Promise<void> => void touched.push("open"),
+        refresh: async (): Promise<void> => void touched.push("refresh"),
+        suppress: async (): Promise<void> => void touched.push("suppress"),
+        record: async (): Promise<void> => void touched.push("record"),
+      };
+      await brief(input(), withWriters as unknown as BriefReads);
+      expect([...new Set(touched)].sort()).toEqual(["listLive", "readClear"]);
     });
 
     it("reads each reason's clear row once and no more", async () => {

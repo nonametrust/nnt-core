@@ -7,6 +7,7 @@ import {
   RETENTION_V0,
   type AuditEntryInput,
   type ClearObservation,
+  type FixedClock,
   type RecordTriggerEvent,
   type StoredTag,
 } from "@nonametrust/store";
@@ -72,10 +73,12 @@ interface Recorder extends BriefWrites {
   readonly calls: string[];
   readonly recorded: RecordTriggerEvent[];
   readonly appended: AuditEntryInput[];
+  readonly clock: FixedClock;
 }
 
 function writes(
   fail: { record?: unknown; append?: unknown } = {},
+  clock: FixedClock = fixedClock(START),
 ): Recorder {
   const calls: string[] = [];
   const recorded: RecordTriggerEvent[] = [];
@@ -84,6 +87,11 @@ function writes(
     calls,
     recorded,
     appended,
+    clock,
+    // The instant travels WITH the writer, so a test that wants a different one
+    // substitutes the writer -- which is exactly the narrowing the shipped type
+    // makes a caller do.
+    now: () => clock.now(),
     record: async (input: RecordTriggerEvent): Promise<void> => {
       calls.push("record");
       if (fail.record !== undefined) throw fail.record;
@@ -104,6 +112,28 @@ function reads(tags: readonly StoredTag[] = []): BriefReads {
   };
 }
 
+/**
+ * A clock whose every read returns a LATER instant.
+ *
+ * `fixedClock` cannot see the difference between one read and two, which is the
+ * fixture-collision class this branch has now paid for six times: a review's mutant
+ * that read the clock a second time for the trigger SURVIVED, because two reads of a
+ * fixed clock are equal and the assertion compared them to each other.
+ */
+function tickingClock(start: Date, stepMs = 1000): { now(): Date; reads: number } {
+  let reads = 0;
+  return {
+    get reads() {
+      return reads;
+    },
+    now(): Date {
+      const at = new Date(start.getTime() + reads * stepMs);
+      reads += 1;
+      return at;
+    },
+  };
+}
+
 /** Ids in a known order, so a test can say which id went where. */
 function idSource(): IdSource {
   let n = 0;
@@ -113,7 +143,6 @@ function idSource(): IdSource {
 const deps = (over: Partial<BriefDeps> = {}): BriefDeps => ({
   reads: reads(),
   writes: writes(),
-  clock: fixedClock(START),
   ids: idSource(),
   ...over,
 });
@@ -143,24 +172,43 @@ describe("runBrief", () => {
         { ...request(), at: threeDaysEarlier } as unknown as BriefRequest,
       );
       expect(bodyOf(w).at).toBe("2026-09-21T00:00:00.000Z");
-      expect(w.recorded).toEqual([]);
     });
 
-    it("is read once per brief, so the trigger and the body carry ONE instant", async () => {
+    it("IGNORES a planted `at` for the TRIGGER too, not only for the body", async () => {
+      // The earlier version of this row asserted `w.recorded` was empty, which was
+      // trivially true because the request carried no surprise. With one, the trigger
+      // is written and its instant is the assertion that matters -- the measured plant
+      // put a trigger three days early into the table.
+      const threeDaysEarlier = new Date(START.getTime() - 3 * 24 * 60 * 60 * 1000);
       const w = writes();
+      await runBrief(
+        deps({ writes: w }),
+        { ...request({ surprise: 2.5 }), at: threeDaysEarlier } as unknown as BriefRequest,
+      );
+      expect(w.recorded).toHaveLength(1);
+      expect(w.recorded[0]!.at.toISOString()).toBe("2026-09-21T00:00:00.000Z");
+    });
+
+    it("is read ONCE per brief, measured on a clock that moves between reads", async () => {
+      // A second read for the trigger used to survive here. With a ticking clock the
+      // two instants would differ by a second, so equality now means one read -- and
+      // the read count is asserted directly as well, because equality alone would
+      // still pass if something read twice and discarded the second.
+      const ticking = tickingClock(START);
+      const w: Recorder = { ...writes(), now: () => ticking.now() };
       await runBrief(deps({ writes: w }), request({ surprise: 2.5 }));
       expect(w.recorded[0]!.at.toISOString()).toBe(bodyOf(w).at);
+      expect(ticking.reads, "the clock was read more than once for one brief").toBe(1);
     });
 
     it("is read AGAIN on the next brief, not captured once", async () => {
       // A wrapper that read the clock at construction would replay the same instant
       // forever -- which is exactly the plant G10's frozen-clock version would have
       // missed.
-      const clock = fixedClock(START);
       const w = writes();
-      const d = deps({ writes: w, clock });
+      const d = deps({ writes: w });
       await runBrief(d, request());
-      clock.advance(60_000);
+      w.clock.advance(60_000);
       await runBrief(d, request());
       expect(bodyOf(w).at).toBe("2026-09-21T00:00:00.000Z");
       expect((w.appended[1]!.body as { at: string }).at).toBe("2026-09-21T00:01:00.000Z");
@@ -176,13 +224,26 @@ describe("runBrief", () => {
     });
 
     it("mints the same two whether or not a trigger is recorded", async () => {
-      // Minted unconditionally so the sequence does not depend on the outcome. An
-      // id sequence that skipped when a brief found no surprise would make two runs
-      // over different corpora impossible to line up.
+      // Minted unconditionally so the sequence does not depend on the outcome. An id
+      // sequence that skipped when a brief found no surprise would make two runs over
+      // different corpora impossible to line up.
+      //
+      // THE SECOND BRIEF IS THE ASSERTION. An earlier version checked only the first
+      // brief's `briefId` and that its body's `triggerId` was null, and a mutant that
+      // skipped minting on the null-surprise path SURVIVED -- nothing observed that
+      // the source had advanced twice. The next brief's ids are what show it.
       const w = writes();
-      await runBrief(deps({ writes: w }), request({ surprise: null }));
+      const d = deps({ writes: w });
+      await runBrief(d, request({ surprise: null }));
       expect(bodyOf(w).briefId).toBe("00000000-0000-4000-8000-000000000001");
       expect(bodyOf(w).triggerId).toBeNull();
+
+      await runBrief(d, request({ surprise: 2.5 }));
+      expect(
+        (w.appended[1]!.body as { briefId: string }).briefId,
+        "the id source did not advance twice on the brief that recorded no trigger",
+      ).toBe("00000000-0000-4000-8000-000000000003");
+      expect(w.recorded[0]!.triggerId).toBe("00000000-0000-4000-8000-000000000004");
     });
 
     it("names the trigger the body names, or null", async () => {
@@ -309,7 +370,7 @@ describe("runBrief", () => {
       );
     });
 
-    it("is NOT named an inconsistency when the record was read as landed but nothing was written", async () => {
+    it("IS named an inconsistency when the record was read as landed, because the row is there", async () => {
       // A 23505 means the row IS there -- written by the attempt this one is a retry
       // of -- so a failed append after it is still an inconsistency.
       const w = writes({

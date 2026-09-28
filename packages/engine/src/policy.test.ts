@@ -338,7 +338,7 @@ describe("BriefPolicy", () => {
   it("names the unit its two amounts are in", () => {
     // R27: `briefThreshold` and `mediumCeiling` are amounts in ONE declared
     // unit, and an intent whose unit differs is refused rather than coerced.
-    // The refusal is Task 6's; that the unit is declared at all is this
+    // The refusal is the brief's, since R44; that the unit is declared at all is this
     // task's, and a blank one is refused above.
     expect(BRIEF_POLICY_V0.thresholdUnit.trim()).not.toBe("");
   });

@@ -103,14 +103,17 @@ export function relatedness(a: Related, b: Related, policy: BriefPolicy): number
 /**
  * Whether this evidence clears the RELATEDNESS floor for this intent.
  *
- * NAMED FOR THE ONE FLOOR IT CHECKS, which is a correction. It was
- * `isReason`, and that name claimed more than the function holds: design
- * §6:266 says a reason is evidence "whose relatedness AND decayed strength clear
- * their thresholds", so relatedness is one of two conditions and the other one --
- * `activeFloor` against the decayed strength -- lives with the brief, which is
- * the only caller that has a strength to compare. A predicate called `isReason`
- * that decides half of reason-hood is the defect this repository already has a
- * commit about, three names that claimed more than their tests held.
+ * NAMED FOR THE ONE FLOOR IT CHECKS, and its name is the smaller half of a
+ * two-part history. It was once called `isReason`, which claimed more than it
+ * held: design §6:266 says a reason is evidence "whose relatedness AND decayed
+ * strength clear their thresholds", so relatedness is one of two conditions. It was
+ * renamed to what it checks.
+ *
+ * R39 then brought `isReason` back, forty lines below and in this same file, as the
+ * CONJUNCTION -- so the `activeFloor` comparison lives here too and not with the
+ * brief, which an earlier version of this paragraph said. It could not live with the
+ * brief now even by choice: `no-floor-outside-relatedness.test.ts` refuses either
+ * floor to be named in any module but this one and `policy.ts`.
  *
  * Measured consequence of getting it wrong, from review: the day-twelve address
  * tag at three thousand six hundred and fifty days has a decayed strength of

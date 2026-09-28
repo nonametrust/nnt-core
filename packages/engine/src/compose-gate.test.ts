@@ -31,6 +31,13 @@ import { fileURLToPath } from "node:url";
 // THE PATTERN ADMITS MEMBER ACCESS, and that is a correction review paid for
 // once: its own first pattern, `new \w*Repository(`, walked straight past
 // `new store.TagRepository(`.
+//
+// WHAT IT CANNOT SEE, measured and recorded rather than claimed shut: a constructor
+// held in a variable. `const Ctor = TagRepository; new Ctor(handle, clock)` names no
+// suffix at the construction site and passes. A lexical rule cannot follow a value.
+// What narrows it is that the alias must still IMPORT the class, and the store
+// classes are only imported by `compose.ts` today -- but nothing enforces that, so
+// this is a limit and not a second rule.
 
 const srcDir = fileURLToPath(new URL("./", import.meta.url));
 const SOURCE = /\.(ts|mts|cts|tsx|js|mjs|cjs)$/;

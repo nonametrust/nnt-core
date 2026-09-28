@@ -74,8 +74,9 @@ export const COMPOSED_KEYS: readonly (keyof Composed)[] = Object.keys(
  * The composition root: the ONE place in this package that constructs a store
  * class, so the whole composition shares one clock.
  *
- * WHY IT IS A GATE AND NOT A CONVENIENCE. Measured across the store's nine
- * clock-bearing classes: seven take their clock UNCHECKED.
+ * WHY IT IS A GATE AND NOT A CONVENIENCE. Measured across the store's EIGHT
+ * clock-bearing classes -- nine are composed here, and `HotWindowRepository` takes
+ * no clock -- seven take their clock UNCHECKED.
  * `ObservationRepository` is the single exception, refusing a clock that is not
  * its `NamespaceRepository`'s by identity, and M3's plan §8 generalises that one
  * pair into "the store now refuses that between two of its own repositories" --

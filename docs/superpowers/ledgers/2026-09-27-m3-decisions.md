@@ -1342,3 +1342,142 @@ away, and the earlier review measurement stands: round trips dominate, not AEAD.
 So **§7's cap question stays dissolved and `maxReasons` is still not needed.** What
 the measurement did produce is R60, which is the real cost of an unbounded reason
 count — not latency but arithmetic.
+
+## Task 5's review round: three lenses, and what a mutation audit found that they did not
+
+Three reviewers at `18d8782`, each in its own worktree on a detached HEAD with its own
+database. A correctness lens, a completeness lens, and a MUTATION AUDITOR whose only
+job was to disbelieve this branch's own claims. The third was worth the other two.
+
+### The one claim of mine that was FALSE, and it was in a commit message
+
+Commit `c83f7ec` says of B22: "Three rows now hold it." **Two do.** Measured by the
+auditor with `void assertAuditBody;`: exactly two tests go red, the blank `tagId` and
+the blank `observationId` rows. The third row in that group -- the invalid `dated_at`
+-- stays GREEN, because it is killed by `iso()` and not by `assertAuditBody` at all.
+
+So the count was overstated by one and the third row was misattributed. Recorded here
+because a commit message cannot be corrected and this ledger is the authority, and
+because it is the same failure this milestone has now recorded five times in other
+people's prose: **a claim about what holds a rule, made without re-running the mutant
+that would prove it.** I wrote it in the same commit that fixed B22.
+
+### Eleven rules that were stated and held by nothing
+
+The auditor ran 103 mutants: 79 of 80 claimed kills re-confirmed, and **13 of 20
+fresh mutants survived**. Three of the survivors were properties my own docstrings
+state in capitals. All eleven below now die, each at a row that names the rule.
+
+- **"ONE read of the clock per brief."** A second read for the trigger survived,
+  because `fixedClock` returns equal instants and the assertion compared the two
+  reads to each other. Held now by a clock that TICKS on every read, plus an assertion
+  on the read count. This is the fixture-collision class §3b lists third, and it has
+  now cost this project six times.
+- **"Both ids minted unconditionally."** Skipping the trigger id on the null-surprise
+  path survived: nothing observed that the source had advanced twice. Held now by the
+  NEXT brief's ids, which is the only place the sequence is visible.
+- **The audit body's `amount`** was never compared to the input. A body carrying the
+  applied threshold instead survived. The row that outlives every key could have
+  carried the wrong amount with the suite green.
+- **The body's `strength`** was asserted only where rounding is the identity, because
+  the fixture used `g0: 1` at the brief's own instant. Rounding to three decimals
+  survived. Held now at a third of a half-life, where the value has seventeen digits.
+- **The trigger's `observationId`** was unheld whenever a reason existed: the only
+  trigger-shape row ran with no reasons, so a fallback to `reasons[0]` hid the mutant.
+- **The tiebreak on `tagId`** was held by a fixture in which `observationId` was a
+  bijection of `tagId`, so a tiebreak on the observation sorted identically. Held now
+  by two tags that SHARE one observation at equal strength -- which is the case the
+  docstring names and which the store really produces.
+- **Three input refusals** -- a blank entry inside `ownTagIds`, a non-array
+  `ownTagIds`, and a blank `intent.channel` or `intent.aspect` -- existed and were
+  held by nothing. The second matters more than it looks: `new Set("abc")` yields the
+  CHARACTERS, so a string would have filtered by letter and excluded nothing.
+- **`requireAt`'s `Date.parse` guard** had no row, so an instant of the right SHAPE
+  that no calendar has (`2026-13-45T00:00:00.000Z`) was admitted by the regex alone.
+- **The lowering beyond four reasons** was unmeasured: a cap at four survived, because
+  the unit rows used one and two tags and only a DB fixture with five caught a cap at
+  three. The enumeration now runs to six.
+
+### What the correctness lens found, and the one both lenses found
+
+- **The whitelist could be fooled by a key SPELLED like an admitted path.** `.`, `[`
+  and `]` are legal in a JSON key and a path is built by joining with them, so a single
+  top-level key named `threshold.base` rendered an admitted path and passed, while the
+  value checks read the real `body.threshold.base` and never looked at the impostor.
+  `JSON.stringify` then carried a reference into what the chain hashes. Not reachable
+  through `brief()`, whose keys are literals; reachable through `assertAuditBody`,
+  which is exported and which Task 8 will reuse. **Keys carrying path punctuation are
+  now refused**, because every admitted key is a plain identifier and no legitimate
+  body has one.
+- **The `at` rule was defeatable without a second `compose`.** `BriefDeps.clock` was a
+  free field, so `{ ...briefDeps(composed, ids), clock: fixedClock(now - 3d) }` was
+  enough -- and the reviewer reproduced the ledger's own measured plant against the
+  real store through the supported entry point. **The instant now lives on
+  `BriefWrites.now()`**, so substituting the clock means substituting the writer.
+  There is no privileged clock object to compare against, so identity cannot close
+  this; putting the instant on the writer narrows it, which is the honest fix.
+- **The R39 enumeration was BLIND to R39's own defect.** All four fixture tags cleared
+  `relatednessFloor`, so the lowering set and the reason set were identical for every
+  mask **whether or not the code enforced it**. A mutant lowering by strength alone
+  left the enumeration green and turned exactly one other row red. It now runs six
+  tags under two floors, contains tags that are active and NOT reasons, asserts
+  `loweredBy` equals the reasons on EVERY mask, and carries a guard that fails if no
+  mask ever produces an active non-reason. Verified by re-running the reviewer's own
+  mutant: the enumeration now goes red.
+- **R22's observation-id filter was not implemented, and a DB row asserted the wrong
+  behaviour as correct.** Two lenses converged on this independently, which this
+  ledger already records is the strongest signal a review gives. R41 ADDED an identity
+  filter; it did not retire R22's, and the plan's acceptance still says in bold "no
+  reason's observation is the intent's own". The core filtered on `ownTagIds` alone,
+  so a caller passing `[]` -- which `assertInput` accepts -- reintroduced exactly the
+  failure R22 exists to prevent. **Both filters now apply**, and each half is killed
+  by its own unit row and its own DB row.
+
+### Limits recorded rather than claimed shut
+
+- **Both lexical gates have one-line bypasses.** A unicode escape inside a string
+  (`"activeFloor"`) reads the same at runtime and walks past the floors pattern;
+  a constructor held in a variable (`const Ctor = TagRepository`) names no suffix at
+  the construction site. A lexical rule cannot follow a value. Stated in both gates'
+  headers.
+- **The floors gate is narrower than R49's purpose.** It refuses NAMING a floor. It
+  cannot refuse a lowering set that differs from the reason set: a bare literal, a
+  computed property name, or no floor at all all pass. What would refuse those is Task
+  6's consistency test, which does not exist yet; until then the brief's own
+  enumeration is what holds R39.
+- **`assertAuditBody` can be fooled by a `toJSON`**, on the object or its prototype,
+  which renders something the walker never saw. Unreachable through `brief()`; a limit
+  of the standalone function, which Task 8 should know before reusing it.
+- **`triggerAlreadyLanded`'s set-versus-prefix distinction is unheld** and equivalent
+  on today's schema, because `trigger_event` has exactly two unique constraints. It
+  will matter silently the day a third is added.
+- **`G9`'s table-coverage row was not schema-scoped**, so a schema left behind by any
+  crashed store run in the same database turned it red for a reason unrelated to the
+  brief. Now filtered to this test's own schema. It failed loudly, which is the right
+  direction, but it was measuring the database rather than the schema.
+- **Task 3's `holdsAt` refusal is unheld on `validUntil`.** `timing.test.ts` plants an
+  unparseable `validFrom` only, and making an unparseable `validUntil` return `false`
+  instead of throwing survives. Not Task 5's to fix; recorded so it is not discovered
+  as a new finding later.
+
+### What Task 9 must do differently, found by the completeness lens
+
+Task 9's comparison -- the provider's threshold before and after day twelve -- **cannot
+be produced by replaying `brief(at = day 11)` against a store seeded to day 21.** The
+`trustline_open` state is refreshed every morning, so its `tagged_at` has moved to its
+last refresh, and R43 then excludes it entirely at day 11: the past replay sees zero
+tags where one existed and was active, which is R42's measurement stated forward. The
+day-eleven brief must be taken LIVE, with the fixed clock advanced through the corpus.
+The alternative the ledger already suggests still works: pass the address tag's id in
+`ownTagIds` to get the "with the address tag filtered out" comparison, since the filter
+is by identity.
+
+### Two smaller corrections
+
+- **`evidenceKind` had been dropped from `Reason`** at the requirements stage with
+  nobody recording the narrowing. R13 lists `dated_at`, `channel`, `aspect` and
+  `evidence_kind` as the columns that survive in the clear. Restored on the output; it
+  stays out of the audit body, where R25 admits none of the four as such.
+- **An invalid `taggedAt` from the store was refused without naming the tag**, by
+  `strengthAt`'s own bare message -- and the R43 exclusion could not catch it either,
+  because `NaN > x` is false. Named now, like the `dated_at` guard beside it.

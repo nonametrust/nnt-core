@@ -70,8 +70,18 @@ export interface Reason {
   readonly tagId: string;
   /** The tag's OPENING observation, R30. A refresh does not move it. */
   readonly observationId: string;
+  /** The TAG's channel, which M2 guarantees is its evidence's. */
   readonly channel: string;
+  /** The TAG's aspect. `readClear` does not return one -- that is R40's whole point. */
   readonly aspect: string;
+  /**
+   * The clear column R13 names alongside the others, and which was dropped from the
+   * requirements' shape without anyone recording the narrowing. Restored: R13 lists
+   * `dated_at`, `channel`, `aspect` and `evidence_kind` as what survives in the clear,
+   * and this is the one of the four that comes from the observation rather than the
+   * tag. It is NOT in the audit body -- see `BriefAuditReason`.
+   */
+  readonly evidenceKind: string;
   /** `null` for a state, R19. */
   readonly datedAt: Date | null;
   /** `strengthAt(tag, at)`, the value this decision was made on. */
@@ -107,7 +117,10 @@ export interface BriefInput {
    * a mechanism.
    */
   readonly intent: Related;
-  /** The intent's own observation, for the R14 check and the R41 filter. */
+  /**
+   * The intent's own observation. Three jobs: the R14 liveness check, R22's
+   * observation-id exclusion, and the identity the audit body records.
+   */
   readonly observationId: string;
   /** R8. Zero is admissible; negative is refused. */
   readonly amount: number;
@@ -300,7 +313,22 @@ export async function brief(input: BriefInput, reads: BriefReads): Promise<Brief
 
   const counted: { tag: StoredTag; strength: number }[] = [];
   for (const t of live) {
-    if (own.has(t.tagId)) continue;
+    // BOTH FILTERS, and two review lenses converged on that independently.
+    //
+    // R41 ruled that the filter is on tag IDENTITY, because a refresh keeps the
+    // OPENING observation's id, so a tag the intent refreshed survives an
+    // observation-id filter and lowers the intent's own threshold. That ADDED a
+    // filter; it did not retire R22's, and the plan's Task 5 acceptance still says
+    // in bold "no reason's observation is the intent's own".
+    //
+    // The two are complementary rather than alternative: a tag the intent OPENED
+    // carries the intent's `observation_id` and one it REFRESHED does not. On the
+    // supported path `ownTagIds` covers both, and this changes nothing there. What
+    // it closes is a caller that passes an incomplete list -- `assertInput` accepts
+    // `[]` -- which reintroduced exactly the failure R22 exists to prevent. One
+    // comparison against a value the core already holds is not a cost worth
+    // declining.
+    if (own.has(t.tagId) || t.observationId === input.observationId) continue;
     // R43. `strengthAt` returns `g0` for EVERY non-positive elapsed, so a tag
     // stamped after `at` reports full strength: a past brief counting it would be
     // reporting evidence that did not exist yet, at a strength it never had.
@@ -309,6 +337,16 @@ export async function brief(input: BriefInput, reads: BriefReads): Promise<Brief
     // past-`at` brief is correct about what existed and approximate about its
     // strength, and both sentences are true of different things.
     if (t.taggedAt.getTime() > at.getTime()) continue;
+    // NAMED, like the `dated_at` guard below. `strengthAt` refuses an invalid instant
+    // with a bare "instant and taggedAt must be valid dates" that says nothing about
+    // WHICH tag, and this value comes from the store rather than from the caller. Note
+    // the exclusion above cannot catch it either: `NaN > x` is false, so an invalid
+    // `taggedAt` walks straight past a comparison.
+    if (Number.isNaN(t.taggedAt.getTime())) {
+      throw new RangeError(
+        `brief.reasons[${t.tagId}].taggedAt from the store is not a valid instant: ${String(t.taggedAt)}`,
+      );
+    }
     const strength = strengthAt(t, at, policies.calibration.halfLifeMs);
     // ONE PREDICATE FOR BOTH JOBS (R39): whatever fails this neither lowers the
     // threshold nor is citable, so a hold caused by a tag always has that tag among
@@ -337,6 +375,7 @@ export async function brief(input: BriefInput, reads: BriefReads): Promise<Brief
       observationId: tag.observationId,
       channel: tag.channel,
       aspect: tag.aspect,
+      evidenceKind: clear.evidenceKind,
       datedAt: clear.datedAt,
       strength,
       relatedness: relatedness(intent, tag, policy),

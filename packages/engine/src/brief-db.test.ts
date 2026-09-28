@@ -262,8 +262,17 @@ afterAll(async () => {
 
 describe("the fixture itself", () => {
   it("covers every table the database really has, so the snapshot measures all of them", async () => {
-    const live = (await db.introspection.getTables()).map((t) => t.name).sort();
-    expect(live, "a table exists that rowVersions() does not read").toEqual([...TABLES].sort());
+    // SCOPED TO THIS SCHEMA. `getTables()` is not limited by `search_path`, so an
+    // unrelated schema left behind by a crashed store run -- or the store's own
+    // suites sharing this database -- turned this row red for a reason that has
+    // nothing to do with the brief. A review measured exactly that.
+    const live = (await db.introspection.getTables())
+      .filter((t) => t.schema === SCHEMA)
+      .map((t) => t.name)
+      .sort();
+    expect(live, "a table exists in this schema that rowVersions() does not read").toEqual(
+      [...TABLES].sort(),
+    );
   });
 
   it("seeded five live tags under one namespace", async () => {
@@ -403,23 +412,36 @@ describe("R43: a tag stamped after the brief's instant", () => {
 });
 
 describe("G12: the intent's own tag", () => {
-  it("is excluded by identity, and raises the threshold it would have lowered", async () => {
-    const reads = briefDeps(composed, ids()).reads;
-    const withOwn = await brief(coreInput(), reads);
-    const withoutOwn = await brief(coreInput({ ownTagIds: [tags["own"]!.tagId] }), reads);
-
-    expect(withOwn.reasons.map((r) => r.tagId)).toContain(tags["own"]!.tagId);
-    expect(withoutOwn.reasons.map((r) => r.tagId)).not.toContain(tags["own"]!.tagId);
-    expect(withoutOwn.threshold.applied).toBeGreaterThan(withOwn.threshold.applied);
+  it("is excluded by its OBSERVATION even when the caller's list is empty (R22)", async () => {
+    // `tags.own` was opened on the intent's own observation. An earlier version of
+    // this row asserted it COUNTED when `ownTagIds` was empty -- asserting as correct
+    // the very failure the plan's acceptance forbids in bold. Two review lenses
+    // converged on it independently.
+    const out = await brief(coreInput({ ownTagIds: [] }), briefDeps(composed, ids()).reads);
+    expect(out.reasons.map((r) => r.tagId)).not.toContain(tags["own"]!.tagId);
   });
 
-  it("keeps its OPENING observation, which is why the filter is on the tag id", async () => {
-    // The measured hole R41 closes: a refresh does not move `observation_id`, so a
-    // tag the intent refreshed would survive an observation-id filter. Here the
-    // intent's own tag really does carry the intent's observation, so both filters
-    // would work -- and the tag refreshed by the intent, which only the id filter
-    // catches, is the case the unit tests cover.
+  it("is excluded by IDENTITY when its observation is someone else's (R41)", async () => {
+    // The case only the identity filter catches: a tag the intent REFRESHED keeps
+    // its opening observation's id, so R22's filter cannot see it. `sameAspect` was
+    // opened on `priceObs`, which is not the intent's observation, so it stands in
+    // for a refreshed tag here.
+    const reads = briefDeps(composed, ids()).reads;
+    const counted = await brief(coreInput(), reads);
+    const filtered = await brief(coreInput({ ownTagIds: [tags["sameAspect"]!.tagId] }), reads);
+
+    expect(counted.reasons.map((r) => r.tagId)).toContain(tags["sameAspect"]!.tagId);
+    expect(filtered.reasons.map((r) => r.tagId)).not.toContain(tags["sameAspect"]!.tagId);
+    expect(filtered.threshold.applied).toBeGreaterThan(counted.threshold.applied);
+  });
+
+  it("keeps its OPENING observation, which is why one filter is not enough", async () => {
+    // The measured hole R41 closes, stated on the real rows: a refresh does not move
+    // `observation_id`. The intent's own tag really does carry the intent's
+    // observation, so R22's filter sees it; a refreshed one would not, which is why
+    // the core applies both.
     expect(tags["own"]!.observationId).toBe(intentObs);
+    expect(tags["sameAspect"]!.observationId).not.toBe(intentObs);
   });
 });
 
