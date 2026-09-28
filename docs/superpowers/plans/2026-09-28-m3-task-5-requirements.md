@@ -1,0 +1,153 @@
+# M3 Task 5: what the brief must be built on
+
+> **Why this file exists.** Task 5's text in
+> `docs/superpowers/plans/2026-09-27-m3-sync-path.md` was written before Tasks 1-4
+> ran and before four review rounds. Ten rulings the plan does not have (R33-R42)
+> now constrain it, four of them change its shape, and two make its acceptance
+> criteria unbuildable as written. This file is the delta: read the plan for
+> R1-R32 and the general constraints, read this for what changed and why.
+>
+> **Where this file and the plan disagree, this file is newer and says why.** The
+> full reasoning with measurements is in
+> `docs/superpowers/ledgers/2026-09-27-m3-decisions.md`; this is the implementable
+> summary.
+
+## The state Task 5 starts from
+
+Branch `m3-sync-path`. Counts: schema 117, tagging 329, indexer 122, store 532,
+engine 190, root gates 64. Green under `Pacific/Kiritimati`, `Etc/GMT+12`,
+`America/St_Johns`, a changed database session timezone, and `LC_ALL=tr_TR.UTF-8`.
+
+Already in `packages/engine`: `policy.ts` (`BriefPolicy`, ten fields),
+`relatedness.ts` (`relatedness`, `relatednessCase`, `clearsRelatednessFloor`,
+`isReason`, `TagFacts`), `grade.ts` (`GRADES`, `gradeFor`),
+`composite-version.ts` (`compositePolicyVersion`), `ids.ts` (`IdSource`), and
+three gates.
+
+Already in the store, added by Task 2 for this task: `openDb` and the `Db` type
+exported; `readClear(observationId)`; `BaselineRepository.upsert(state,
+expectedCount)` raising `BaselineStale`; `TriggerEventRepository.record` taking
+`triggerId` and `at`; `readonly clock` public on six classes.
+
+## The four rulings that change Task 5's shape
+
+**R39 — one predicate decides both what lowers the threshold and what the brief
+may cite.** `isReason(tag, intent, policy)` requires `strength >= activeFloor` AND
+`relatedness >= relatednessFloor`. Use it for both; do not compute the lowering
+set separately. Consequence for Task 6: `thresholdFor` cannot be intent-free, so
+design §6's "the engine exposes the current threshold as a query" either goes or
+becomes a second query no brief uses.
+
+**R40 — the intent's reading is carried from `observe`, not decrypted in the
+core.** Relatedness needs the intent's `(channel, aspect)`; `readClear` returns the
+channel and not the aspect. Opening the payload to get it means a brief cannot be
+replayed after the month expires, which would undermine R13. So `observe` returns
+the derived reading and `brief` takes it.
+
+**R41 — R22's filter is on the tags the intent TOUCHED.** A refresh keeps the
+opening observation's `observation_id`, so filtering on that id lets a tag the
+intent itself refreshed lower the intent's own threshold. `observe` returns the tag
+ids it opened OR refreshed; `brief` takes them as `ownTagIds`.
+
+**R42 — R1's determinism is "the same inputs AND the same store state".** A
+refresh overwrites `g0`, `tagged_at`, `refresh_count` and `saturation_state` and
+keeps no history, so a past `at` cannot be reconstructed by any filter. G10's two
+runs must not write between them, and a reason's `refreshCount` at a past `at` is a
+post-refresh value.
+
+## What Task 5 must build
+
+1. **A composition root.** `compose(handle, clock, ring, retention)` where `handle`
+   is a `Db` **or a `Transaction`** — Task 8 rebuilds repositories per transaction
+   under R10. Returns every repository. Two tests: each one's `clock` is `===` the
+   one object, and a lexical rule refusing `new *Repository(` / `new AuditChain(`
+   outside that module, with an "exemption is doing work" pair. `HotWindowRepository`
+   takes no clock and is correctly absent from the identity check.
+   *This closes the gate §3 and §8 require and that the plan gives to no task: 7 of
+   8 repository classes take an unchecked clock, and §8's claim that the store
+   refuses a foreign one is false.*
+
+2. **The brief core**, pure, taking
+   `{ at, briefId, triggerId, intent, amount, unit, riskTier, ownTagIds, surprise, policies }`
+   and returning `{ grade, reasons, threshold, effects }`.
+   - `intent` is the reading carried from `observe` (R40).
+   - `surprise: number | null` — it lives only on `trigger_event`, the tag row has
+     none, and recomputing it would judge against a baseline already holding the
+     intent's fold, which R10 forbids. `null` is the single branch that is both R18
+     (categorical) and R29 (cold).
+   - `threshold: { base, applied, loweredBy: tagId[] }` so every grade has an
+     account of itself.
+   - reasons: `{ tagId, observationId, channel, aspect, datedAt: Date | null (R19),
+     strength, relatedness, relatednessCase, refreshCount (R30), source }` where
+     `source` is either readable or
+     `{ code: "SOURCE_UNREADABLE", periodExpired, namespaceErased }` (R13).
+   - effects: a `TriggerToRecord` (= `RecordTriggerEvent`, which already takes
+     `triggerId` and `at`) and an `AuditBodyToAppend` (= `AuditEntryInput`), in that
+     order (R1).
+
+3. **A thin wrapper that performs the effects**, and is the supported entry point.
+   It reads `at` from the clock and mints ids; the core does neither.
+
+4. **The gates the ledger lists, with what each needs.**
+   - **R25 must be a WHITELIST at every depth, not a blacklist.** `AuditChain.append`
+     accepted `{ payload, source, evidence: { ref } }`; a `payload`/`source` key
+     check passes `evidence.ref`. Closed body type plus a runtime whitelist over the
+     rendered canonical JSON (`canonicalForm` is exported).
+   - **`at === clock.now()` is plantable and must be gated in the wrapper.** `record`
+     bounds only the future (R34) and `AuditChain.append` stamps its own
+     `occurredAt`; measured with `at = now − 3d`, the trigger landed at day 8 and the
+     audit row at day 11 with no error. Rule it: the replay entry point performs NO
+     effects.
+   - **R14 needs an observer.** "Before any tag is read" cannot be seen from outside;
+     count `listLive` calls. The refusal can only name a uuid, so the check sits on
+     the first read, `readClear(intentObservationId)`, whose `namespaceErased` flag
+     is what it acts on. A brief on an erased namespace is refused WHOLE, not served
+     as `SOURCE_UNREADABLE` reasons.
+   - **G10's replay test must advance the clock between runs** and must not write
+     between them (R42).
+   - **G9's "the core writes nothing"** by comparing every table's `xmin` before and
+     after. `db.selectFrom(...).select(db.dynamic.ref<string>("xmin"))` works;
+     `db.dynamic.ref("xmin as xmin")` does not — kysely quotes the whole string.
+
+5. **`listLive` needs an upper bound on the instant.** `strengthAt` returns `g0`
+   for every non-positive elapsed, so a tag stamped after `at` reports full
+   strength. Exclude `taggedAt > at` — necessary, and not sufficient (R42).
+
+## What is already settled and needs no work
+
+- **`maxReasons` is NOT needed** and §7's cap question dissolves. Measured at 200
+  reasons: `listLive` 0.8 ms, `readClear` ×200 24 ms, `get` ×200 46 ms sequential
+  and 33 ms parallel. Round trips dominate, not AEAD, and the one-to-two-second
+  budget is about forty times away. What remains to decide is whether M3's reason
+  carries `source.ref` at all, since that lives inside the payload and is the only
+  thing needing a `get`.
+- **A DB-backed engine test needs no gate change.** `kysely` and the store's test
+  harness are both refused in engine test files, and the store's public surface
+  alone suffices: `openDb(base).schema.createSchema(...)`, `migrate(db, <store
+  migrations path>)`, and `.dropSchema(...).cascade()`.
+- **`IdSource.next()` suffices** — two ids per brief; the audit `seq` is
+  DB-assigned.
+- **`AuditChain.append` can carry what R25 requires**, and `policyVersion` is the
+  R26 composite, which `compositePolicyVersion` now builds and refuses.
+
+## Open questions this task inherits
+
+- **Whether M3's reason carries `source.ref`.** It is inside the payload, so
+  carrying it costs one `get` per readable reason and makes the reason unbuildable
+  after the month expires. Design §6:270-273 says each reason carries its sources.
+  R13 already rules what happens when a source will not open; this is the narrower
+  question of whether a source that WILL open is dereferenced.
+- **§7's grade vocabulary is still provisional.** `clear | watch | hold` with R38's
+  rule. Kerem has a veto and it has not been exercised.
+- **R12's fifth cases** are stated limits, not rulings: unnormalised aspect strings
+  (`usdc` against `USDC` are two aspects), compound aspects with no partial-match
+  term, and a `cluster_proximity` intent that reads into TWO aspects — Task 5 must
+  rule max-over-readings or per-reading, which is unruled today.
+
+## Non-negotiables carried from the plan
+
+§3's constraints all still apply. In particular: the engine computes nothing a
+decision depends on; every refusal names its field or class; assert a refusal's
+message and not only its class; override every `BriefPolicy` field in at least one
+test with a number no other field shares; and §3b's mutation step is not optional —
+after green, remove each rule one at a time and record WHICH test goes red.
