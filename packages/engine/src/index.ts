@@ -11,3 +11,5 @@ export * from "./relatedness.js";
 export * from "./grade.js";
 export * from "./composite-version.js";
 export * from "./compose.js";
+export * from "./audit-body.js";
+export * from "./brief.js";
