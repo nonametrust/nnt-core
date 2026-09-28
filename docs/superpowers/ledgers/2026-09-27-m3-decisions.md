@@ -69,6 +69,12 @@ day-twelve address change not a reason, which §9 and Task 9 both require it to
 be. One is refused because at one a different channel is worth exactly as much
 as the same channel and the term is deleted rather than declared.
 
+> **THIS RULE WAS RETIRED AT TASK 4 (R36).** With only three relatedness values it
+> left `relatednessFloor` one admissible position, so the field decided nothing.
+> `crossAspectAffinity` (R35) gives relatedness a fourth value and the rule is gone;
+> what it protected is asserted on `BRIEF_POLICY_V0` instead. Read R36 before
+> acting on the paragraph below.
+
 The rule the plan does not state: **`crossChannelAffinity` must be at least
 `relatednessFloor`**. Each of the two can be in range while the PAIR is
 inverted, and below the floor the term R12 exists to make non-zero can never
@@ -329,7 +335,8 @@ should fail in.
 - **`tagging/src/policy.ts:11-12` still describes the scenario as "a
   five-hundred-unit request … held".** R15 made it 2500 USDC. A stale docstring in
   another package, left alone rather than edited mid-task.
-- **`README.md` is stale in four places** now that the engine exists: line 25
+- ~~**`README.md` is stale in four places**~~ — **done at `68619e5`**; it has an
+  engine row, six gates, and says the engine arrived with M3. The original entry: line 25
   says the engine arrives in a later milestone, the packages table has no engine
   row, the `gates/` row names three gates of six, and "only schema resolves
   through dist" is no longer true. One docs commit before the public tag.
@@ -477,13 +484,16 @@ claim the wrapper must establish.
   corpus produces. R12 names three terms and the data model has four, and design
   §1 puts aspect matching inside `rel()`. **Rule before Task 4.** If that case
   gets a value below `crossChannelAffinity`, `relatednessFloor` stops being inert.
-- **Task 5 must exclude tags whose `taggedAt` is after the brief's `at`.**
+- **Task 5 must exclude tags whose `taggedAt` is after the brief's `at`.** (R42
+  narrowed R1 afterwards; the exclusion STANDS — see R43 below, it is about a past
+  brief being correct and not about determinism.)
   `strengthAt` returns `g0` for every non-positive elapsed, and `listLive` has a
   lower bound on the instant and no upper one, so a replay at a past `at` reports
   every tag refreshed since at FULL strength. That is a determinism hole in G10
   independent of any policy number.
-- **`BriefPolicy` will need four more numbers**, and the field pin should move
-  once rather than three times: `timeoutMs` (R7's engine-set timeout), a
+- **`BriefPolicy` will need four more numbers** — **two of these four are since
+  resolved: R38's `watch` rule needs no number, and `maxReasons` was dropped with a
+  latency measurement. Two remain, both Task 7's.** The original entry: `timeoutMs` (R7's engine-set timeout), a
   lock/statement timeout (R7 puts `Cancelled`/55P03 in the unavailable set, and
   that only fires under a `lock_timeout` the engine sets), **the rule that
   produces `watch`** — §7 rules the grade vocabulary provisionally and nothing
@@ -656,14 +666,32 @@ USDC**. The first defaults were fitted to R15 alone — threshold 3000, lowered 
 2400 or 1920 — and measurement showed §9's own assertion FAILING on the numbers
 this repository ships.
 
-Both are satisfiable at once, so both are satisfied. `briefThreshold` 600 with
-`activeTagFactor` 0.8 leaves 500 above the base bar and below it once one tag is
-active, which is what §9 means by the tag doing the work; 2500 stays held under
-R15's two active tags. The admissible window — above 500, at or below `500 / f` —
-is pinned by a test, so a later change to the factor cannot silently leave one
-scenario behind. `mediumCeiling` moves to 100 to stay under the lower threshold,
-and the seven-tag gap its docstring recorded is nine tags now, computed rather
-than recalled.
+Both are satisfiable at once, so both are satisfied. **At `briefThreshold` 600 and
+`activeTagFactor` 0.8, the day-twenty-one threshold is 600 × 0.8² = 384 and BOTH
+500 and 2500 are held there.** That is what each document literally asserts, and
+it is all that is claimed.
+
+> **THIS PARAGRAPH SAID SOMETHING ELSE AND THE CORPUS REFUTED IT.** It read: "600
+> with 0.8 leaves 500 above the base bar and below it once one tag is active, which
+> is what §9 means by the tag doing the work". Three things wrong. 500 is BELOW
+> 600, so the words were inverted. §9 asks for a `hold` and for the address change
+> to be among the reasons; it says the tag LOWERS the threshold, and lowering is not
+> flipping — the flip was an interpolation. And the flip is unreachable anyway:
+> §9 and R15 share ONE corpus, whose daily-refreshed trustline state is active from
+> day one, so there are never zero active tags, and with the address tag filtered
+> out 500 is still held at 480. The windows where the address tag WOULD be the
+> flipping tag are disjoint — base in (625, 781.25] for 500, (3125, 3906.25] for
+> 2500 — so no single base gives both a flip.
+>
+> `policy.ts` and `policy.test.ts` were corrected at `cef11b7`; this paragraph was
+> not, and a review reading the ledger against the code found it. **Task 9's
+> acceptance is derived from here**, so it matters more than most: Task 9 compares
+> the provider's THRESHOLD before and after day twelve, never grade against grade.
+
+What the test pins is therefore the window in which both holds are true and the base
+still sits above 500 unlowered: `500 < briefThreshold <= 500 / f`. `mediumCeiling`
+moves to 100 to stay under the lower threshold, and the seven-tag gap its docstring
+recorded is nine tags now, computed rather than recalled.
 
 **These numbers are still FITTED, and still declared so.** What changed is that
 they are fitted to both documents instead of one, which removes any need to edit
@@ -830,6 +858,11 @@ to the same output. **G10's two runs must not write between them**, and the reas
   the test counts `listLive` calls. And the refusal can only name a uuid —
   `NamespaceRepository` has no read by uuid — so the check sits on the first read,
   `readClear(intentObservationId)`, whose `namespaceErased` flag is what R14 acts on.
+  (An earlier version of this entry said `NamespaceRepository` has no read by uuid.
+  It has three — `dataKey`, `periodsOf`, `shred` — and `dataKey` raises
+  `NamespaceShredded` on an erased one. The conclusion stands for a different
+  reason: `dataKey` UNWRAPS and hands key material to the engine on the happy path,
+  which is not what a liveness check should do.)
   A brief on an erased namespace is refused whole, not served as
   `SOURCE_UNREADABLE` reasons.
 - **The candidate trigger's `surprise` has no source.** It lives only on
@@ -842,8 +875,10 @@ to the same output. **G10's two runs must not write between them**, and the reas
   public surface alone is enough — `openDb(base).schema.createSchema(...)`,
   `migrate(db, <store migrations path>)` (12 tables), and
   `db.selectFrom(...).select(db.dynamic.ref<string>("xmin"))` for G9's snapshot.
-  One gotcha recorded: `db.dynamic.ref("xmin as xmin")` does not work, kysely quotes
-  the whole string.
+  Two gotchas recorded: `db.dynamic.ref("xmin as xmin")` does not work, kysely
+  quotes the whole string; and the boundary gate refuses the bare word `kysely`
+  **inside a string as well as in code** — comments are blanked and strings are not
+  — so a test title may not name the driver.
 - **`maxReasons` is NOT needed, and §7's cap question dissolves.** Measured at 200
   reasons: `listLive` 0.8 ms, `readClear` ×200 24 ms, `get` ×200 46 ms sequential
   and 33 ms parallel. Round trips dominate, not AEAD, and the one-to-two-second
@@ -863,3 +898,122 @@ by NNT07. So a raw writer can promote the brief's candidate into a harm-confirme
 tiered trigger — not merely edit it. Scope stays M4 as ruled, and it is recorded as
 a known hole in this repository's idiom: a test that asserts the hole, so the day it
 closes is noticed.
+
+## R43-R48: the decisions Task 5 would otherwise have made by accident
+
+A fourth review built Task 5's skeleton from this ledger and reported every place it
+had to guess. Those are ruled here, because a decision made by whichever branch
+catches it first is the failure R5 and §3b both exist to prevent. Each carries what
+it costs.
+
+### R43. The `taggedAt > at` exclusion STANDS, and it is about correctness rather than determinism
+
+R42 narrowed R1's replay claim and said the exclusion "removes that tag entirely",
+which read as though the exclusion might be the problem. It is not. Measured: a tag
+stamped after `at` reads its full `g0` at `at`, because `strengthAt` returns `g0` for
+every non-positive elapsed. A brief at a past instant that counted such a tag would
+be reporting evidence that did not exist yet, at a strength it never had.
+
+So the exclusion stands. What R42 concedes is separate: a REFRESHED tag's earlier
+state is not recoverable, so a past-`at` brief is correct about what existed and
+approximate about its strength. Both sentences are true and they are about different
+things.
+
+### R44. Task 5 computes the threshold; Task 6 becomes the query and its consistency test
+
+Under R39 the lowering set IS the reason set, so `applied = base × factor^|reasons|`
+is one line inside the brief and cannot be deferred. **And the unit refusal cannot
+wait either**: without it a Task 5 brief with `unit: "XLM"` grades a raw number
+against a USDC threshold. R27 already rules the refusal; Task 5 performs it.
+
+Task 6 keeps the intent-scoped `thresholdFor`, its "one value at one instant"
+consistency test, and Task 9's comparison. **Cost:** two task boundaries move, and
+Task 6 is smaller than its text implies. Recorded rather than discovered when Task 6
+finds its work already done.
+
+### R45. `riskTier` is `"low" | "medium" | "high"`, refused by name at runtime
+
+Nowhere in the tree: the design says "low-stakes / mid-tier / high-stakes", the plan
+says "low/mid/high" once and "medium" once. `"medium"` is chosen because
+`mediumCeiling` is already named for it, so the policy field and the tier agree.
+
+Refused at RUNTIME and not only by the type, because a JavaScript caller bypasses
+the type and this value goes into the audit body — which is hashed and outlives
+every key (R25, and the storage card's F7). A tier the vocabulary does not admit
+must not become a permanent row.
+
+### R46. An intent with more than ONE reading is refused in M3, by name
+
+R40 says "the intent's derived reading", singular. `readObservation` returns
+`Reading[]`, and `cluster_proximity` yields TWO — `hops` and `amount` — so R40 is
+unimplementable as written for one of seven channels.
+
+The alternatives were max-over-readings and per-reading briefs. Both invent a rule
+nobody has measured: which of two readings is "the" intent for relatedness, and
+which surprise goes on the candidate trigger. **Ruled: refuse it, by name.** A
+refusal is honest, is one line, and leaves M4 the ruling with a population to
+measure it against. **Cost, stated because it is outward-facing:** a
+`cluster_proximity` intent cannot be briefed in M3, and that belongs in the README
+beside R33's.
+
+### R47. A reason does NOT carry `source.ref` in M3
+
+The source reference lives inside the sealed payload, so carrying it costs one AEAD
+open per readable reason and makes the reason unbuildable once the month expires.
+Three reasons not to:
+
+- **R25 forbids it in the audit body anyway** — the chain outlives both the month
+  key and the namespace key, so a body naming a source would defeat erasure through
+  the audit table.
+- **F3 measured that a refreshed tag's source misdescribes its own evidence**: a tag
+  refreshed forty times names one observation and records the other thirty-nine
+  nowhere. A ref that is right about 1 of 40 events is worse than an honest absence.
+- The latency measurement shows `get` is the only real cost in a brief, and dropping
+  the ref drops it.
+
+So a reason's source is a CODE and its clear columns, never a dereference:
+`SOURCE_PRESENT` when the payload would open, `SOURCE_UNREADABLE` when
+`periodExpired || namespaceErased`. Design §6 says error states are codes; the
+ordinary state needed a code too, and nothing had named it.
+
+**Cost, and it is outward-facing:** design §6:270-273 says each reason carries its
+sources, and in M3 it carries a code and the clear columns rather than a reference.
+That sentence belongs in the README beside R13's and R33's.
+
+### R48. The audit body is a CLOSED type, and the whitelist WALKS it
+
+R25 admits "ids, codes, versions and instants". A grade cannot be explained by those
+alone: `amount`, `unit`, `threshold.base`, `threshold.applied` and each reason's
+`strength` and `relatedness` are none of the four, and **a grade nobody can
+recompute is not auditable** — which is what an audit row is for.
+
+So the body is a closed `BriefAuditBody` type admitting exactly those named fields,
+and the runtime check is a WHITELIST that walks the object at every depth. Not a
+blacklist: review measured `AuditChain.append` accepting
+`{ payload, source, evidence: { ref } }`, so a `payload`/`source` key check passes
+`evidence.ref`. And not a regex over the rendered canonical JSON either, because a
+string VALUE containing `":` fools one.
+
+`AuditEntryInput.kind` for a brief is `"brief"`. None of the admitted numbers is a
+payload field: `amount` is an input (R8), and the strengths and relatednesses are
+computed from tag rows the store already keeps in the clear.
+
+### Recorded as known properties, not ruled away
+
+- **Two briefs on one intent write two candidate triggers.** Measured: no uniqueness
+  on `observation_id`, three `record`s on one observation landed. Each brief is its
+  own decision citing the same intent, so this is correct — and R1's "a retry
+  collides on the primary key" covers only a retry reusing its id.
+- **A retry whose first `record` actually landed sees 23505 on the primary key.** The
+  wrapper must read that as "landed" and continue to the audit append. And R24 —
+  a committed write with no chain entry is a named inconsistency, not a rollback —
+  **extends to the brief verbatim**; the plan rules it for ingest only.
+- **Two `compose` calls with two clocks are invisible to every gate.** The
+  composition root makes one clock the norm, not a guarantee.
+- **A reason whose namespace is erased mid-brief is `SOURCE_UNREADABLE`, not a
+  refusal.** R14 refuses on the INTENT's flag; a reason's flag is R13's business.
+- **The `at === clock.now()` gate can only hold identity under a fixed clock.** With
+  `systemClock`, `occurredAt` trails `at` by milliseconds, so the production property
+  is `at <= occurredAt`.
+- **The compose lexical rule must admit member access.** Review's own first pattern,
+  `new \w*Repository(`, walked past `new store.TagRepository(`.
