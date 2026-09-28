@@ -110,22 +110,18 @@ interface Reason {
 }                                // no source.ref in M3 (R47)
 ```
 
-   `loweredBy` is redundant with `reasons[].tagId` under R39 — they are the same set
-   — and a test should assert that equality rather than let the two drift.
-   - `intent` is the reading carried from `observe` (R40).
-   - `surprise: number | null` — it lives only on `trigger_event`, the tag row has
-     none, and recomputing it would judge against a baseline already holding the
-     intent's fold, which R10 forbids. `null` is the single branch that is both R18
-     (categorical) and R29 (cold).
-   - `threshold: { base, applied, loweredBy: tagId[] }` so every grade has an
-     account of itself.
-   - reasons: `{ tagId, observationId, channel, aspect, datedAt: Date | null (R19),
-     strength, relatedness, relatednessCase, refreshCount (R30), source }` where
-     `source` is either readable or
-     `{ code: "SOURCE_UNREADABLE", periodExpired, namespaceErased }` (R13).
-   - effects: a `TriggerToRecord` (= `RecordTriggerEvent`, which already takes
-     `triggerId` and `at`) and an `AuditBodyToAppend` (= `AuditEntryInput`), in that
-     order (R1).
+   Two notes the types cannot carry. `loweredBy` is redundant with
+   `reasons[].tagId` under R39 — they are the same set — and a test should assert
+   that equality rather than let the two drift. And `surprise` is `null` rather than
+   recomputed because it lives only on `trigger_event`, the tag row has none, and
+   recomputing it would judge against a baseline that already holds the intent's own
+   fold, which R10 forbids.
+
+   The effects are existing store types: `TriggerToRecord` is
+   `RecordTriggerEvent` (which already takes `triggerId` and `at`) and
+   `AuditBodyToAppend` is `AuditEntryInput`, whose `kind` is `"brief"` and whose
+   `policyVersion` is `compositePolicyVersion(...)`. `occurredAt` is stamped by the
+   chain and cannot be carried, which is why the body holds `at` itself.
 
 3. **A thin wrapper that performs the effects**, and is the supported entry point.
    It reads `at` from the clock and mints ids; the core does neither.
