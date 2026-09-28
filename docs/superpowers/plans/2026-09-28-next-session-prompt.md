@@ -18,12 +18,12 @@ sıradaki iş Görev 5, brief'in çekirdeği.** Dal `m3-sync-path`, çalışma d
     bütün — beş yere dağılmış hâlinden bir review'ın tahmin etmek zorunda
     kalmasıyla yazıldı.
   docs/superpowers/ledgers/2026-09-27-m3-decisions.md
-    R33-R48, yani planın taşımadığı ON ALTI ruling, her biri ölçümüyle ve neye
-    mal olduğuyla. "Round three, lens three" ve "R43-R48" bölümleri Görev 5'in
+    R33-R49, yani planın taşımadığı ON YEDİ ruling, her biri ölçümüyle ve neye
+    mal olduğuyla. "Round three, lens three" ve "R43-R49" bölümleri Görev 5'in
     zemini. Plandan daha yeni; çeliştikleri yerde bu kazanır ve nedenini söyler.
   docs/superpowers/plans/2026-09-27-m3-sync-path.md
     R1-R32, §3 genel kısıtlar, §3b mutasyon adımı, §5 kapı tablosu. Hâlâ otorite,
-    ama R33-R48 onu dört yerde değiştiriyor.
+    ama R33-R49 onu dört yerde değiştiriyor.
   git log --oneline 11db2ac..HEAD
 
 DİSİPLİN, bu sırayla ve atlamadan:

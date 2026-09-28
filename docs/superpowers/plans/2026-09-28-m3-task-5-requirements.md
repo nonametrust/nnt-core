@@ -2,7 +2,7 @@
 
 > **Why this file exists.** Task 5's text in
 > `docs/superpowers/plans/2026-09-27-m3-sync-path.md` was written before Tasks 1-4
-> ran and before four review rounds. Ten rulings the plan does not have (R33-R42)
+> ran and before four review rounds. Seventeen rulings the plan does not have (R33-R49)
 > now constrain it, four of them change its shape, and two make its acceptance
 > criteria unbuildable as written. This file is the delta: read the plan for
 > R1-R32 and the general constraints, read this for what changed and why.
@@ -168,7 +168,7 @@ interface Reason {
 - **`AuditChain.append` can carry what R25 requires**, and `policyVersion` is the
   R26 composite, which `compositePolicyVersion` now builds and refuses.
 
-## Settled since this file was first written (R43-R48 in the ledger)
+## Settled since this file was first written (R43-R49 in the ledger)
 
 - **The reason carries a CODE and no `source.ref`** (R47), with three measured
   reasons. Outward-facing: design §6:270-273 says each reason carries its sources,
@@ -183,6 +183,9 @@ interface Reason {
 - **The audit body is a closed type whose whitelist WALKS the object** (R48), and it
   admits the named numbers a grade cannot be recomputed without.
 - **The `taggedAt > at` exclusion stands** (R43).
+- **R49 is owed before Task 6, not Task 5:** a lexical gate refusing `.activeFloor`
+  and `.relatednessFloor` outside `relatedness.ts` and `policy.ts`, because nothing
+  else stops Task 6 lowering the threshold by strength alone.
 
 ## Open questions this task still inherits
 
