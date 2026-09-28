@@ -998,6 +998,26 @@ string VALUE containing `":` fools one.
 payload field: `amount` is an input (R8), and the strengths and relatednesses are
 computed from tag rows the store already keeps in the clear.
 
+### R49. R39's "one predicate for both jobs" needs a GATE, owed before Task 6
+
+`isReason`'s docstring says the same set lowers the threshold and is cited, and
+nothing enforces it. Measured lexically: in the engine's non-test source
+`activeFloor` is compared in exactly one place and `relatednessFloor` in one, both in
+`relatedness.ts` — so nothing stops Task 6 writing a `thresholdFor` that filters on
+`strength >= activeFloor` alone, and no test would go red, because no test imports a
+threshold function yet.
+
+**The gate, in the idiom of `gates/no-horizon-outside-reader.test.ts`:** refuse the
+tokens `.activeFloor` and `.relatednessFloor` anywhere in `packages/engine/src`
+outside `relatedness.ts` and `policy.ts`, so the only way to lower a threshold or
+cite a reason is through `isReason`. It belongs with Task 6, which is the first task
+that could break the rule.
+
+Until it exists the claim rests on convention. The claim itself was checked and
+holds: enumerating 32 tag subsets against 10 amounts under the shipped policy with
+`isReason` applied to both jobs produced zero unaccounted holds below the base
+threshold.
+
 ### Recorded as known properties, not ruled away
 
 - **Two briefs on one intent write two candidate triggers.** Measured: no uniqueness
@@ -1017,3 +1037,15 @@ computed from tag rows the store already keeps in the clear.
   is `at <= occurredAt`.
 - **The compose lexical rule must admit member access.** Review's own first pattern,
   `new \w*Repository(`, walked past `new store.TagRepository(`.
+- **`compositePolicyVersion` accepts an interior newline, NUL and a lone surrogate**,
+  all of which `canonicalForm` then refuses at append time — three functions deep,
+  which is what `assertBriefPolicy`'s own docstring says it exists to avoid. It also
+  accepts a zero-width-space-only component as non-blank, because `trim()` does not
+  strip one. Interior CR, tab, backslash, U+2044, U+FF0F and a 100,000-character
+  component all round-trip correctly.
+- **The R31 hole is wider than its test asserts**, and the test says so now: a raw
+  `INSERT` of a fabricated `harm_confirmed` tier-A trigger succeeds, and then the
+  REAL `HotWindowRepository.open` and `PermanentRecordRepository.promote` both cite
+  it. Moving a trigger to another namespace succeeds when its observation moves too.
+  A raw writer can manufacture graded evidence that downstream tables then trust,
+  not merely edit a candidate.

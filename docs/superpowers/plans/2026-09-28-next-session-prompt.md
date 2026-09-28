@@ -80,6 +80,18 @@ REVIEW BRIEF'İNDE HER ZAMAN OLACAKLAR:
     yakaladı; `ALTER DATABASE` komutu `-d` olmadan exit 2 veriyor, yani başarısız
     bir ALTER'dan sonraki koşu hiçbir şey kanıtlamaz.
 
+DÖRDÜNCÜ TURUN EKLEDİĞİ İKİ ŞEY:
+  - **R49: Görev 6'dan önce bir kapı borçlu.** `isReason`'ın "aynı küme her iki iş
+    için" iddiasını hiçbir şey tutmuyor; `.activeFloor` ve `.relatednessFloor`
+    token'larını `relatedness.ts` ve `policy.ts` dışında reddeden leksikal bir kapı
+    gerekiyor, yoksa Görev 6 eşiği yalnız güçle düşürebilir ve hiçbir test kırmızıya
+    dönmez.
+  - **Üç test "yanlış sebepten" geçiyordu** ve mutasyon buldu: bir kontrol asla
+    doğru olmayan bir `if` içindeydi; bir mesaj-doğrulaması mesajın kendi kuyruğuyla
+    tatmin oluyordu; bir fixture'ın iki tabanı arasında hiçbir değer yoktu. Üçü de
+    düzeltildi — ama sınıf olarak tekrar edecek: **bir doğrulama yeşil olduğu için
+    doğru şeyi ölçtüğünü kanıtlamaz.**
+
 GÖREV 5'İN İNŞA EDECEĞİ ŞEYLER şartname dosyasında sırayla yazılı: composition
 root (+ clock kimlik testi + leksikal kural), çekirdek (saf), wrapper (efektleri
 uygulayan tek giriş noktası), ve altı kapı. Kapıların her biri için "neye ihtiyacı
