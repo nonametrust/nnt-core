@@ -1798,3 +1798,114 @@ is appended when the store returns. Neither is built: `availability.ts` classifi
 decides, and nothing yet writes the outage anywhere. Both belong with the ingest path in
 Task 8, which is where a caller exists to do the writing, and they are recorded here so
 Task 8 does not have to rediscover that it owns them.
+
+### Task 7's review round: R65 was wrong, and the store could crash before any policy ran
+
+A correctness lens at `fa7c5b8`. Store 532 -> 534, engine 486 -> 523.
+
+**R65 IS CORRECTED, and it was wrong in the direction that matters.** It ruled that an
+unmapped SQLSTATE is a refusal, on the argument that "the server answered, which is the
+opposite of an outage". **That is false for the classes whose whole meaning is that the
+server is unavailable**, and a review measured it live: `pg_terminate_backend` on a
+blocked backend gives `57P01`, which classified as a refusal, so the tiered policy would
+never have run on a database that was shutting down. The same held for `57P03`
+(`cannot_connect_now`, the canonical "database system is starting up"), class 08
+(connection exception), class 53 (insufficient resources: out of connections, disk or
+memory) and `XX000`.
+
+Corrected: classes 08, 53 and XX, plus `57P01`-`57P05`, are `connection`. **Not the
+whole of class 57** — `57014 query_canceled` is in it and keeps its own condition, which
+a class-wide rule would have lost. The right sentence is the narrow one: a SQLSTATE that
+describes the STATEMENT is a refusal; one that describes the SERVER is an outage.
+
+**A five-character libuv code was read as a SQLSTATE.** `EPIPE`, `EBADF`, `EBUSY`,
+`EPERM`, `EINTR`, `ENXIO`, `EROFS`, `EXDEV` and `EFBIG` all match `/^[0-9A-Z]{5}$/`,
+and the comment beside it claimed "a libuv error code is not five characters". So
+`EPIPE` — a write to a socket the server already closed, which is precisely a dead
+connection — classified as a refusal. The discriminator is a DIGIT: every real Postgres
+SQLSTATE carries one, because the three-character subclass always does (`XX000` and
+`HV00L` included), and no libuv code does. Checked against the full class list rather
+than assumed.
+
+**R7's FOURTH condition existed in the plan and not in the code.** G15's row is titled
+"the four unavailable conditions" and R7 says "only an exhausted retry becomes
+unavailable"; there were three, and `RetriesExhausted` fell through to `connection`. So
+an exhausted deadlock retry — against a server that answered every single time — would
+have been written down as a connection outage. `retries_exhausted` is now its own
+condition.
+
+**A thrown string, number or null classified as an outage.** A programming fault is not
+a degraded database, and reporting it as one sends the tiered policy after a healthy
+server because a caller threw the wrong thing.
+
+### R68. `openDb`'s pool had no error handler, and one dropped connection killed the process
+
+Found by the same review and reproduced independently before fixing. Node's
+EventEmitter rethrows an unhandled `'error'`, and `pg.Pool` emits one when the server
+drops a connection **no query is waiting on** — a restart, a failover, an administrator
+running `pg_terminate_backend`. Measured: the process died with "Unhandled 'error' event
+… terminating connection due to administrator command", exit 1.
+
+**This defeats R7 entirely rather than merely logging badly.** A tiered response to the
+store being unavailable cannot run in a process the store has already taken down with
+it. An unavailability policy whose first act is to crash is not a policy.
+
+Fixed in `openDb`, with two rows: the process survives a terminated idle connection, and
+the pool still serves afterwards — because "did not crash" and "still works" are
+different claims and the first would pass for a pool that quietly stopped.
+
+**The store's own clock gate caught the fix.** The first version stamped the stderr line
+with `new Date()`, which `clock-gate.test.ts` refuses outside two exempt modules;
+`openDb` is a connection factory and is handed no `Clock`. The line carries no timestamp
+now — whatever collects stderr stamps it, which is the right place for an instant nobody
+injected.
+
+### R69. The engine's own timeout MANUFACTURES the outage it reports, and that is gated
+
+`withStoreTimeout` races and walks away: it does not cancel the query or release the
+connection. Measured on the real cluster: ten timed-out `listLive` calls against a locked
+table left **ten backends still waiting on the lock**, and an eleventh call —
+`select 1`, which the server answers instantly — timed out too, because the pool's ten
+clients were all held by abandoned queries.
+
+So R7's third condition, once it has fired enough times, makes every later call an engine
+timeout regardless of the server's health, and the tiered policy runs against a database
+that is up.
+
+**Gated with a row that measures the drain**, not described in a docstring, so the day it
+is fixed the row goes red and says so. The fix is not more racing: a bound the engine
+sets must be paired with one the SERVER sets — `statement_timeout` / `lock_timeout` on
+the composition's connection — so that abandoning a call also ends it. Recorded as owed
+rather than built, because `compose` is handed a `Db` that is already open and the engine
+does not own the connection string.
+
+**And a budget above 2^31-1 fired after one millisecond.** Node's timer takes a 32-bit
+delay, so the largest budgets behaved like the smallest while `Number.isFinite` admitted
+them. Refused by name now.
+
+### R7's stderr line exists, and R27's pattern does not apply to a utility's argument
+
+`reportUnavailable` writes one structured line: the event, the instant, the condition,
+the decision, its code, the tier and a subject. **Codes and ids only** — the failure's
+message is not written, because it can carry an observed value and a line on stderr is as
+durable as whatever collects it.
+
+It is what makes the plan's "low proceeds **and logs**" and G16's third plant — "low's
+log line dropped" — runnable at all. Neither was, until this existed.
+
+**On the review's sharpest remaining point:** `withStoreTimeout` takes its budget from the
+caller, which is the pattern R27 forbids for `mediumCeiling`. The two are not alike. R27's
+ceiling is a DECISION — a caller supplying it is a caller raising the bar it must clear —
+while a timeout budget is a utility's argument with no caller yet. Ruled: when the timeout
+is wired into a brief, the budget comes from the policy; a `BriefPolicy.timeoutMs` added
+today would be a field nothing reads, which is the shape this milestone has already found
+drifts. Recorded so the wiring task does not have to rediscover it.
+
+### Still owed, corrected
+
+The previous entry handed R7's stderr line and reconciliation row to Task 8. The stderr
+line is built. **The reconciliation audit row is NOT Task 8's**, and the review was right
+that the deferral was mis-addressed: Task 8's "Does" is the ingest path and R7 is not in
+it, while the tiered policy takes an amount and a risk tier, which are the BRIEF's inputs.
+It belongs with whichever task wires the unavailability path into the brief, and the plan
+should say so before that task starts.

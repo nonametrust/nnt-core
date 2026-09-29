@@ -16,7 +16,17 @@ import type { BriefPolicy } from "./policy.js";
  * condition is what goes to structured stderr — the audit chain lives in the same
  * Postgres that is unavailable, so the chain cannot be the record of its own outage.
  */
-export type UnavailableCondition = "connection" | "cancelled" | "engine_timeout";
+export type UnavailableCondition =
+  | "connection"
+  | "cancelled"
+  | "engine_timeout"
+  /**
+   * R7's fourth: "only an exhausted retry becomes unavailable". G15's row is titled
+   * "the four unavailable conditions" and there were three -- so a `RetriesExhausted`
+   * fell through to `connection`, and an exhausted DEADLOCK retry, against a server
+   * that answered every single time, was written down as a connection outage.
+   */
+  | "retries_exhausted";
 
 /**
  * A timeout the ENGINE set, R7's third condition.
@@ -61,20 +71,59 @@ export class RetriesExhausted extends Error {
 export const CANCELLED_SQLSTATES: ReadonlySet<string> = new Set(["55P03", "57014"]);
 
 /**
- * The SQLSTATEs R28 retries: both deadlock spellings, and the unique-violation the
- * live-tag pair raises under a race.
+ * The SQLSTATEs R28 retries on sight: both deadlock spellings.
  *
- * `23505` is here and is NOT retryable on its own — see `isRetryable`, which requires
- * the constraint name. The set exists so a RAW 23505 from a non-mapping path is not
- * mistaken for an outage; whether it is retried is a narrower question.
+ * READ BY `isRetryable`, which is a correction. An earlier version of this set also
+ * carried `23505` and was read by nothing at all -- a review measured that emptying it
+ * turned exactly one test red, the one that asserted its own contents. `23505` is not
+ * here because it is retryable only on ONE constraint, which a SQLSTATE cannot say.
  */
-export const RETRYABLE_SQLSTATES: ReadonlySet<string> = new Set(["40P01", "40001", "23505"]);
+export const RETRYABLE_SQLSTATES: ReadonlySet<string> = new Set(["40P01", "40001"]);
+
+/**
+ * The SQLSTATEs whose whole meaning is that the server is unavailable.
+ *
+ * **MEASURED, and this set is a defect being closed rather than a precaution.** A
+ * review terminated a blocked backend with `pg_terminate_backend` and got `57P01`,
+ * which classified as a REFUSAL -- because the rule was "an unmapped SQLSTATE means
+ * the server answered, which is the opposite of an outage". That is false for exactly
+ * these classes: **the server answered to say it is unavailable.**
+ *
+ * - **08** connection exception: the connection failed or was violated.
+ * - **53** insufficient resources: out of connections, disk or memory.
+ * - **57P0x** operator intervention: admin shutdown, crash shutdown, `cannot_connect_now`
+ *   (the canonical "database system is starting up"), idle-session timeout.
+ * - **XX** internal error.
+ *
+ * NOT the whole of class 57: `57014 query_canceled` is in it and is a CANCELLED
+ * statement, which keeps its own condition. A class-wide rule would have lost that.
+ */
+const OUTAGE_SQLSTATE_CLASSES: readonly string[] = ["08", "53", "XX"];
+const OUTAGE_SQLSTATES: ReadonlySet<string> = new Set([
+  "57P01",
+  "57P02",
+  "57P03",
+  "57P04",
+  "57P05",
+]);
 
 /** The one unique key R28 names for a retry. */
 const RETRYABLE_CONSTRAINT = "tag_one_live_per_pair";
 
-/** A SQLSTATE is five characters; a libuv error code is not. */
-const SQLSTATE = /^[0-9A-Z]{5}$/;
+/**
+ * A SQLSTATE is five characters **containing at least one digit**.
+ *
+ * The digit is the whole point and it is a correction. An earlier version was
+ * `/^[0-9A-Z]{5}$/`, with a comment claiming "a libuv error code is not five
+ * characters" -- and `EPIPE`, `EBADF`, `EBUSY`, `EPERM`, `EINTR`, `ENXIO`, `EROFS`,
+ * `EXDEV` and `EFBIG` all are. So `EPIPE`, which is what a write to a socket the
+ * server already closed produces, was read as a SQLSTATE and classified as a refusal.
+ *
+ * Every real Postgres SQLSTATE carries a digit: the class may be letters (`XX`, `HV`)
+ * but the three-character subclass always has one, `XX000` and `HV00L` included. No
+ * libuv code does.
+ */
+const SQLSTATE = /^(?=.*[0-9])[0-9A-Z]{5}$/;
 
 /**
  * The SQLSTATE an error carries, from whichever shape it arrived in.
@@ -119,6 +168,7 @@ function sqlstateOf(e: unknown): string | null {
  */
 export function classifyStoreFailure(e: unknown): UnavailableCondition | null {
   if (e instanceof EngineTimeout) return "engine_timeout";
+  if (e instanceof RetriesExhausted) return "retries_exhausted";
   if (e instanceof Cancelled) return "cancelled";
   // EVERY OTHER CLASS THE STORE NAMED IS A REFUSAL, `Deadlocked` included. The store
   // built it, so the server answered and said what was wrong; that is the opposite of
@@ -133,7 +183,12 @@ export function classifyStoreFailure(e: unknown): UnavailableCondition | null {
 
   const sqlstate = sqlstateOf(e);
   if (sqlstate !== null) {
-    return CANCELLED_SQLSTATES.has(sqlstate) ? "cancelled" : null;
+    if (CANCELLED_SQLSTATES.has(sqlstate)) return "cancelled";
+    // A SQLSTATE whose meaning IS unavailability. Checked before the refusal default,
+    // because "the server answered" is not the same as "the server is working".
+    if (OUTAGE_SQLSTATES.has(sqlstate)) return "connection";
+    if (OUTAGE_SQLSTATE_CLASSES.includes(sqlstate.slice(0, 2))) return "connection";
+    return null;
   }
   // No SQLSTATE at all, and not a class the store named. Reached only for an error
   // that came out of a store call, so the server never answered: a refused
@@ -141,6 +196,10 @@ export function classifyStoreFailure(e: unknown): UnavailableCondition | null {
   // our own validation is not one of those and never reaches here on the real path,
   // because input is refused by name before any store call is made.
   if (e instanceof RangeError || e instanceof TypeError) return null;
+  // A thrown string, number, null or object is a programming fault rather than an
+  // outage, and reporting it as one would send the tiered policy after a healthy
+  // database because a caller threw the wrong thing.
+  if (!(e instanceof Error)) return null;
   return "connection";
 }
 
@@ -163,7 +222,7 @@ export function isRetryable(e: unknown): boolean {
     return e.sqlstate === "23505" && e.constraint === RETRYABLE_CONSTRAINT;
   }
   const sqlstate = sqlstateOf(e);
-  return sqlstate === "40P01" || sqlstate === "40001";
+  return sqlstate !== null && RETRYABLE_SQLSTATES.has(sqlstate);
 }
 
 /** What the tiered policy decided, with the code it is recorded under. */
@@ -218,6 +277,54 @@ export function tierUnderUnavailability(
   return amount < policy.mediumCeiling ? proceed : refuse;
 }
 
+/** What a report of an outage carries. Ids, codes and instants, as R25 admits. */
+export interface UnavailabilityReport {
+  readonly event: "engine.store.unavailable";
+  readonly at: string;
+  readonly condition: UnavailableCondition;
+  readonly decision: "proceed" | "refuse";
+  readonly code: UnavailabilityDecision["code"];
+  readonly riskTier: RiskTier;
+  readonly subject: string | null;
+}
+
+/**
+ * Writes the outage to structured stderr, R7.
+ *
+ * **STDERR AND NOT THE AUDIT CHAIN**, which is the whole reason this function exists
+ * rather than an audit append: the chain lives in the same Postgres that is
+ * unavailable, so it cannot be the record of its own outage. R7 also asks for a
+ * reconciliation audit row when the store returns; that needs a caller with a live
+ * store and is recorded as owed.
+ *
+ * **CODES AND IDS ONLY**, R21. The failure's own message is not written: it can carry
+ * an observed VALUE -- `surpriseOf`'s `RangeError` does -- and a line on stderr is as
+ * durable as whatever collects it.
+ *
+ * The plan's Task 7 acceptance says "low proceeds **and logs**" and G16's third plant
+ * is "low's log line dropped". Neither was runnable until this existed.
+ */
+export function reportUnavailable(
+  condition: UnavailableCondition,
+  riskTier: RiskTier,
+  decision: UnavailabilityDecision,
+  at: Date,
+  subject: string | null = null,
+  write: (line: string) => void = (line) => process.stderr.write(line),
+): UnavailabilityReport {
+  const report: UnavailabilityReport = {
+    event: "engine.store.unavailable",
+    at: at.toISOString(),
+    condition,
+    decision: decision.decision,
+    code: decision.code,
+    riskTier,
+    subject,
+  };
+  write(`${JSON.stringify(report)}\n`);
+  return report;
+}
+
 /**
  * R7's third condition: a bound the ENGINE sets on a store call.
  *
@@ -227,6 +334,22 @@ export function tierUnderUnavailability(
  *
  * The call's OWN failure passes through unchanged — a timeout reported for a store
  * that refused in 3ms would send the tiered policy after a database that is up.
+ *
+ * **WHAT THIS DOES NOT DO, and it is a real hazard rather than a caveat.** Racing
+ * abandons the call; it does not cancel the query or release the connection. A review
+ * measured the consequence on the real cluster: ten timed-out `listLive` calls against
+ * a locked table left **ten backends still waiting on the lock**, and the eleventh
+ * call — `select 1`, which the server answers instantly — timed out too, because the
+ * pool's ten clients were all held by abandoned queries. So this condition, once it
+ * fires enough times, MANUFACTURES the outage it is meant to report, and the tiered
+ * policy then runs against a database that is up.
+ *
+ * It is gated by a test that measures the drain rather than left as prose. The fix is
+ * not more racing: a bound the engine sets must be paired with one the SERVER sets, so
+ * that abandoning a call also ends it. That is `statement_timeout` / `lock_timeout` on
+ * the composition's connection, and it is recorded as owed rather than built here
+ * because the engine does not own the connection string — `compose` is handed a
+ * `Db` that is already open.
  */
 export async function withStoreTimeout<T>(
   call: () => Promise<T>,
@@ -235,6 +358,16 @@ export async function withStoreTimeout<T>(
 ): Promise<T> {
   if (!Number.isFinite(budgetMs) || budgetMs <= 0) {
     throw new RangeError(`timeout budget must be a positive finite number, got ${budgetMs}`);
+  }
+  // NODE'S TIMER TAKES A 32-BIT DELAY. Above 2^31-1 it warns and fires after ONE
+  // MILLISECOND, so the largest budgets behave like the smallest -- measured: a budget
+  // of 2_147_483_648 raised its timeout after 2ms. `Number.isFinite` admits it, so the
+  // bound has to be named here.
+  if (budgetMs > MAX_TIMER_MS) {
+    throw new RangeError(
+      `timeout budget must be at most ${MAX_TIMER_MS}ms, got ${budgetMs}: above that a ` +
+        `timer fires after one millisecond instead of waiting`,
+    );
   }
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -253,6 +386,11 @@ export async function withStoreTimeout<T>(
     if (timer !== undefined) clearTimeout(timer);
   }
 }
+
+/**
+ * The largest delay `setTimeout` honours. Above it the timer fires immediately.
+ */
+const MAX_TIMER_MS = 2_147_483_647;
 
 /** What a bounded retry needs to know. */
 export interface RetryBound {

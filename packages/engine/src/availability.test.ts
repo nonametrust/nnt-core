@@ -20,6 +20,8 @@ import {
   tierUnderUnavailability,
   withStoreTimeout,
   RetriesExhausted,
+  reportUnavailable,
+  type UnavailabilityReport,
 } from "./availability.js";
 
 // Task 7: R6, R7, R27's ceiling, R28.
@@ -120,17 +122,119 @@ describe("classifyStoreFailure", () => {
     });
   });
 
-  it("treats an unmapped sqlstate as a refusal and not as an outage", () => {
-    // A SQLSTATE the store does not map still means the server answered. Calling that
-    // unavailable would run the tiered policy on a database that is up.
-    expect(classifyStoreFailure(driverError({ code: "42P01" }))).toBeNull();
+  it("treats an unmapped sqlstate as a refusal when the server answered ABOUT THE QUERY", () => {
+    // A SQLSTATE that describes the statement means the server is up and said what was
+    // wrong with what it was asked. Calling that unavailable would run the tiered
+    // policy on a database that is up.
+    for (const code of ["42P01", "22P02", "23502", "P0001"]) {
+      expect(classifyStoreFailure(driverError({ code })), code).toBeNull();
+    }
   });
 
-  it("holds the two sqlstate sets apart, and names them", () => {
+  describe("a sqlstate whose whole meaning is THE SERVER IS UNAVAILABLE", () => {
+    // THE DEFECT THIS CLOSES, and a review measured it live: `pg_terminate_backend` on
+    // a blocked backend gives `57P01`, which classified as a REFUSAL. The ledger's
+    // justification -- "the server answered, which is the opposite of an outage" -- is
+    // false for exactly these classes: **the server answered to say it is
+    // unavailable**. The tiered policy would never have run on a database that was
+    // restarting, full, shutting down, or dropping the connection.
+
+    it.each([
+      ["57P01 admin_shutdown, the terminated backend", "57P01"],
+      ["57P02 crash_shutdown", "57P02"],
+      ["57P03 cannot_connect_now, the canonical restart error", "57P03"],
+      ["57P05 idle_session_timeout", "57P05"],
+      ["08006 connection_failure", "08006"],
+      ["08001 unable_to_establish", "08001"],
+      ["08P01 protocol_violation", "08P01"],
+      ["53300 too_many_connections", "53300"],
+      ["53100 disk_full", "53100"],
+      ["53200 out_of_memory", "53200"],
+      ["XX000 internal_error", "XX000"],
+    ])("%s is a connection outage", (_label, code) => {
+      expect(classifyStoreFailure(driverError({ code }))).toBe("connection");
+    });
+
+    it("does not swallow the query-cancelled codes, which keep their own condition", () => {
+      // 57014 is in class 57 too, and it is a CANCELLED statement rather than an outage.
+      // A class-wide rule that took the whole 57 class would have lost that distinction.
+      expect(classifyStoreFailure(driverError({ code: "57014" }))).toBe("cancelled");
+      expect(classifyStoreFailure(driverError({ code: "55P03" }))).toBe("cancelled");
+    });
+
+    it("is not retried, because an outage is the tiered policy's business", () => {
+      expect(isRetryable(driverError({ code: "57P01" }))).toBe(false);
+      expect(isRetryable(driverError({ code: "53300" }))).toBe(false);
+    });
+  });
+
+  describe("a libuv code that is five uppercase characters", () => {
+    // The second defect the same review measured. `EPIPE` is what a write to a socket
+    // the server already closed produces -- a dead connection -- and the shape regex
+    // `/^[0-9A-Z]{5}$/` matched it, so it was read as a SQLSTATE and classified as a
+    // refusal. The docstring claimed "a libuv error code is not five characters".
+    //
+    // The discriminator is a DIGIT: every real Postgres SQLSTATE contains one (the
+    // subclass is three characters and always carries digits, `XX000` and `HV00L`
+    // included) and no libuv code does.
+    it.each(["EPIPE", "EBADF", "EBUSY", "EPERM", "EINTR", "ENXIO", "EROFS", "EXDEV", "EFBIG"])(
+      "%s is a connection outage, not a sqlstate",
+      (code) => {
+        expect(classifyStoreFailure(driverError({ code }))).toBe("connection");
+      },
+    );
+
+    it("still reads a real sqlstate that is mostly letters", () => {
+      expect(classifyStoreFailure(driverError({ code: "XX000" }))).toBe("connection");
+      expect(classifyStoreFailure(driverError({ code: "P0001" }))).toBeNull();
+    });
+  });
+
+  describe("an exhausted retry is R7's FOURTH condition", () => {
+    // G15's row is titled "the four unavailable conditions" and R7 says "only an
+    // exhausted retry becomes unavailable". There were three, and `RetriesExhausted`
+    // fell through to `connection` -- so an exhausted deadlock retry, against a server
+    // that answered every single time, would have been written to stderr as a
+    // connection outage.
+    it("is named as itself and not as a connection", () => {
+      expect(classifyStoreFailure(new RetriesExhausted("fold", 3, "obs-1"))).toBe(
+        "retries_exhausted",
+      );
+    });
+
+    it("is not retried again", () => {
+      expect(isRetryable(new RetriesExhausted("fold", 3, "obs-1"))).toBe(false);
+    });
+  });
+
+  describe("something that is not an Error at all", () => {
+    // A thrown string, number or null is a programming fault, not an outage. Reporting
+    // it as one would send the tiered policy after a healthy database because a
+    // caller threw the wrong thing.
+    it.each([["a string", "boom"], ["a number", 42], ["null", null], ["undefined", undefined]])(
+      "%s is not classified as an outage",
+      (_label, thrown) => {
+        expect(classifyStoreFailure(thrown)).toBeNull();
+      },
+    );
+  });
+
+  it("holds the two sqlstate sets apart, names them, and USES them", () => {
     expect([...CANCELLED_SQLSTATES].sort()).toEqual(["55P03", "57014"]);
-    expect([...RETRYABLE_SQLSTATES].sort()).toEqual(["23505", "40001", "40P01"]);
+    // 23505 is NOT here. It used to be, and a review measured that the whole set was
+    // read by nothing -- emptying it turned red only the row asserting its own
+    // contents. It is retryable on ONE constraint, which a SQLSTATE cannot say.
+    expect([...RETRYABLE_SQLSTATES].sort()).toEqual(["40001", "40P01"]);
     for (const code of CANCELLED_SQLSTATES) {
       expect(RETRYABLE_SQLSTATES.has(code), `${code} is in both sets`).toBe(false);
+    }
+    // Each set is read by the function that claims it, so emptying either changes an
+    // ANSWER and not only this row.
+    for (const code of RETRYABLE_SQLSTATES) {
+      expect(isRetryable(driverError({ code })), `${code} must be retried`).toBe(true);
+    }
+    for (const code of CANCELLED_SQLSTATES) {
+      expect(classifyStoreFailure(driverError({ code })), code).toBe("cancelled");
     }
   });
 });
@@ -228,6 +332,73 @@ describe("tierUnderUnavailability (R6, R27's ceiling)", () => {
   });
 });
 
+describe("reportUnavailable (R7's structured stderr)", () => {
+  const captured: string[] = [];
+  const write = (line: string): void => void captured.push(line);
+  const AT = new Date("2026-09-21T00:00:00.000Z");
+
+  it("writes ONE structured line a machine can read", () => {
+    captured.length = 0;
+    const decision = tierUnderUnavailability("low", 1, POLICY);
+    reportUnavailable("connection", "low", decision, AT, "obs-1", write);
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.endsWith("\n"), "not newline-terminated").toBe(true);
+    expect(JSON.parse(captured[0]!)).toEqual({
+      event: "engine.store.unavailable",
+      at: "2026-09-21T00:00:00.000Z",
+      condition: "connection",
+      decision: "proceed",
+      code: "STORE_UNAVAILABLE_PROCEEDED",
+      riskTier: "low",
+      subject: "obs-1",
+    });
+  });
+
+  it("is what makes 'low proceeds AND LOGS' a testable sentence", () => {
+    // The plan's acceptance for Task 7 and G16's third planted violation both name a
+    // log line that did not exist, so the plant could not be run at all.
+    captured.length = 0;
+    reportUnavailable("cancelled", "low", tierUnderUnavailability("low", 1, POLICY), AT, null, write);
+    const line = JSON.parse(captured[0]!) as UnavailabilityReport;
+    expect(line.riskTier).toBe("low");
+    expect(line.decision).toBe("proceed");
+  });
+
+  it("records each of the four conditions by name", () => {
+    for (const condition of ["connection", "cancelled", "engine_timeout", "retries_exhausted"] as const) {
+      captured.length = 0;
+      reportUnavailable(condition, "high", tierUnderUnavailability("high", 1, POLICY), AT, null, write);
+      expect((JSON.parse(captured[0]!) as UnavailabilityReport).condition, condition).toBe(condition);
+    }
+  });
+
+  it("carries NO message, because a message can carry an observed value (R21)", () => {
+    captured.length = 0;
+    reportUnavailable(
+      "connection",
+      "medium",
+      tierUnderUnavailability("medium", 1, POLICY),
+      AT,
+      "obs-9",
+      write,
+    );
+    const keys = Object.keys(JSON.parse(captured[0]!) as object).sort();
+    expect(keys).toEqual(["at", "code", "condition", "decision", "event", "riskTier", "subject"]);
+    for (const forbidden of ["message", "cause", "stack", "error", "detail"]) {
+      expect(keys, forbidden).not.toContain(forbidden);
+    }
+  });
+
+  it("writes the refusal too, so an outage is never silent whichever way it went", () => {
+    captured.length = 0;
+    reportUnavailable("connection", "high", tierUnderUnavailability("high", 5, POLICY), AT, null, write);
+    const line = JSON.parse(captured[0]!) as UnavailabilityReport;
+    expect(line.decision).toBe("refuse");
+    expect(line.code).toBe("STORE_UNAVAILABLE_REFUSED");
+  });
+});
+
 describe("withStoreTimeout (the engine's own timeout, R7's third condition)", () => {
   it("returns the value when the call finishes in time", async () => {
     await expect(withStoreTimeout(() => Promise.resolve(7), 1000, "listLive")).resolves.toBe(7);
@@ -277,6 +448,17 @@ describe("withStoreTimeout (the engine's own timeout, R7's third condition)", ()
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("refuses a bound above the largest delay a timer honours", async () => {
+    // Node's timer takes a 32-bit delay: above 2^31-1 it warns and fires after ONE
+    // millisecond, so the largest budget behaves like the smallest. Measured at
+    // 2_147_483_648, which raised its timeout after 2ms while claiming to wait 24 days.
+    await expect(
+      withStoreTimeout(() => Promise.resolve(1), 2_147_483_648, "listLive"),
+    ).rejects.toThrow(/timeout budget must be at most 2147483647ms/);
+    // And the largest honoured value is still accepted.
+    await expect(withStoreTimeout(() => Promise.resolve(1), 2_147_483_647, "x")).resolves.toBe(1);
   });
 
   it("refuses a bound that is not a positive finite number", async () => {

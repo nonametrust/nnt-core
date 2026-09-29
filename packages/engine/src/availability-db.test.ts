@@ -211,6 +211,59 @@ describe("G15, condition three: a timeout the engine sets itself", () => {
   }, 30_000);
 });
 
+describe("the hazard the engine's own timeout creates, measured rather than argued", () => {
+  it("DRAINS THE POOL: an abandoned call keeps its backend and its client", async () => {
+    // `withStoreTimeout` races and walks away. It does not cancel the query or release
+    // the connection, so every timed-out call keeps a backend waiting on the server and
+    // a client checked out of the pool. A review measured this against the real
+    // cluster: after ten timeouts, a `select 1` -- which the server answers instantly --
+    // timed out as well, because the pool had nothing left to lend.
+    //
+    // The consequence is the one that matters: THIS CONDITION MANUFACTURES THE OUTAGE
+    // IT REPORTS. Once it has fired enough times, every later call is an engine
+    // timeout regardless of the server's health, and the tiered policy runs against a
+    // database that is up.
+    //
+    // Gated here rather than written in a docstring, so the day it is fixed this row
+    // goes red and says so. The fix is a server-side bound paired with the engine's,
+    // which is recorded as owed.
+    const pooled = openDb(urlFor(SCHEMA));
+    const blocked = compose(pooled, fixedClock(AT), ring, RETENTION_V0);
+    const NS_ID = "11111111-0000-4000-8000-000000000001";
+
+    const drained = await withTagLocked(async () => {
+      // The default pool is ten clients. Abandon exactly that many.
+      const abandoned = await Promise.all(
+        Array.from({ length: 10 }, () =>
+          failureOf(() => withStoreTimeout(() => blocked.tags.listLive(NS_ID), 120, "listLive")),
+        ),
+      );
+      for (const e of abandoned) expect(e).toBeInstanceOf(EngineTimeout);
+
+      // An eleventh call against a table NOTHING holds. The server would answer it
+      // instantly; the pool cannot hand it a client.
+      return failureOf(() =>
+        withStoreTimeout(() => blocked.namespaces.find("wallet", "nobody"), 1500, "find"),
+      );
+    });
+    await pooled.destroy();
+
+    expect(
+      drained,
+      "the pool no longer drains -- if a server-side bound now releases the client, " +
+        "delete this row and record that the hazard is closed",
+    ).toBeInstanceOf(EngineTimeout);
+    expect(classifyStoreFailure(drained)).toBe("engine_timeout");
+  }, 60_000);
+
+  it("leaves the pool usable once the lock is released, so the drain is not permanent", async () => {
+    // The control. A drain that never recovered would be a different defect, and this
+    // row is what tells the two apart.
+    const rows = await composed.tags.listLive("11111111-0000-4000-8000-000000000001");
+    expect(rows).toEqual([]);
+  }, 30_000);
+});
+
 describe("R7: a DEADLOCK is not one of the three, measured on a real one", () => {
   it("is raised as Deadlocked, retried, and never classified as unavailable", async () => {
     // Two transactions taking the same two rows in opposite orders. Postgres kills one
