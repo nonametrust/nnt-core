@@ -1909,3 +1909,71 @@ that the deferral was mis-addressed: Task 8's "Does" is the ingest path and R7 i
 it, while the tiered policy takes an amount and a risk tier, which are the BRIEF's inputs.
 It belongs with whichever task wires the unavailability path into the brief, and the plan
 should say so before that task starts.
+
+### The mutation audit of Task 7: five survivors, and a count of mine that was wrong again
+
+73 mutants, in a worktree of its own. Part 1 re-confirmed all 20 of the commit's claims;
+Part 4 re-ran 12 of the earlier tasks' kills at this head and all 12 held. What it found
+is what the branch did NOT claim.
+
+**The timeout's BUDGET VALUE was held by nothing, and this is the one that would bite.**
+Replacing `budgetMs` with `budgetMs / 2`, with `budgetMs / 10`, and with `0` all
+SURVIVED the entire suite. The reason is a fixture shape, not an oversight in the rule:
+every "times out" row used a promise that never resolves, so ANY positive timer wins, and
+every "in time" row used an already-resolved promise or a sub-millisecond localhost
+query, so ANY timer loses. Between them they pinned the timeout's existence and never its
+duration.
+
+The consequence is exactly what `withStoreTimeout`'s own docstring says the pass-through
+exists to prevent: **a timer firing at a tenth of its budget classifies healthy store
+calls as `engine_timeout`** under any real latency, and the tiered policy then runs
+against a database that is up. Held now with fake timers on both sides of the boundary —
+nothing has rejected at `budget - 1`, it has at `budget`, and a call answering at 90% of
+its budget still succeeds.
+
+**`Infinity` was admitted as a budget.** Replacing `Number.isFinite` with
+`Number.isNaN` survived, because the row titled "refuses a bound that is not a positive
+finite number" iterated `[0, -1, NaN]`. Node clamps any delay above 2^31-1 to one
+millisecond, so an infinite budget IS the shortened-timer defect in its worst form, and
+reachable from a config value.
+
+**"Not every 23505" was enforced on the mapped form only.** The module's thesis is that
+every rule is matched on both the mapped class and the raw SQLSTATE, and for this one it
+was not: adding `|| sqlstate === "23505"` to the raw branch survived. A constraint name
+is what makes a 23505 retryable and a bare SQLSTATE cannot carry one.
+
+**`TypeError` was excluded by a branch nothing held.** Narrowing it to `RangeError` alone
+survived. The comment claimed a value error "never reaches here on the real path" — but a
+`TypeError` thrown INSIDE a repository does come out of a store call, and under that
+mutant it became a connection outage.
+
+**`sqlstateOf`'s `sqlstate` branch could not execute.** The only object exposing
+`sqlstate` is `ConstraintViolation`, which is a `StoreError` and is taken by
+`instanceof` before this function is reached — deleting the branch changed no answer,
+while deleting the `code` branch killed seven rows. It is gone. A branch that cannot run,
+justified by a docstring, is the shape this milestone keeps finding.
+
+### R68's kill count was wrong too, and the second direction is worse than the first
+
+The previous entry says the old `e.name !== "Error"` discriminator is caught by "three
+rows". **Measured: eight**, and the eighth is a DB row that reveals a failure mode the
+entry does not mention. pg's `DatabaseError` sets `name = "error"`, lowercase — so the
+old check returned `null` for a REAL lock timeout, and **a genuine cancellation
+classified as an ordinary refusal**. The entry describes only the opposite direction, a
+refusal classified as an outage. Both were wrong, and the one it missed is the one that
+silently loses an outage rather than inventing one.
+
+That is the second time in this milestone I have written a kill count into a commit
+message without re-running the mutant after the rows changed. The rule from
+`claims-need-the-mutant-rerun` stands and was not followed: **re-run, then write the
+number.**
+
+### Recorded, not fixed
+
+- **The lock transaction's rollback is held by a collision**, not an assertion: deleting
+  the `ReleaseLock` throw is caught only because the NEXT row's `addColumn` then fails on
+  a column that already exists. The schema is dropped either way, so the leak is real but
+  bounded.
+- Four equivalent mutants survived and are provably equivalent (branch-order swaps over
+  disjoint classes, a `{4,5}` regex where no 4-character code exists). They are controls,
+  not holes.

@@ -126,22 +126,26 @@ const RETRYABLE_CONSTRAINT = "tag_one_live_per_pair";
 const SQLSTATE = /^(?=.*[0-9])[0-9A-Z]{5}$/;
 
 /**
- * The SQLSTATE an error carries, from whichever shape it arrived in.
+ * The SQLSTATE a RAW driver error carries.
  *
- * The store's `ConstraintViolation` exposes `sqlstate`; a raw driver error carries
- * `code`. `code` is also where libuv puts `ECONNREFUSED`, so the shape is checked
- * rather than the field's presence.
+ * **`code` ONLY, and the `sqlstate` branch that used to be here was dead.** A review
+ * measured it: the only object in this system exposing `sqlstate` is the store's
+ * `ConstraintViolation`, which is a `StoreError` and is therefore taken by
+ * `instanceof StoreError` in `classifyStoreFailure` and by `instanceof
+ * ConstraintViolation` in `isRetryable` **before this function is ever reached**.
+ * Deleting the branch changed no answer; deleting the `code` branch killed seven rows.
+ * A branch that cannot execute, justified by a docstring, is the shape this milestone
+ * keeps finding, so it is gone rather than kept for symmetry.
+ *
+ * `code` is also where libuv puts `ECONNREFUSED`, so the SHAPE is checked rather than
+ * the field's presence — see `SQLSTATE`, whose digit rule is what separates the two.
  */
 function sqlstateOf(e: unknown): string | null {
   if (typeof e !== "object" || e === null) return null;
-  const withSqlstate = e as { sqlstate?: unknown; code?: unknown };
-  if (typeof withSqlstate.sqlstate === "string" && SQLSTATE.test(withSqlstate.sqlstate)) {
-    return withSqlstate.sqlstate;
-  }
-  if (typeof withSqlstate.code === "string" && SQLSTATE.test(withSqlstate.code)) {
-    return withSqlstate.code;
-  }
-  return null;
+  const withCode = e as { code?: unknown };
+  return typeof withCode.code === "string" && SQLSTATE.test(withCode.code)
+    ? withCode.code
+    : null;
 }
 
 /**
@@ -167,6 +171,11 @@ function sqlstateOf(e: unknown): string | null {
  * unavailable would run the tiered policy against a database that is up.
  */
 export function classifyStoreFailure(e: unknown): UnavailableCondition | null {
+  // NON-ERRORS ANSWER FIRST, so nothing below has to guard against a thrown string or
+  // a null. A thrown primitive is a programming fault rather than a degraded database,
+  // and reporting it as one sends the tiered policy after a healthy server because a
+  // caller threw the wrong thing.
+  if (!(e instanceof Error)) return null;
   if (e instanceof EngineTimeout) return "engine_timeout";
   if (e instanceof RetriesExhausted) return "retries_exhausted";
   if (e instanceof Cancelled) return "cancelled";
@@ -195,11 +204,11 @@ export function classifyStoreFailure(e: unknown): UnavailableCondition | null {
   // connection, a connect timeout, a socket that died mid-query. A `RangeError` from
   // our own validation is not one of those and never reaches here on the real path,
   // because input is refused by name before any store call is made.
+  // A value error our own validation raised, or a programming fault thrown INSIDE a
+  // repository -- both come out of a store call and neither is an outage. Narrowing
+  // this to `RangeError` alone survived a review's mutation run, which is why the
+  // `TypeError` half has a row of its own.
   if (e instanceof RangeError || e instanceof TypeError) return null;
-  // A thrown string, number, null or object is a programming fault rather than an
-  // outage, and reporting it as one would send the tiered policy after a healthy
-  // database because a caller threw the wrong thing.
-  if (!(e instanceof Error)) return null;
   return "connection";
 }
 

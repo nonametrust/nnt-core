@@ -120,6 +120,14 @@ describe("classifyStoreFailure", () => {
     it("a RangeError, which is what a bad value looks like and never a store outage", () => {
       expect(classifyStoreFailure(new RangeError("brief.amount must be non-negative"))).toBeNull();
     });
+
+    it("a TypeError, which a programming fault inside a repository really produces", () => {
+      // Narrowing the branch to `RangeError` alone SURVIVED. The comment claimed a value
+      // error "never reaches here on the real path" -- but a `TypeError` thrown INSIDE a
+      // repository does come out of a store call, and under that mutant it became a
+      // connection outage: the tiered policy against a database that is up.
+      expect(classifyStoreFailure(new TypeError("x.y is not a function"))).toBeNull();
+    });
   });
 
   it("treats an unmapped sqlstate as a refusal when the server answered ABOUT THE QUERY", () => {
@@ -271,6 +279,17 @@ describe("isRetryable (R28's set)", () => {
     expect(isRetryable(new NamespaceShredded("shredded"))).toBe(false);
     expect(isRetryable(new RangeError("bad input"))).toBe(false);
   });
+
+  it("does not retry a RAW 23505 either, which the mapped rule alone did not cover", () => {
+    // The module's thesis is "every rule is matched on BOTH the mapped class and the
+    // raw SQLSTATE", and for 23505 it was not: adding `|| sqlstate === "23505"` to the
+    // raw branch SURVIVED. The constraint name is what makes a 23505 retryable and a
+    // bare SQLSTATE cannot carry one, so the raw form is never retried.
+    expect(isRetryable(driverError({ code: "23505" }))).toBe(false);
+    expect(isRetryable(driverError({ code: "23505", constraint: "tag_one_live_per_pair" }))).toBe(
+      false,
+    );
+  });
 });
 
 describe("tierUnderUnavailability (R6, R27's ceiling)", () => {
@@ -404,6 +423,57 @@ describe("withStoreTimeout (the engine's own timeout, R7's third condition)", ()
     await expect(withStoreTimeout(() => Promise.resolve(7), 1000, "listLive")).resolves.toBe(7);
   });
 
+  it("waits the WHOLE budget and not a fraction of it", async () => {
+    // THE BUDGET VALUE WAS HELD BY NOTHING. A review replaced `budgetMs` with
+    // `budgetMs / 2`, with `budgetMs / 10`, and with `0` -- all three SURVIVED the
+    // entire suite. Every "times out" row used a promise that never resolves, so any
+    // positive timer wins, and every "in time" row used an already-resolved promise or
+    // a sub-millisecond localhost query, so any timer loses.
+    //
+    // The consequence is the one the module's own docstring says the pass-through
+    // exists to prevent: a timer firing at a tenth of its budget classifies HEALTHY
+    // store calls as `engine_timeout` under any real latency, and the tiered policy
+    // then runs against a database that is up.
+    //
+    // Fake timers make the boundary observable: at one millisecond BEFORE the budget
+    // nothing has rejected, and at the budget it has.
+    vi.useFakeTimers();
+    try {
+      let settled: "pending" | "rejected" = "pending";
+      const pending = withStoreTimeout(() => new Promise<number>(() => {}), 5_000, "listLive");
+      const watched = pending.then(
+        () => undefined,
+        () => {
+          settled = "rejected";
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(settled, "rejected before its budget was spent").toBe("pending");
+
+      await vi.advanceTimersByTimeAsync(1);
+      await watched;
+      expect(settled, "did not reject when the budget ran out").toBe("rejected");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not fire EARLY for a call that answers just inside the budget", async () => {
+    // The other side of the same boundary, and the one a shortened timer breaks: a
+    // store call that answers at 90% of its budget must succeed.
+    vi.useFakeTimers();
+    try {
+      const call = (): Promise<string> =>
+        new Promise((resolve) => setTimeout(() => resolve("answered"), 4_500));
+      const raced = withStoreTimeout(call, 5_000, "listLive");
+      await vi.advanceTimersByTimeAsync(4_500);
+      await expect(raced).resolves.toBe("answered");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("raises an EngineTimeout naming the call and the bound", async () => {
     const never = () => new Promise<number>(() => {});
     await expect(withStoreTimeout(never, 20, "listLive")).rejects.toThrow(
@@ -462,7 +532,11 @@ describe("withStoreTimeout (the engine's own timeout, R7's third condition)", ()
   });
 
   it("refuses a bound that is not a positive finite number", async () => {
-    for (const bad of [0, -1, Number.NaN]) {
+    // `Infinity` is in the list because it was not, and a review replaced
+    // `Number.isFinite` with `Number.isNaN` and SURVIVED. Node clamps any delay above
+    // 2^31-1 to one millisecond, so an infinite budget is a one-millisecond timeout --
+    // the shortened-timer defect in its worst form, reachable from a config value.
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
       await expect(
         withStoreTimeout(() => Promise.resolve(1), bad, "x"),
         String(bad),
