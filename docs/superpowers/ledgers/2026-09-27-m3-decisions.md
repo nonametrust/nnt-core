@@ -1701,3 +1701,100 @@ still standing a round later.
 Every text patch from here asserts its match and exits non-zero when it fails to find
 it. A silent no-op in a docs patch is indistinguishable from a lie in the commit
 message that reports it.
+
+## Task 7 — the risk tier and the unavailability policy
+
+Engine 432 -> 486. `pnpm build`, `pnpm typecheck` and `pnpm test` all exit 0, read
+separately.
+
+G15's acceptance is the reason this task has two test files: "each unavailable
+condition produces its code **with the store really unreachable rather than
+stubbed**". A stub that throws `new Error("ECONNREFUSED")` proves the classification
+reads a field; it proves nothing about whether that field is what the driver sets.
+Every condition below was produced against the real cluster first, and the shapes it
+produced are what the code matches.
+
+### R64. The brief's two READS do not map their driver errors, so `Cancelled` never arrives on the read path
+
+R7 defines unavailable as "a driver error carrying no SQLSTATE, `Cancelled`
+(55P03/57014), and a timeout the engine sets itself". Measured: `TagRepository.listLive`
+and `ObservationRepository.readClear` — the brief's only two reads — contain **no
+`mapPgError` call**. The writes (`record`, `AuditChain.append`) do. So a lock timeout
+on the read path arrives as a raw `DatabaseError` carrying `code: "55P03"` and never
+as `Cancelled`.
+
+**Ruled: every rule is matched on BOTH the mapped class and the raw SQLSTATE.** A
+classification written to R7's letter would have held on the write path alone — and
+for a deadlock that is R7's own failure arriving through a door R7 did not check.
+
+**The same is true of `Deadlocked`, and it is worse.** A REAL deadlock, produced by two
+transactions taking two rows in opposite orders, arrives as `DatabaseError` with
+`instanceof Deadlocked === false`. So on every path this engine uses, the mapped class
+is not what a deadlock produces, and **the raw SQLSTATE branch does all the work**.
+Measured consequence: the plan's own G15 plant — "`Deadlocked` added to the set, which
+must go red" — planted on the mapped class left the real-deadlock row GREEN. It is
+planted in both forms now, and the raw form is the one the DB row kills.
+
+### R65. A class the store NAMED is a refusal, never an outage
+
+The discriminator is `e instanceof StoreError`, taken after `Cancelled`. An earlier
+version asked `e.name !== "Error"` instead, which is false for every one of these
+classes — a subclass with no explicit `name` inherits `"Error"` — so **a shredded
+namespace classified as a connection outage**, and the tiered failure policy would have
+run against a database that was up. Three rows caught it.
+
+The corollary is ruled too: **an unmapped SQLSTATE is a refusal.** The server answered
+and said what was wrong, which is the opposite of an outage.
+
+### R66. The engine's own timeout is measured on a call that really hangs
+
+R7's third condition is the one the store cannot report: a server that has stopped
+answering produces no error to classify. The row that holds it takes an ACCESS
+EXCLUSIVE lock on `tag` in one session and calls `TagRepository.listLive` — the brief's
+own read — from another with no `lock_timeout`. The call hangs, the server is healthy
+throughout, and the only evidence is that the engine stopped waiting.
+
+Two corrections on the way there. `createIndex` was the first attempt at the lock and
+takes only SHARE, which blocks writes and **not reads** — so the row that was meant to
+measure a blocked SELECT measured one that sailed through. And a `pg_sleep` built
+through `dynamic.ref` became a column reference rather than a function call. Both were
+caught by the rows failing, not by review.
+
+### R67. The three tier behaviours, with the ceiling on the policy
+
+Low proceeds; medium proceeds strictly UNDER `mediumCeiling` and is refused at or above
+it; high is refused at any amount including zero. **The ceiling comes from the policy
+and never from the caller** — design §6:281, because a caller supplying its own ceiling
+is a caller raising it, and degrading availability is not a way to bypass the layer.
+
+**The result is a CODE and not a grade.** A `hold` returned here would be
+indistinguishable from a hold the threshold produced, which is the difference between
+"we decided" and "we could not decide".
+
+### What the mutation run found about the TESTS
+
+**An unbounded retry cannot be measured by waiting for it.** The first version of the
+bound's row threw a retryable failure forever and waited for `RetriesExhausted`; with
+the bound removed it did not go red, it HUNG — vitest's test timeout aborted the test
+while the promise kept spinning and kept the worker alive. Three separate mutation runs
+were lost to it, and one left a mutated file behind that had to be restored from a
+backup rather than from git, because the file was untracked.
+
+Every retry stub now has an ESCAPE HATCH: after ten calls it throws something
+non-retryable, so a correct bound never reaches it and an unbounded loop comes back as
+the wrong error, fast. Recorded because the lesson generalises: **a test that measures
+a loop must make the loop terminate even when the bound is gone.**
+
+**The timeout's `clearTimeout` was held by nothing.** Deleting it survived — a resolved
+call with an uncleared thirty-second timer passes every assertion about its value and
+keeps the event loop alive for thirty seconds. Held now with fake timers, asserting
+zero pending timers after the call both resolves and rejects.
+
+### Still owed by Task 7
+
+R7 says the condition is written to **structured stderr** — because the audit chain
+lives in the same Postgres that is unavailable — and that a **reconciliation audit row**
+is appended when the store returns. Neither is built: `availability.ts` classifies and
+decides, and nothing yet writes the outage anywhere. Both belong with the ingest path in
+Task 8, which is where a caller exists to do the writing, and they are recorded here so
+Task 8 does not have to rediscover that it owns them.
