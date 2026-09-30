@@ -262,6 +262,90 @@ afterAll(async () => {
   }
 });
 
+describe("the ring compose returns is the ring its repositories were built on", () => {
+  it("records a call on the SAME object compose was handed", async () => {
+    // FOUR MUTANTS SURVIVED without this. A review built every repository on
+    // `{...ring}` while `compose` kept returning the real one, and gave `AuditChain`
+    // and `PermanentRecordRepository` their own copies -- all invisible, because the
+    // only ring assertion anywhere was `expect(composed.ring).toBe(ring)`, which says
+    // nothing about what the repositories were wired to.
+    //
+    // A spread copy shares the closures, so it is equivalent TODAY. It would not be for
+    // a ring that held state or was a class instance, and no test would have said so.
+    // This one would: the spy is the object `compose` is handed, and a repository built
+    // on a copy never touches it.
+    const real = keyRingFromEnv({
+      NNT_MASTER_KEY: randomBytes(32).toString("base64"),
+    } as NodeJS.ProcessEnv);
+    // THE PROBE IS `this`, NOT THE CALL COUNT, and the first version of this row got
+    // that wrong. A spread copy carries the same closures, so an arrow-function spy
+    // records the call whichever object was invoked and both mutants survived it
+    // again. Written as METHODS, `this` is the object the caller actually held: the
+    // spy itself when compose passed it through, the copy when it did not.
+    const calls: string[] = [];
+    const spy = {
+      wrap(this: unknown, dataKey: Buffer, namespaceId: string): Buffer {
+        calls.push(this === spy ? "wrap" : "wrap:COPY");
+        return real.wrap(dataKey, namespaceId);
+      },
+      unwrap(this: unknown, wrapped: Buffer, namespaceId: string): Buffer {
+        calls.push(this === spy ? "unwrap" : "unwrap:COPY");
+        return real.unwrap(wrapped, namespaceId);
+      },
+      deriveKey(this: unknown, label: string): Buffer {
+        calls.push(this === spy ? "deriveKey" : "deriveKey:COPY");
+        return real.deriveKey(label);
+      },
+    };
+
+    const watched = compose(db, fixedClock(SEED_NOW), spy, RETENTION_V0);
+    expect(watched.ring, "compose did not return the ring it was given").toBe(spy);
+
+    // `ensure` wraps a fresh data key, which only the ring can do.
+    const stored = await watched.namespaces.ensure({ kind: "wallet", id: "RINGSPY" });
+    expect(stored.namespaceId).toBeDefined();
+    expect(
+      calls,
+      "the namespace repository was built on a ring that is not the one compose returned",
+    ).toContain("wrap");
+    expect(calls.filter((c) => c.endsWith(":COPY")), "a repository holds a COPY of the ring").toEqual([]);
+
+    // And a read unwraps through the same object.
+    calls.length = 0;
+    await watched.namespaces.dataKey(stored.namespaceId);
+    expect(calls).toContain("unwrap");
+    expect(calls.filter((c) => c.endsWith(":COPY"))).toEqual([]);
+
+    // The audit chain holds one too, and reaches the ring only through the DAY SEAL --
+    // `deriveKey(AUDIT_DAY_SEAL_LABEL)`. A first attempt appended and sealed at the same
+    // instant and touched the ring not at all, which this row's own guard caught: a
+    // day cannot be sealed until it is closed. So the seal runs from a second
+    // composition whose clock is two days later, on the same spy.
+    calls.length = 0;
+    await watched.audit.append({
+      policyVersion: "a/b/c/d",
+      kind: "ringspy",
+      body: { at: SEED_NOW.toISOString() },
+    });
+    const later = compose(db, fixedClock(new Date(SEED_NOW.getTime() + 2 * DAY)), spy, RETENTION_V0);
+    await later.audit.sealDay(SEED_NOW.toISOString().slice(0, 10));
+    expect(
+      calls.filter((c) => c.endsWith(":COPY")),
+      "the audit chain holds a COPY of the ring",
+    ).toEqual([]);
+    expect(
+      calls.filter((c) => c.startsWith("deriveKey")).length,
+      "the audit chain never reached the ring, so this half proves nothing",
+    ).toBeGreaterThan(0);
+
+    // WHAT THIS ROW DOES NOT PROBE, recorded rather than left as an absence:
+    // `PermanentRecordRepository` also takes the ring, and a copy given to IT still
+    // survives. Nothing in M3 calls it -- promotion is M4's path -- so probing it here
+    // would mean promoting a record in the brief's own suite to watch a key unwrap.
+    // M4 inherits the probe along with the path.
+  }, 30_000);
+});
+
 describe("the fixture itself", () => {
   it("covers every table the database really has, so the snapshot measures all of them", async () => {
     // SCOPED TO THIS SCHEMA. `getTables()` is not limited by `search_path`, so an

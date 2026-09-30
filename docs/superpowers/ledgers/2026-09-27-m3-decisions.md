@@ -2109,3 +2109,46 @@ sentence.
   `retention` was already public as `namespaces.policy`. Corrected, along with a note on
   what carrying the ring widens: `deriveKey` for an arbitrary label, which
   `namespaces.dataKey` did not already expose.
+
+### R73. The ring `compose` RETURNS was not the ring its repositories were built on, and nothing said so
+
+The mutation audit's sharpest finding. Four mutants survived the whole suite:
+repositories built on `{...ring}` while `compose` returned the real one; `AuditChain`
+given its own copy; `PermanentRecordRepository` given one; and the handle wrapped in
+`Object.create` on the way out.
+
+The only ring assertion anywhere was `expect(composed.ring).toBe(ring)`. **That says
+nothing about what the repositories were wired to** — a `compose` that hands back the
+right ring and builds every repository on a different one was invisible. A spread copy
+shares the closures so it is equivalent TODAY; it would not be for a ring holding state
+or built as a class, and no test would have said so.
+
+**And the first fix did not work either.** A spy ring with ARROW functions recorded the
+call whichever object was invoked, because the copy carries the same closures — both
+mutants survived it again. The probe has to be `this`: written as METHODS, `this` is the
+object the caller actually held, so a repository built on a copy records `:COPY` and the
+row goes red.
+
+Two more things that row taught, both from its own guards:
+
+- **A guard caught the second half proving nothing.** The audit chain reaches the ring
+  only through the day seal's `deriveKey`, and a first attempt appended and sealed at
+  the same instant — a day cannot be sealed until it is closed, so the ring was never
+  touched and the assertion passed over an empty list. The seal now runs from a second
+  composition two days later.
+- **`PermanentRecordRepository`'s copy still survives, and that is recorded rather than
+  fixed.** Nothing in M3 calls it; promotion is M4's path. Probing it here would mean
+  promoting a record inside the brief's own suite to watch a key unwrap. M4 inherits the
+  probe with the path.
+
+### Part 4: the composition change disarmed nothing
+
+23 of the previous tasks' claimed kills re-run at this head, all held by a row that
+names the rule — the clock identity, the lexical gates, R14, R22, R41, R43, R53, the
+floor boundary on real decay, the timeout budget, the retry bound, R60's underflow, the
+audit body's amount. `assertAuditBody` removed turns exactly TWO rows red, matching this
+ledger's corrected count and not the commit message's three.
+
+The one the auditor could not apply — `assertBriefPolicy` removed from the brief's
+`assertInput` — I ran myself: it dies at both "up front, before any read" rows, so that
+claim holds too.

@@ -118,6 +118,17 @@ describe("compose", () => {
     expect(again.retention).toBe(composed.retention);
   });
 
+  it("returns the HANDLE it was given, which Task 8 opens a transaction on", () => {
+    // `handle: Object.create(handle)` survived every row. It is equivalent today --
+    // the prototype chain still reaches every method -- but Task 8 calls
+    // `composed.handle.transaction()`, and a wrapper is the shape that quietly stops
+    // being the same connection.
+    const handle = openDb(UNREACHABLE);
+    expect(compose(handle, fixedClock(new Date("2026-09-21T00:00:00.000Z")), ring, RETENTION_V0).handle).toBe(
+      handle,
+    );
+  });
+
   it("carries the clock it was given, for the wrapper that reads `at` off it", () => {
     const clock = fixedClock(new Date("2026-09-21T00:00:00.000Z"));
     expect(build(clock).clock).toBe(clock);
