@@ -2020,3 +2020,92 @@ honour that is not to reach them with an observation the envelope already refuse
 
 The refusal carries the schema's own reasons rather than a summary, because "invalid" is
 not something a producer can act on.
+
+### Task 8a's review: the correction is right, and the argument beside it was false
+
+Two lenses at `c6fefd5`. The correctness lens confirmed R70 independently and from a
+direction I had not used — and then found that the OTHER claim in the same commit is
+wrong, and that the shape I had chosen would have destroyed a calibrated signal.
+
+**R70 is confirmed, on the count AND the conclusion.** Enumerated from the switch; from
+`ASPECT_SHAPES`; from a killed channel-name mutant; and end to end — a warm `hops`
+baseline yields `{measured, surprise 8, crosses true}` and a `new` tag decision, and
+`relatedness` scores a `hops` intent against a `hops` tag at 1. Nothing downstream
+refuses it. R46's stated reason applies only at two readings or more, so the count is
+the right predicate.
+
+**But it was not new knowledge, and the commit implied it was.** Tagging's own
+`reading.test.ts:140` — "reads hops and amount from cluster_proximity as two readings,
+and hops alone without an amount" — has held the one-reading form since M2. R46 was
+ruled against a tested, documented property without reading it. That is the finding
+worth keeping: the ruling was not wrong because the code was subtle, it was wrong
+because nobody opened the test.
+
+### R71. The count refusal is on the RETURN, never on the fold
+
+The first version threw. A review pointed out what that costs: R46 is about the INTENT
+being briefed, while ingesting the two-reading form is M2's designed behaviour —
+`tagObservation` tags both `hops` and `amount`, and `amount` is the dust signal
+`cluster_proximity` carries a calibrated weight of 0.8167 for, sourced
+"dust_from_scam_cluster".
+
+So a throw on the ingest path would have **refused every dust observation at the door
+and deleted the channel's calibrated signal in order to enforce a rule about briefs.**
+
+Ruled: `readingsOf` returns EVERY reading for the fold and says separately whether there
+is an intent to brief — `{ briefable: true, reading }` or
+`{ briefable: false, code: "INTENT_HAS_MANY_READINGS", aspects }`. A returned code
+rather than a throw is also what R7 settled for unavailability, for the same reason:
+design §6 says error states are codes and not prose.
+
+### R72. Validating first does NOT honour R21, and a named wrapper does
+
+The commit argued that running `validateObservation` first keeps tagging's
+value-carrying refusals out of reach. **Measured false, on exactly the case Task 8's
+acceptance names.** `decimalStringSchema` is `/^(0|[1-9]\d*)(\.\d+)?$/` with **no length
+bound**, so a 309-digit `amount` passes validation and only then does tagging throw
+`amount 999…999 does not fit a double` — the whole value in the message, as a bare
+`RangeError` nothing named. Task 8's acceptance: "a 308-digit amount is recorded with
+its code and observation id … and the refusal's message text appears nowhere in the
+audit body".
+
+So the one refusal the plan cares about is precisely the one validating first does not
+stop. `UnreadableObservation` now wraps it, carrying a CODE and the channel; the value
+stays on `cause` for a human reading stderr and appears nowhere in the message or in
+`JSON.stringify`.
+
+**And `ValidationFailed.errors` carry wire values too**, which its docstring denied.
+Zod's enum messages carry `received '<value>'` — a `direction`, a `field`, a
+`namespace.kind` — and a strict object's message carries the unknown KEY names, which on
+this wire can be an address. The class now says so, so Task 8b records a code and never
+the errors.
+
+### Three smaller corrections, and a claim of mine that was wrong for the third time
+
+- **A non-string `namespaceId` was accepted by nothing that tested it.** Every row passed
+  a string, so flipping the guard survived; under it `readingsOf(wire, undefined)`
+  returned `namespaceId: undefined`.
+- **A padded id is now REFUSED rather than trimmed.** A `.trim()` on the returned record
+  survived every row and is not equivalent: what this function returns is what R57
+  compares by string equality. Refused where the value is handed over, which is
+  `thresholdUnit`'s precedent. The trim mutant is equivalent now, which is the right
+  outcome.
+- **A zero-reading observation is unreachable, and the ASSUMPTION is what is gated.** No
+  channel can return an empty array — every switch arm returns at least one and the
+  default throws — so a mutant treating zero as briefable survives and always will.
+  That is a property of `reading.ts`, not of this module, so it is asserted across all
+  eight channel forms here: the day one starts returning empty, that row goes red.
+
+**And my commit message credited the re-composition row with holding the ring. It did
+not** — it asserted `again.namespaces.clock` and `.policy` and never the ring, which was
+held only by the plain identity assert. The row asserts it now.
+
+That is the **third** time this milestone I have written a claim about what holds
+something without re-running the mutant that would prove it. The first two are recorded
+above. The rule has not changed and I have not followed it: re-run, then write the
+sentence.
+
+- `compose.ts`'s "without these it could not" was also true of the ring only —
+  `retention` was already public as `namespaces.policy`. Corrected, along with a note on
+  what carrying the ring widens: `deriveKey` for an arbitrary label, which
+  `namespaces.dataKey` did not already expose.

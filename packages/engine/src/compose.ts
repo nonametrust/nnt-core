@@ -40,8 +40,20 @@ export interface Composed {
    *
    * R10 puts the fold and the tag write in ONE transaction, and `Db` already admits a
    * `Transaction` — so the ingest path opens one and calls `compose` again onto it.
-   * Without these it could not: `NamespaceRepository` keeps its ring private, so a
-   * caller holding only the repositories cannot rebuild them.
+   *
+   * **THE RING IS THE ONE THAT WAS UNREACHABLE.** An earlier version of this sentence
+   * said "without these it could not", of both; a review pointed out that `retention`
+   * was already public as `namespaces.policy`. Only `NamespaceRepository`'s ring is
+   * private. `retention` is carried beside it so a re-composition is one call rather
+   * than one call and one reach into a repository.
+   *
+   * **WHAT CARRYING THE RING WIDENS**, stated rather than left implicit: a `Composed`
+   * holder could already reach per-namespace key material through the public
+   * `namespaces.dataKey`. What is new is `deriveKey` for an arbitrary label — the
+   * audit seal key among them — and `wrap` under an arbitrary namespace. It bites only
+   * where a `Composed` is handed to something that did not compose it, which is
+   * exactly what R50 keeps the brief core away from by giving it a two-method read
+   * port instead.
    */
   readonly ring: KeyRing;
   readonly retention: RetentionPolicy;

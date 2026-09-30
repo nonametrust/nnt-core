@@ -110,6 +110,12 @@ describe("compose", () => {
     const again = compose(composed.handle, composed.clock, composed.ring, composed.retention);
     expect(again.namespaces.clock).toBe(composed.clock);
     expect(again.namespaces.policy).toBe(RETENTION_V0);
+    // THE RING TOO, which an earlier version of this row did not assert. A review
+    // measured that the re-composition checked the clock and the policy and never the
+    // ring -- so the commit message crediting it with holding the ring was wrong, and
+    // the ring was held only by the plain identity assert above.
+    expect(again.ring).toBe(composed.ring);
+    expect(again.retention).toBe(composed.retention);
   });
 
   it("carries the clock it was given, for the wrapper that reads `at` off it", () => {
