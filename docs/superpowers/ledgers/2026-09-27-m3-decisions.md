@@ -2152,3 +2152,65 @@ ledger's corrected count and not the commit message's three.
 The one the auditor could not apply — `assertBriefPolicy` removed from the brief's
 `assertInput` — I ran myself: it dies at both "up front, before any read" rows, so that
 claim holds too.
+
+## Task 8b — the ingest path, and an acceptance criterion that is not well-defined
+
+Engine 549 -> 559. `observe(composed, wire, policies)`: append, derive, fold and tag in
+one transaction, chain entry after the commit.
+
+### R74. The order is forced by the store and by R21, not chosen
+
+`append` refuses to run inside a transaction and `AuditChain.append` refuses one too, so
+R10's unit of work is exactly the fold and the tag write — the append before it, the
+chain entry after.
+
+**And the payload cannot be read before the append even if one wanted to.** `append`
+parses the ENVELOPE (`observationSchema`) and not the channel payload, so a payload
+tagging cannot read reaches tagging regardless; and R21 records a refusal against an
+OBSERVATION ID, which does not exist until the row does. So "store first, refuse after"
+is not a convenience, it is what makes R21 satisfiable.
+
+The namespace id comes from `namespaces.find` rather than the append result: a
+`StoredObservation` carries `namespace: {kind, id}` — the wire's names — and R57 compares
+the reading's namespace against the observation's by the STORE's id.
+
+### R75. "The mean equal to a serial fold's" is not a well-defined witness
+
+The plan's acceptance for forty concurrent observations asks for "n at forty and the mean
+equal to a serial fold's, **and the witness is the mean as well as the count**".
+
+**Measured: `updateBaseline` WINSORIZES against the running median and MAD, so the fold is
+order-dependent and there is no single serial mean to equal.** On this fixture — the
+amounts 1 through 40 — ascending gives 16.473, descending 24.527, a shuffle 15.334: a
+spread of **9.19**, where the plain arithmetic mean is 20.5. Forty concurrent writers
+commit in an arbitrary order, so demanding one particular serial mean is demanding one
+particular interleaving.
+
+**Ruled: the witness is that the result is a serial fold of those forty values in SOME
+order.** The envelope is computed in the test from the same arithmetic over 200 random
+orders plus both extremes, so it moves with the policy rather than being hard-coded, and
+a guard fails the row if the envelope ever collapses — an order-independent fixture would
+make the assertion vacuous. The count stays exact, which is the half an envelope cannot
+give.
+
+The plan's intent survives intact: a lost fold, a doubled fold, or a retry that re-read
+without rolling back all produce a state no ordering of the forty can produce. What
+changes is the sentence, because the one the plan wrote cannot be satisfied.
+
+### R76. The shipped `maxRetries` of 5 does not survive forty-way contention
+
+Measured, on the first run of that row: `observe gave up after 6 attempts`. Optimistic
+concurrency means the Nth writer loses to every writer that commits between its read and
+its own commit, so the retries needed grow with the contention.
+
+**Recorded rather than hidden by the test's own bound.** The row uses 200 so it can
+measure what it is about — that the fold is correct under concurrency — and the fact that
+the shipped default cannot reach forty writers on one pair is a calibration finding with
+an operational consequence: `maxRetries` is one of the seven uncalibrated numbers §6
+declares, and this is the first measurement of what it costs.
+
+### `pnpm test` and `pnpm typecheck` diverged for the third time on this branch
+
+Tests green, typecheck exit 2: `.catch()` widened a union to include the success value,
+and only `tsc` saw it. Recorded because the branch's own rule — run both and read the
+codes SEPARATELY — is the only reason it was caught before the commit.

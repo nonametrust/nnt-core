@@ -1,5 +1,10 @@
-import { validateObservation, type Observation, type WireObservation } from "@nonametrust/schema";
-import { readObservation } from "@nonametrust/tagging";
+import { holdsAt, validateObservation, type Observation, type WireObservation } from "@nonametrust/schema";
+import { readObservation, tagObservation, type AspectContext, type LiveTagInput } from "@nonametrust/tagging";
+import { strengthAt, type StoredTag } from "@nonametrust/store";
+import { compose, type Composed } from "./compose.js";
+import { retrying } from "./availability.js";
+import { compositePolicyVersion } from "./composite-version.js";
+import type { BriefPolicies } from "./brief.js";
 import type { Related } from "./relatedness.js";
 
 /**
@@ -155,3 +160,216 @@ export function readingsOf(wire: WireObservation, namespaceId: string): Observat
         };
   return { validated: validated.value, all, intent };
 }
+
+/**
+ * A per-observation refusal, R21: a CODE and an observation id, never the message.
+ *
+ * The observation is appended BEFORE its payload is read, which is what gives this an
+ * id to carry — `append` parses the envelope only (`observationSchema`), so a payload
+ * tagging cannot read reaches tagging and its `RangeError` names the whole value. R21
+ * says the code goes in and the message does not, and an audit body outlives both the
+ * month key and the namespace key.
+ *
+ * The underlying failure stays on `cause`, for a human reading stderr.
+ */
+export class RefusedObservation extends Error {
+  constructor(
+    readonly code: string,
+    readonly observationId: string,
+    options: ErrorOptions,
+  ) {
+    super(`observe: ${observationId} refused as ${code}`, options);
+  }
+}
+
+/** What one ingested observation leaves behind, and what a brief needs from it. */
+export interface ObserveResult {
+  readonly observationId: string;
+  /** False on a re-delivery: `append` had seen this idempotency key before. */
+  readonly created: boolean;
+  /** R23: a re-delivery folds NOTHING, and says so. */
+  readonly folded: boolean;
+  /** R40/R46: the reading a brief may be handed, or why there is none. */
+  readonly intent: IntentReading;
+  /** R41: the tags this observation opened OR refreshed. */
+  readonly ownTagIds: readonly string[];
+  /** R18/R29: null for a categorical reading and for a cold baseline. */
+  readonly surprise: number | null;
+}
+
+/**
+ * Ingest one observation: append it, fold it, tag it, and record it.
+ *
+ * **THE ORDER IS FORCED BY THE STORE AND BY R21.** `append` refuses to run inside a
+ * transaction and `AuditChain.append` refuses one too, so R10's unit of work is exactly
+ * the fold and the tag write, with the append before it and the chain entry after. And
+ * the payload cannot be read before the append even if one wanted to: R21 records a
+ * refusal against an OBSERVATION ID, which does not exist until the row does.
+ *
+ * **R10: ONE TRANSACTION, AND THE RETRY RE-RUNS ALL OF IT.** This ruling replaced a
+ * wrong one and carries its measurement: "baseline first, then tag, and the retry
+ * re-reads both" does not avoid the double fold, it CREATES a committed fold with no
+ * tag, and the retry folds again because `tagReading` always computes the next baseline
+ * from the one it was given — which already holds the first fold. Measured with the
+ * real repositories: one writer retried once left `count = 12` for 11 observations,
+ * with the mean moved. So the reads are INSIDE the transaction and the retry re-runs
+ * them.
+ *
+ * **R24: the chain entry is written after the commit**, and a missing one is a named
+ * inconsistency rather than a rollback — the chain's job is to record what happened,
+ * not to be the transaction log.
+ */
+export async function observe(
+  composed: Composed,
+  wire: WireObservation,
+  policies: BriefPolicies,
+): Promise<ObserveResult> {
+  const at = composed.clock.now();
+
+  // OUTSIDE the transaction, because `append` refuses one. A new observation for an
+  // erased namespace is refused here, by name, by the store's own gate.
+  const appended = await composed.observations.append(wire);
+  const observationId =
+    appended.created || appended.readable ? appended.observation.observationId : appended.observationId;
+
+  // THE NAMESPACE ID IS THE STORE'S, and it is not on the append result: a
+  // `StoredObservation` carries `namespace: {kind, id}` — the wire's names — and the
+  // internal id lives on the namespace row `append` ensured. R57 compares the reading's
+  // namespace against the observation's by that id, so taking it from anywhere else
+  // would compare two different things.
+  const stored = await composed.namespaces.find(wire.namespace.kind, wire.namespace.id);
+  if (stored === null) {
+    throw new Error(`observe: ${observationId} was appended and its namespace is not there`);
+  }
+  const namespaceId = stored.namespaceId;
+
+  let readings;
+  try {
+    readings = readingsOf(wire, namespaceId);
+  } catch (cause) {
+    // R21: the code and the id, never the message. The observation row exists, which is
+    // what makes the id available to name it by.
+    const code = (cause as { code?: string }).code ?? "OBSERVATION_UNREADABLE";
+    throw new RefusedObservation(code, observationId, { cause });
+  }
+
+  // R23: a re-delivery folds NOTHING. `append` answers `{created:false}` on a repeat,
+  // and nothing records which observations a baseline has absorbed, so folding again
+  // would double-count. The cost is stated rather than hidden: a crash between a
+  // successful append and its fold loses that contribution permanently, and nothing
+  // detects it. Closing that needs a fold ledger, which is M4's.
+  if (!appended.created) {
+    return { observationId, created: false, folded: false, intent: readings.intent, ownTagIds: [], surprise: null };
+  }
+
+  const observation = { ...readings.validated, observationId } as Observation;
+
+  // A STATE WHOSE VALIDITY HAS PASSED OPENS NO TAG. `holdsAt` is the single exempt
+  // date reader, and an event always holds.
+  const holds = holdsAt(observation, at);
+
+  const folded = await retrying(
+    async () =>
+      // R10's unit of work. Every read is inside, so the retry re-runs them.
+      composed.handle.transaction().execute(async (trx) => {
+        const inner = compose(trx, composed.clock, composed.ring, composed.retention);
+        const baselines = await inner.baselines.forNamespace(namespaceId);
+        const contexts = new Map<string, AspectContext>();
+        const liveByAspect = new Map<string, StoredTag>();
+
+        for (const reading of readings.all) {
+          const baseline =
+            baselines.find((b) => b.channel === reading.channel && b.aspect === reading.aspect) ?? null;
+          const live = await inner.tags.findLive(namespaceId, reading.channel, reading.aspect);
+          if (live !== null) liveByAspect.set(reading.aspect, live);
+          const liveTag: LiveTagInput | null =
+            live === null
+              ? null
+              : {
+                  g0: live.g0,
+                  taggedAt: live.taggedAt,
+                  refreshCount: live.refreshCount,
+                  saturationState: live.saturationState,
+                  decayedStrength: strengthAt(live, at, policies.calibration.halfLifeMs),
+                };
+          contexts.set(reading.aspect, { baseline, liveTag });
+        }
+
+        const tagged = tagObservation({
+          namespaceId,
+          observation,
+          at,
+          contexts,
+          policy: policies.tagging,
+          calibration: policies.calibration,
+        });
+
+        const ownTagIds: string[] = [];
+        let surprise: number | null = null;
+
+        for (const result of tagged.readings) {
+          if (result.baseline !== null) {
+            const before = contexts.get(result.reading.aspect)?.baseline ?? null;
+            await inner.baselines.upsert(result.baseline, before === null ? null : before.count);
+          }
+          if (result.verdict !== null && result.verdict.kind === "measured") {
+            surprise = result.verdict.surprise;
+          }
+          // A state past its validity opens no tag, and a refresh of one is likewise
+          // not this observation's to make.
+          if (result.decision === null || !holds) continue;
+
+          if (result.decision.kind === "new") {
+            const opened = await inner.tags.open({
+              namespaceId,
+              observationId,
+              channel: result.decision.channel,
+              aspect: result.decision.aspect,
+              g0: result.decision.g0,
+              taggedAt: result.decision.taggedAt,
+            });
+            ownTagIds.push(opened.tagId);
+          } else {
+            const live = liveByAspect.get(result.decision.aspect)!;
+            await inner.tags.refresh(live.tagId, {
+              g0: result.decision.g0,
+              taggedAt: result.decision.taggedAt,
+              refreshCount: result.decision.refreshCount,
+              saturationState: result.decision.saturationState,
+            });
+            ownTagIds.push(live.tagId);
+          }
+        }
+        return { ownTagIds, surprise };
+      }),
+    { maxRetries: policies.brief.maxRetries, label: "observe", subject: observationId },
+  );
+
+  // R24: AFTER the commit, because `AuditChain.append` refuses a transaction.
+  await composed.audit.append({
+    policyVersion: compositePolicyVersion({
+      retention: policies.retention.version,
+      tagging: policies.tagging.version,
+      calibration: policies.calibration.version,
+      brief: policies.brief.version,
+    }),
+    kind: "observe",
+    body: {
+      observationId,
+      namespaceId,
+      at: at.toISOString(),
+      aspects: readings.all.map((r) => r.aspect),
+      tagIds: folded.ownTagIds,
+    },
+  });
+
+  return {
+    observationId,
+    created: true,
+    folded: true,
+    intent: readings.intent,
+    ownTagIds: folded.ownTagIds,
+    surprise: folded.surprise,
+  };
+}
+
