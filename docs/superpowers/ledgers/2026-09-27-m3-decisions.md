@@ -2214,3 +2214,82 @@ declares, and this is the first measurement of what it costs.
 Tests green, typecheck exit 2: `.catch()` widened a union to include the success value,
 and only `tsc` saw it. Recorded because the branch's own rule — run both and read the
 codes SEPARATELY — is the only reason it was caught before the commit.
+
+### R75 IS WITHDRAWN. The plan's acceptance was satisfiable, and I broke it with my own fixture
+
+The worst error of this milestone, and it is mine twice over: I declared a plan ruling
+unsatisfiable on the strength of a property my own test fixture created, and I replaced
+it with a witness that detects essentially nothing.
+
+**The plan's sentence is satisfiable, exactly and literally.** `scaleFloor` for
+`volume/amount/USDC/in` is 0.05 and `winsorMadMultiple` is 3, so the winsorising band is
+±0.15 around the running location. The amounts 1 through 40 clip on nearly every step,
+which is what made the fold order-dependent. **Within the band it is not.** Measured over
+2000 random orders of `10.000, 10.001 … 10.039`: the mean varies by **1.2e-14** and `m2`
+by **1.9e-15**, and the mean equals the arithmetic mean to fourteen digits. The plan
+never dictated the fixture; I chose one that clips and then blamed the ruling.
+
+**And the envelope detected nothing.** Measured: it was **24.7 wide**, not the 9.19 I
+wrote — 9.19 was ascending-versus-descending, and 200 shuffles widen it to ~24. Inside
+it:
+
+- forty copies of a single wrong value: **passes**, count exact
+- one lost plus one doubled: **passes in 99.6% of orders**, count exact
+- a review found 39-of-40, a stale-read overwrite and 20-lost-20-doubled all inside
+
+A review also ran the real path: `observe` forced to fold a constant forty times left
+the concurrency row **green**. The row named "leaves n at forty AND the mean a serial
+fold's" did not test the mean at all.
+
+**Two further things I got wrong in the same entry.** "Plus both extremes" — ascending
+and descending are NOT the extremes; a hill-climb finds 7.08 and 33.92 against their
+16.47 and 24.53. And min/max over 200 samples is not a bound at all, which made the row
+~0.7% flaky by construction.
+
+**And the premise under it was never true.** R10's defect — a committed fold with no tag,
+then a retry that folds again — moves the COUNT: the ledger's own measurement was
+"count = 12 for 11 observations", and a review reproduced it at 48 for 40. The count was
+always the working witness. The plan's "the count can still look right" is the sentence
+that needed checking, and nobody checked it.
+
+**What the row asserts now**, which is the plan's sentence plus one thing it missed: an
+in-band fixture, `mean` and `m2` against the serial fold to nine decimals. `m2` is not
+decoration — measured, forty copies of the arithmetic mean give an **identical mean**
+(1.1e-14 apart) and `m2` of 0 against 0.00533. **The mean alone would not catch it.** So
+the second moment is what makes the plan's own witness complete, and a control row
+asserts both quantities really do move for a lost-plus-doubled fold and for forty wrong
+values.
+
+### R77. The audit body `observe` writes carried a payload field into the chain
+
+`aspects` is templated from the payload — `amount/${assetCode}/${direction}`,
+`event/${p.event}`, `quoted/${p.unit}` — and the schema bounds none of those strings.
+Measured by a review: a 56-character address-shaped `assetCode` reached
+`audit.head().canonical` verbatim, in a hash-chained row that outlives every key. R25 says
+the body carries ids, codes, versions and instants and **never a payload field**, and
+this body was three payload fields concatenated. `assertAuditBody` was never applied to
+it — that function was written for the brief's body.
+
+The body carries a reading COUNT now. The aspects are recoverable from the tag rows the
+ids name, which is the right lifetime for them and not the chain's.
+
+### R78. Three more holes the same review found
+
+- **A zod refusal from `append` escaped unwrapped**, carrying wire content — an unknown
+  key shaped like a Stellar address arrived verbatim in the message. R74 argued no
+  observation id exists yet, which is true and is a reason to omit the id, **not** a
+  reason to let the message escape. `RefusedObservation` now takes a nullable id.
+- **The third `append` arm was collapsed into the second.** A re-delivery whose namespace
+  was erased or whose month expired answers `{created:false, readable:false}` with its
+  own flags, and was returned as an ordinary re-delivery with a briefable reading and
+  nothing saying otherwise. The result names it now; R14 is the brief-side half of the
+  same fact.
+- **"A state whose validity has passed opens no tag" was held by nothing.** Deleting the
+  `holdsAt` check SURVIVED the whole suite: no test drove a `state` observation through
+  `observe` at all. A live state and an expired one, same channel and payload, now hold
+  it from both sides.
+
+### `pnpm test` and `pnpm typecheck` diverged a FOURTH time
+
+Both times in this round were casts in a test file that only `tsc` sees. The rule is
+unchanged and it keeps earning its place.

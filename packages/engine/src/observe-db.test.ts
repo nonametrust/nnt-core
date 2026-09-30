@@ -191,79 +191,69 @@ describe("R23: a re-delivery folds nothing and says so", () => {
 
 describe("R10: the fold and the tag write are ONE transaction", () => {
   it("leaves n at forty AND the mean a serial fold's, under forty concurrent writers", async () => {
-    // The plan's acceptance, and the witness is the MEAN as well as the count: a retry
-    // that re-reads without rolling back moves the mean while the count can still look
-    // right. Forty distinct amounts, so a lost or doubled fold moves it detectably.
-    const amounts = Array.from({ length: 40 }, (_, i) => `${i + 1}.0000000`);
+    // The plan's acceptance, satisfied LITERALLY. An earlier version of this row used
+    // the amounts 1 through 40, found the fold order-dependent, and concluded the
+    // plan's sentence could not be satisfied. That conclusion was wrong and the cause
+    // was the fixture: `scaleFloor` for this pair is 0.05 and `winsorMadMultiple` is 3,
+    // so the winsorising band is ±0.15 around the running location and 1..40 clips on
+    // nearly every step.
+    //
+    // WITHIN THE BAND THE FOLD IS ORDER-INDEPENDENT. Measured over 2000 random orders
+    // of the fixture below: the mean varies by 1.2e-14 and `m2` by 1.9e-15, and the
+    // mean equals the arithmetic mean to fourteen digits. So there IS one serial fold
+    // to equal, for any interleaving the database chooses.
+    //
+    // The envelope that replaced it detected nothing: it was 24.7 wide, and forty
+    // copies of a single wrong value passed it, as did one-lost-plus-one-doubled in
+    // 99.6% of orders. It is gone.
+    const amounts = Array.from({ length: 40 }, (_, i) => (10 + i * 0.001).toFixed(7));
     const observations = amounts.map((a, i) => payment(`op:c${i}`, a, "CONCURRENT"));
 
-    // THE SHIPPED `maxRetries` OF 5 IS NOT ENOUGH FOR FORTY-WAY CONTENTION ON ONE
-    // PAIR, and that is measured rather than assumed: the first run of this row failed
-    // with "observe gave up after 6 attempts". Optimistic concurrency means the Nth
-    // writer loses to every writer that commits between its read and its own commit,
-    // so the retries needed grow with the contention, and the bound is a policy number
-    // nobody has calibrated against a fleet.
-    //
-    // The row uses a bound large enough to measure what it is about -- that the fold
-    // is correct under concurrency -- and the fact that the default does not reach it
-    // is a finding, recorded in the ledger rather than hidden by this line.
     const contended = { ...policies, brief: { ...BRIEF_POLICY_V0, maxRetries: 200 } };
     const results = await Promise.all(observations.map((o) => observe(composed, o, contended)));
     expect(results.filter((r) => r.folded).length, "not every writer folded").toBe(40);
 
     const nsId = await namespaceIdOf("CONCURRENT");
     const baseline = await baselineOf(nsId, "volume", "amount/USDC/in");
-    expect(baseline!.count, "the count is not forty").toBe(40);
 
-    // THE PLAN'S WITNESS IS NOT WELL-DEFINED, and that is measured rather than argued.
-    // Its acceptance says "the mean equal to a serial fold's" -- but `updateBaseline`
-    // WINSORIZES against the running median and MAD, so the fold is order-dependent and
-    // there is no single serial mean to equal. Measured on exactly this fixture:
-    // ascending gives 16.473, descending 24.527, a shuffle 15.334 -- a spread of 9.19,
-    // where the plain arithmetic mean is 20.5. Forty concurrent writers commit in an
-    // arbitrary order, so demanding one particular serial mean would be demanding one
-    // particular interleaving.
-    //
-    // What IS well-defined, and still catches what the witness exists for: the result
-    // must be a serial fold of THESE FORTY VALUES IN SOME ORDER. A lost fold, a doubled
-    // fold, or a retry that re-read without rolling back all produce a state no
-    // ordering of the forty can produce. The envelope is computed here from the same
-    // arithmetic rather than hard-coded, so it moves with the policy.
+    // The serial fold, through tagging's own arithmetic rather than assumed.
     const floor = scaleFloorFor(POLICY_V0, "volume", "amount/USDC/in");
-    const foldInOrder = (xs: readonly string[]) => {
-      let state = emptyBaseline(nsId, "volume", "amount/USDC/in");
-      for (const a of xs) {
-        state = updateBaseline(state, Number(a), robustScale(state, floor), POLICY_V0);
-      }
+    let serial = emptyBaseline(nsId, "volume", "amount/USDC/in");
+    for (const a of amounts) {
+      serial = updateBaseline(serial, Number(a), robustScale(serial, floor), POLICY_V0);
+    }
+
+    expect(baseline!.count, "the count is not forty").toBe(40);
+    expect(baseline!.mean, "the mean moved, so a fold was lost or doubled").toBeCloseTo(
+      serial.mean,
+      9,
+    );
+    // `m2` is the second order-independent moment, and it moves where the mean might
+    // not: one lost plus one doubled shifts it detectably while the count stays exact.
+    expect(baseline!.m2, "the second moment moved").toBeCloseTo(serial.m2, 9);
+  }, 120_000);
+
+  it("would SEE a lost or doubled fold, which is what makes the row above mean something", async () => {
+    // The control the envelope never had. A witness that passes forty wrong values is
+    // not a witness, and this is how that is known rather than hoped: the same
+    // assertions, against a baseline built from a deliberately wrong multiset.
+    const amounts = Array.from({ length: 40 }, (_, i) => (10 + i * 0.001).toFixed(7));
+    const floor = scaleFloorFor(POLICY_V0, "volume", "amount/USDC/in");
+    const fold = (xs: readonly string[]) => {
+      let state = emptyBaseline("ns", "volume", "amount/USDC/in");
+      for (const a of xs) state = updateBaseline(state, Number(a), robustScale(state, floor), POLICY_V0);
       return state;
     };
+    const honest = fold(amounts);
+    const oneLostOneDoubled = fold([...amounts.slice(0, 39), amounts[0]!]);
+    const allWrong = fold(Array.from({ length: 40 }, () => "10.0195000"));
 
-    const means: number[] = [];
-    const ordered = [...amounts];
-    means.push(foldInOrder(ordered).mean);
-    means.push(foldInOrder([...ordered].reverse()).mean);
-    for (let trial = 0; trial < 200; trial++) {
-      const shuffled = [...ordered];
-      for (let i = shuffled.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [shuffled[i], shuffled[j]] = [shuffled[j]!, shuffled[i]!];
-      }
-      means.push(foldInOrder(shuffled).mean);
-    }
-    const low = Math.min(...means);
-    const high = Math.max(...means);
-    expect(high - low, "the fixture is order-independent, so this envelope proves nothing").toBeGreaterThan(1);
-
-    expect(
-      baseline!.mean,
-      `the mean ${baseline!.mean} is outside every ordering of these forty ` +
-        `(${low.toFixed(3)}..${high.toFixed(3)}), so a fold was lost, doubled, or folded twice`,
-    ).toBeGreaterThanOrEqual(low);
-    expect(baseline!.mean).toBeLessThanOrEqual(high);
-
-    // And the count is exact, which is the half an envelope cannot give.
-    expect(baseline!.count).toBe(40);
-  }, 120_000);
+    expect(oneLostOneDoubled.count, "the count alone cannot see this").toBe(honest.count);
+    expect(allWrong.count).toBe(honest.count);
+    // Both are caught by the assertions the row above makes, at the precision it uses.
+    expect(Math.abs(oneLostOneDoubled.mean - honest.mean)).toBeGreaterThan(1e-9);
+    expect(Math.abs(allWrong.m2 - honest.m2)).toBeGreaterThan(1e-9);
+  });
 });
 
 describe("R21: a refusal is recorded as a CODE and an observation id", () => {
@@ -309,6 +299,111 @@ describe("R21: a refusal is recorded as a CODE and an observation id", () => {
     await observe(composed, payment("op:huge3", huge, "AFTERHUGE"), policies).catch(() => undefined);
     const out = await observe(composed, payment("op:after", "5.0000000", "AFTERHUGE"), policies);
     expect(out.folded).toBe(true);
+  }, 30_000);
+});
+
+describe("a state whose validity has passed", () => {
+  it("is folded and opens NO tag", async () => {
+    // The plan's acceptance clause, and a mutant deleting `|| !holds` SURVIVED the
+    // whole suite before this row: no test drove a `state` observation through
+    // `observe` at all. `holdsAt` is the single exempt date reader and an event always
+    // holds, so only a state can exercise it.
+    //
+    // Categorical readings always produce a tag decision, so `protocol` is the channel
+    // that makes the absence visible: a live state tags, an expired one must not.
+    // A STATE CARRIES AN INTERVAL AND NO INSTANT. The union is strict in both
+    // directions, so `observedAt` must be absent -- built from the fields rather than
+    // spread over the event helper, which carries one.
+    const state = (ref: string, validUntil: string, nsId: string): WireObservation =>
+      ({
+        schemaVersion: "0.1.0",
+        namespace: { kind: "wallet", id: nsId },
+        channel: "protocol",
+        evidenceKind: "state",
+        kind: "event_observed",
+        validFrom: "2026-09-01T00:00:00.000Z",
+        validUntil,
+        source: { ...source, ref },
+        payload: { event: "trustline_open" },
+      }) as unknown as WireObservation;
+
+    // Still valid at the clock's instant: it tags.
+    const live = await observe(composed, state("op:live", "2026-12-01T00:00:00.000Z", "STATELIVE"), policies);
+    expect(live.folded).toBe(true);
+    expect(live.ownTagIds, "a live state opened no tag, so the row below proves nothing").toHaveLength(1);
+
+    // Expired before it: same channel, same payload, no tag.
+    const expired = await observe(composed, state("op:expired", "2026-09-05T00:00:00.000Z", "STATEDEAD"), policies);
+    expect(expired.folded).toBe(true);
+    expect(expired.ownTagIds, "a state past its validity opened a tag").toEqual([]);
+
+    const nsId = await namespaceIdOf("STATEDEAD");
+    expect(await composed.tags.listLive(nsId)).toEqual([]);
+  }, 30_000);
+});
+
+describe("R25: the audit body carries no payload field", () => {
+  it("keeps an address-shaped assetCode out of the chain", async () => {
+    // A review measured this reaching `audit.head().canonical` verbatim: an aspect is
+    // templated from the payload and the schema bounds none of those strings, so a
+    // 56-character address-shaped `assetCode` went into a hash-chained row that
+    // outlives every key.
+    const address = `G${"A".repeat(55)}`;
+    const out = await observe(
+      composed,
+      wire({
+        source: { ...source, ref: "op:addr" },
+        namespace: { kind: "wallet", id: "ADDRLEAK" },
+        payload: { amount: "1.0000000", assetCode: address, direction: "in" },
+      }),
+      policies,
+    );
+    const head = await composed.audit.head();
+    expect(head!.canonical, "an address reached the chain").not.toContain(address);
+    expect(head!.canonical, "the aspect reached the chain").not.toContain("amount/");
+    // What it DOES carry: ids, an instant, and a count.
+    expect(head!.canonical).toContain(out.observationId);
+  }, 30_000);
+});
+
+describe("the third append arm is NAMED, not collapsed into a re-delivery", () => {
+  it("says the source will not open when the namespace was erased", async () => {
+    // `append` has three arms. A re-delivery whose namespace was erased answers
+    // `{created:false, readable:false}` with its own flags, and was returned as an
+    // ordinary re-delivery with a briefable reading and nothing saying otherwise.
+    const observation = payment("op:thirdarm", "1.0000000", "THIRDARM");
+    const first = await observe(composed, observation, policies);
+    expect(first.readable).toBe(true);
+    expect(first.namespaceErased).toBe(false);
+
+    const nsId = await namespaceIdOf("THIRDARM");
+    await composed.namespaces.shred(nsId);
+
+    const again = await observe(composed, observation, policies);
+    expect(again.created).toBe(false);
+    expect(again.folded).toBe(false);
+    expect(again.readable, "an erased re-delivery was reported as readable").toBe(false);
+    expect(again.namespaceErased).toBe(true);
+  }, 30_000);
+});
+
+describe("R21: an envelope the schema rejects, before any row exists", () => {
+  it("is wrapped in a code, with no id and no wire content", async () => {
+    // `append` runs `observationSchema.parse` before any row exists, and a zod refusal
+    // carries wire content -- a review measured an unknown key shaped like an address
+    // arriving verbatim. No observation id exists to name it by, which is a reason to
+    // omit the id and NOT a reason to let the message escape.
+    const address = `G${"B".repeat(55)}`;
+    const bad = { ...(payment("op:zod", "1.0000000", "ZODLEAK") as object), [address]: 1 };
+    const failure = await observe(composed, bad as unknown as WireObservation, policies).then(
+      () => null,
+      (e: unknown) => e as RefusedObservation,
+    );
+    expect(failure, "the malformed envelope was accepted").not.toBeNull();
+    expect(failure!.code).toBe("OBSERVATION_INVALID");
+    expect(failure!.observationId, "an id was invented for a row that does not exist").toBeNull();
+    expect(failure!.message).not.toContain(address);
+    expect(JSON.stringify(failure)).not.toContain(address);
   }, 30_000);
 });
 

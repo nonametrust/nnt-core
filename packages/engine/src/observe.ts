@@ -1,6 +1,6 @@
 import { holdsAt, validateObservation, type Observation, type WireObservation } from "@nonametrust/schema";
 import { readObservation, tagObservation, type AspectContext, type LiveTagInput } from "@nonametrust/tagging";
-import { strengthAt, type StoredTag } from "@nonametrust/store";
+import { StoreError, strengthAt, type StoredTag } from "@nonametrust/store";
 import { compose, type Composed } from "./compose.js";
 import { retrying } from "./availability.js";
 import { AuditEntryMissing } from "./run-brief.js";
@@ -176,10 +176,20 @@ export function readingsOf(wire: WireObservation, namespaceId: string): Observat
 export class RefusedObservation extends Error {
   constructor(
     readonly code: string,
-    readonly observationId: string,
+    /**
+     * `null` when the refusal happened BEFORE the row existed — an envelope zod
+     * rejects. R21 asks for a code and an observation id; when there is no id the
+     * honest answer is no id, never the message.
+     */
+    readonly observationId: string | null,
     options: ErrorOptions,
   ) {
-    super(`observe: ${observationId} refused as ${code}`, options);
+    super(
+      observationId === null
+        ? `observe: an observation was refused as ${code} before it was stored`
+        : `observe: ${observationId} refused as ${code}`,
+      options,
+    );
   }
 }
 
@@ -190,6 +200,15 @@ export interface ObserveResult {
   readonly created: boolean;
   /** R23: a re-delivery folds NOTHING, and says so. */
   readonly folded: boolean;
+  /**
+   * Whether the stored observation's payload can still be opened. False only on the
+   * third `append` arm: a re-delivery whose month expired or whose namespace was
+   * erased. R13's business on the brief side; named here so a caller is not left to
+   * infer it.
+   */
+  readonly readable: boolean;
+  readonly periodExpired: boolean;
+  readonly namespaceErased: boolean;
   /** R40/R46: the reading a brief may be handed, or why there is none. */
   readonly intent: IntentReading;
   /** R41: the tags this observation opened OR refreshed. */
@@ -229,7 +248,19 @@ export async function observe(
 
   // OUTSIDE the transaction, because `append` refuses one. A new observation for an
   // erased namespace is refused here, by name, by the store's own gate.
-  const appended = await composed.observations.append(wire);
+  //
+  // R21 EVEN HERE, WHERE THERE IS NO ID YET. `append` runs `observationSchema.parse`,
+  // and a zod refusal carries wire content in its message -- a review measured an
+  // unknown key shaped like a Stellar address arriving verbatim. No observation id
+  // exists to name it by, which is a reason to omit the id and NOT a reason to let the
+  // message escape unwrapped.
+  let appended;
+  try {
+    appended = await composed.observations.append(wire);
+  } catch (cause) {
+    if (cause instanceof StoreError) throw cause;
+    throw new RefusedObservation("OBSERVATION_INVALID", null, { cause });
+  }
   const observationId =
     appended.created || appended.readable ? appended.observation.observationId : appended.observationId;
 
@@ -260,7 +291,28 @@ export async function observe(
   // successful append and its fold loses that contribution permanently, and nothing
   // detects it. Closing that needs a fold ledger, which is M4's.
   if (!appended.created) {
-    return { observationId, created: false, folded: false, intent: readings.intent, ownTagIds: [], surprise: null };
+    // THREE ARMS, NOT TWO. An earlier comment here said "`append` answers
+    // `{created:false}` on a repeat", which collapses the third arm into the second: a
+    // re-delivery whose namespace was erased or whose month expired answers
+    // `{created:false, readable:false}` with its own flags, and was returned as an
+    // ordinary re-delivery with a briefable reading and nothing saying otherwise.
+    //
+    // The reading is still derivable -- it comes from the wire, which is in hand -- so
+    // it is still returned. What changes is that the result SAYS the source will not
+    // open, and a caller is not left to infer it from silence. R14 refuses a brief on
+    // an erased namespace, and this is the ingest-side half of the same fact.
+    const readable = appended.readable;
+    return {
+      observationId,
+      created: false,
+      folded: false,
+      readable,
+      periodExpired: readable ? false : appended.periodExpired,
+      namespaceErased: readable ? false : appended.namespaceErased,
+      intent: readings.intent,
+      ownTagIds: [],
+      surprise: null,
+    };
   }
 
   const observation = { ...readings.validated, observationId } as Observation;
@@ -360,11 +412,20 @@ export async function observe(
       brief: policies.brief.version,
     }),
     kind: "observe",
+    // R25: IDS, CODES, VERSIONS AND INSTANTS. An earlier version carried `aspects`,
+    // and a review measured what that costs: an aspect is templated from the payload
+    // (`amount/${assetCode}/${direction}`, `event/${p.event}`, `quoted/${p.unit}`) and
+    // the schema bounds none of those strings, so a 56-character address-shaped
+    // `assetCode` reached the chain's canonical form verbatim. The row is hash-chained
+    // and outlives every key, which is the one place a payload field must never go.
+    //
+    // The aspects are recoverable from the tag rows the ids name, for as long as those
+    // rows exist -- which is the right lifetime for them and not the chain's.
     body: {
       observationId,
       namespaceId,
       at: at.toISOString(),
-      aspects: readings.all.map((r) => r.aspect),
+      readings: readings.all.length,
       tagIds: folded.ownTagIds,
     },
   };
@@ -399,6 +460,9 @@ export async function observe(
     observationId,
     created: true,
     folded: true,
+    readable: true,
+    periodExpired: false,
+    namespaceErased: false,
     intent: readings.intent,
     ownTagIds: folded.ownTagIds,
     surprise: folded.surprise,
