@@ -3,6 +3,7 @@ import { readObservation, tagObservation, type AspectContext, type LiveTagInput 
 import { strengthAt, type StoredTag } from "@nonametrust/store";
 import { compose, type Composed } from "./compose.js";
 import { retrying } from "./availability.js";
+import { AuditEntryMissing } from "./run-brief.js";
 import { compositePolicyVersion } from "./composite-version.js";
 import type { BriefPolicies } from "./brief.js";
 import type { Related } from "./relatedness.js";
@@ -345,8 +346,13 @@ export async function observe(
     { maxRetries: policies.brief.maxRetries, label: "observe", subject: observationId },
   );
 
-  // R24: AFTER the commit, because `AuditChain.append` refuses a transaction.
-  await composed.audit.append({
+  // R24: AFTER the commit, because `AuditChain.append` refuses a transaction — and
+  // RETRIED under R28, then NAMED, never rolled back. The fold and the tag are already
+  // committed; rolling them back to keep the chain tidy would make the chain the
+  // transaction log, which is exactly what R24 says it is not. So an exhausted append
+  // leaves a fold with no entry, says so by name, and writes the condition to
+  // structured stderr — the chain cannot record its own absence.
+  const entry = {
     policyVersion: compositePolicyVersion({
       retention: policies.retention.version,
       tagging: policies.tagging.version,
@@ -361,7 +367,33 @@ export async function observe(
       aspects: readings.all.map((r) => r.aspect),
       tagIds: folded.ownTagIds,
     },
-  });
+  };
+  try {
+    await retrying(async () => composed.audit.append(entry), {
+      maxRetries: policies.brief.maxRetries,
+      label: "observe.audit",
+      subject: observationId,
+    });
+  } catch (cause) {
+    // A CODE AND IDS ONLY, R21: whatever failed may carry an observed value, and a line
+    // on stderr is as durable as whatever collects it.
+    process.stderr.write(
+      `${JSON.stringify({
+        event: "engine.observe.audit_entry_missing",
+        at: at.toISOString(),
+        code: "AUDIT_ENTRY_MISSING",
+        observationId,
+        namespaceId,
+        tagIds: folded.ownTagIds,
+      })}\n`,
+    );
+    throw new AuditEntryMissing(
+      `observe ${observationId} folded and tagged, and its chain entry did not land: ` +
+        `the writes are committed and are NOT rolled back, so this is a named ` +
+        `inconsistency rather than a failure that undid itself`,
+      { cause },
+    );
+  }
 
   return {
     observationId,

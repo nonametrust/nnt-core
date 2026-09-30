@@ -4,6 +4,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { WireObservation } from "@nonametrust/schema";
 import { CALIBRATION_V0, POLICY_V0, emptyBaseline, updateBaseline, robustScale, scaleFloorFor } from "@nonametrust/tagging";
 import {
+  Deadlocked,
   NamespaceShredded,
   fixedClock,
   keyRingFromEnv,
@@ -16,6 +17,7 @@ import {
 import { compose, type Composed } from "./compose.js";
 import { BRIEF_POLICY_V0 } from "./policy.js";
 import { observe, RefusedObservation } from "./observe.js";
+import { AuditEntryMissing } from "./run-brief.js";
 import type { BriefPolicies } from "./brief.js";
 
 // Task 8b: R10, R21, R23, R24, R28 — the ingest path, against a real database.
@@ -320,6 +322,61 @@ describe("an erased namespace", () => {
       observe(composed, payment("op:erase2", "2.0000000", "TOERASE"), policies),
     ).rejects.toBeInstanceOf(NamespaceShredded);
   }, 30_000);
+});
+
+describe("R24: an audit row that never lands is NAMED, not rolled back", () => {
+  it("leaves the fold and the tag committed, and says so by name", async () => {
+    // The chain's job is to record what happened, not to be the transaction log. So an
+    // exhausted append does NOT undo a committed fold -- it names the inconsistency and
+    // writes the condition to structured stderr, because the chain cannot record its
+    // own absence.
+    const lines: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string): boolean => {
+      lines.push(String(chunk));
+      return true;
+    };
+    // A composition whose audit chain always refuses. Everything else is the real one.
+    const broken: Composed = {
+      ...composed,
+      audit: {
+        ...composed.audit,
+        append: async () => {
+          throw new Deadlocked("deadlock detected");
+        },
+      } as unknown as Composed["audit"],
+    };
+
+    try {
+      await expect(
+        observe(broken, payment("op:noaudit", "11.0000000", "NOAUDIT"), {
+          ...policies,
+          brief: { ...BRIEF_POLICY_V0, maxRetries: 1 },
+        }),
+      ).rejects.toBeInstanceOf(AuditEntryMissing);
+    } finally {
+      (process.stderr as { write: unknown }).write = realWrite;
+    }
+
+    // NOT ROLLED BACK: the fold is there.
+    const nsId = await namespaceIdOf("NOAUDIT");
+    const baseline = await baselineOf(nsId, "volume", "amount/USDC/in");
+    expect(baseline!.count, "the fold was rolled back to keep the chain tidy").toBe(1);
+
+    // And the condition reached stderr, as one structured line carrying ids and a code.
+    const reported = lines.map((l) => {
+      try {
+        return JSON.parse(l) as Record<string, unknown>;
+      } catch {
+        return null;
+      }
+    }).filter((l): l is Record<string, unknown> => l !== null);
+    const missing = reported.find((l) => l["event"] === "engine.observe.audit_entry_missing");
+    expect(missing, "the outage was never written to stderr").toBeDefined();
+    expect(missing!["code"]).toBe("AUDIT_ENTRY_MISSING");
+    expect(missing!["observationId"]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(Object.keys(missing!)).not.toContain("message");
+  }, 60_000);
 });
 
 describe("R24: the audit row is written after the transaction commits", () => {
