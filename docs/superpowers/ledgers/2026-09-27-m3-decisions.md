@@ -1977,3 +1977,46 @@ number.**
 - Four equivalent mutants survived and are provably equivalent (branch-order swaps over
   disjoint classes, a `{4,5}` regex where no 4-character code exists). They are controls,
   not holes.
+
+## Task 8a — the reading the brief is handed, and R46 measured rather than quoted
+
+Engine 527 -> 539. `compose` now carries `ring` and `retention`, because R10 has the
+ingest path open a transaction and compose again onto it, and `NamespaceRepository`
+keeps its ring private — so a caller holding only the repositories could not rebuild
+them. Held by a row that re-composes and checks the clock and policy identities survive.
+
+### R70. R46's refusal is on the READING COUNT, not on the channel name
+
+R46 says: "An intent with more than ONE reading is refused in M3, by name.
+`cluster_proximity` yields TWO — `hops` and `amount` — so a `cluster_proximity` intent
+cannot be briefed in M3, and that belongs in the README."
+
+Measured against `reading.ts:159-173`: **`hops` is always produced and `amount` is
+pushed only `if (p.amount !== undefined)`.** So `cluster_proximity` yields two readings
+when the payload carries an amount and ONE when it does not, and no other channel can
+produce two at all. The maximum anywhere is two.
+
+**Ruled: the refusal is on the count.** A `cluster_proximity` observation with no amount
+derives exactly `hops` and is as briefable as any other, and refusing it by channel name
+would refuse a question M3 can answer. Held both ways: the two-reading form is refused
+naming both aspects, and the one-reading form is admitted — a mutant that refuses by
+channel name, which is R46 as literally worded, is killed by that second row.
+
+**The outward-facing sentence changes with it.** The README owes "a `cluster_proximity`
+intent cannot be briefed in M3" only of the two-reading form. Recorded here; the README
+line goes in with the rest of Task 8.
+
+### Validation runs FIRST, and the reason is R21
+
+`validateObservation` is the schema's, not tagging's, and it refuses the envelope: a
+channel that is not one, a payload the channel's shape does not admit, and an
+`observationId` or `ingestedAt` on the wire — both engine-assigned, so a producer
+supplying one is a producer choosing an id.
+
+Running it before anything is derived is not tidiness. **Tagging's refusals carry
+observed VALUES** — `surpriseOf`'s `RangeError` names the deviation and the scale
+(`scale.ts:63`) — and R21 keeps those out of anything recorded. The cheapest way to
+honour that is not to reach them with an observation the envelope already refuses.
+
+The refusal carries the schema's own reasons rather than a summary, because "invalid" is
+not something a producer can act on.

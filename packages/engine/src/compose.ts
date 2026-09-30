@@ -35,6 +35,16 @@ export interface Composed {
    */
   readonly handle: Db;
   readonly clock: Clock;
+  /**
+   * The two values a re-composition needs, carried because Task 8 performs one.
+   *
+   * R10 puts the fold and the tag write in ONE transaction, and `Db` already admits a
+   * `Transaction` — so the ingest path opens one and calls `compose` again onto it.
+   * Without these it could not: `NamespaceRepository` keeps its ring private, so a
+   * caller holding only the repositories cannot rebuild them.
+   */
+  readonly ring: KeyRing;
+  readonly retention: RetentionPolicy;
   readonly namespaces: NamespaceRepository;
   readonly observations: ObservationRepository;
   readonly tags: TagRepository;
@@ -54,6 +64,8 @@ export interface Composed {
 const COMPOSED_KEY_SET: { readonly [K in keyof Composed]: true } = {
   handle: true,
   clock: true,
+  ring: true,
+  retention: true,
   namespaces: true,
   observations: true,
   tags: true,
@@ -125,6 +137,8 @@ export function compose(
   return {
     handle,
     clock,
+    ring,
+    retention,
     namespaces,
     observations: new ObservationRepository(handle, namespaces, clock, retention),
     tags: new TagRepository(handle, clock),

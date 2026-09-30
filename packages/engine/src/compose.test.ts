@@ -68,6 +68,8 @@ describe("compose", () => {
     // this repository has already shipped twice: a scan that is green because it
     // scanned nothing.
     const clock = fixedClock(new Date("2026-09-21T00:00:00.000Z"));
+    // `ring` and `retention` are values rather than repositories, so they carry no
+    // clock and are correctly absent from this list.
     expect(clockBearing(build(clock)).map(([key]) => key).sort()).toEqual([
       "audit",
       "baselines",
@@ -94,6 +96,20 @@ describe("compose", () => {
   it("returns exactly the keys it declares, so a dropped repository is a red test", () => {
     const composed = build(fixedClock(new Date("2026-09-21T00:00:00.000Z")));
     expect(Object.keys(composed).sort()).toEqual([...COMPOSED_KEYS].sort());
+  });
+
+  it("carries the ring and the retention policy, so Task 8 can re-compose on a transaction", () => {
+    // R10 puts the fold and the tag write in one transaction, and the ingest path
+    // opens one and composes again onto it. `NamespaceRepository` keeps its ring
+    // private, so without these a caller holding only the repositories could not.
+    const composed = build(fixedClock(new Date("2026-09-21T00:00:00.000Z")));
+    expect(composed.ring).toBe(ring);
+    expect(composed.retention).toBe(RETENTION_V0);
+    // And re-composing on the same handle really works, which is the point of carrying
+    // them at all.
+    const again = compose(composed.handle, composed.clock, composed.ring, composed.retention);
+    expect(again.namespaces.clock).toBe(composed.clock);
+    expect(again.namespaces.policy).toBe(RETENTION_V0);
   });
 
   it("carries the clock it was given, for the wrapper that reads `at` off it", () => {
