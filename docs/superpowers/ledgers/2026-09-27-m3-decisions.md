@@ -2507,6 +2507,78 @@ Re-run at this head after the rows above:
 And a control — `subject: observationId + ""`, which changes nothing observable —
 **SURVIVED**, so the harness is not simply red for any edit to this file.
 
+### R83. R21's "recorded" half, and WHICH refusals may be recorded at all
+
+R21 reads "a per-observation refusal is **recorded** as a code and an observation id,
+never as the message", the plan's acceptance says such an observation "is recorded and
+skipped rather than halting ingest", and G19 budgets eight rows for it and names a mutant
+that only makes sense against a body: *"the message put in the body"*. Nothing recorded
+anything. `observe` threw a `RefusedObservation` carrying the code and the id — which is
+how a CALLER learns of it — and wrote nothing durable.
+
+**The plan does not say which refusals, and the two sites are not alike.** The ingest path
+refuses in two places:
+
+- **After the append**, when the channel validator or tagging refuses the payload. There
+  is a row to name, and that row had to be ACCEPTED first — so the rate is already
+  bounded by the producer cap. This one is recorded, as kind `observe_refused`.
+- **At the append**, when `observationSchema` rejects the envelope. No row exists.
+  Recording it would turn malformed wire input into permanent, unerasable rows at
+  whatever rate a producer chooses to send it: an **amplification vector into the one
+  table retention cannot reach**. `RefusedObservation` already carries a null id here
+  precisely because there is nothing to name. Structured stderr is the record, which is
+  the same answer R7 gives for every condition the chain cannot hold, and for the same
+  reason — the chain is not the place for facts about things that do not exist in it.
+
+`REFUSAL_CODES` is closed on R45's ground: the code is derived from `cause.code`, a
+property of whatever was thrown, and the value is hashed into a row that outlives every
+key. And the recording never replaces the refusal: a failed append writes
+`REFUSAL_ENTRY_MISSING` to stderr and the caller still receives the reason the
+observation was refused. An ingest that reported a lost audit row in place of that would
+have replaced the fact with a fact about recording the fact.
+
+G19's own named mutant — the message put in the body — now dies at two rows.
+
+### The Proxy row had a hole, and only mutating AFTER it was green found it
+
+R81's row was written for "every read the fold makes is on the transaction's connection",
+it was green, and moving `inner.tags.refresh` to `composed.tags.refresh` **survived it**.
+The row drives a cold volume event, which opens no tag at all — so neither tag branch was
+ever reached through the guard. R10's named defect is "a committed fold with no tag", and
+the tag side of it was the half unheld.
+
+A categorical channel always produces a decision, so a second row drives two `protocol`
+events through the guarded composition: the first exercises `findLive` and `open`, the
+second `findLive` and `refresh`. All five seams of the fold are now held — the baseline
+read, the baseline upsert, `findLive`, `open` and `refresh` — each measured separately.
+
+This is the same lesson as "a green verification does not prove it measures the right
+thing", arriving one level up: a row written FOR a property can hold one instance of it
+and none of the others, and only a mutant per seam says which.
+
+### A hung mutant poisoned every run after it, and a control is what caught that
+
+`findLive` moved outside the transaction exhausts the pool: ten backends sit
+`idle in transaction`, every DB row then dies on its own vitest timeout, and the run never
+finishes. The three mutants that followed it all reported **KILLED with no red test row** —
+the signature of an environmental failure, not a kill. Re-run after reaping the stuck
+backends: all three still die, but now at rows naming their rule, and **both no-op
+controls survive**, which is the only reason the first verdicts could be known to be
+worthless.
+
+So the driver now reaps leftover backends before every run, and a `KILLED` with an empty
+red-row list is reported as environmental rather than counted. The branch had already paid
+for hung mutants once, by losing three runs; this is the second bill and the first one
+that produced false GREEN-adjacent evidence rather than none.
+
+### Recorded, not fixed
+
+`assertRefusalBody` deleted from the recorder **SURVIVES**. Every code that can reach that
+call is already in R21's vocabulary, so there is no reachable violation today: the
+function is held by ten unit rows and the call is a guard against a code a later refusal
+class introduces. Stated rather than left as a silent survivor, and not papered over with
+a row that would have to fake a cause to make it fail.
+
 ### `pnpm test` and `pnpm typecheck` diverged a FIFTH time
 
 `AppendResult`'s third arm carries no `observation` field at all, and a stub spreading

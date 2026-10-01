@@ -2,11 +2,15 @@ import { describe, it, expect } from "vitest";
 import {
   ADMITTED_OBSERVE_PATHS,
   ADMITTED_PATHS,
+  ADMITTED_REFUSAL_PATHS,
+  REFUSAL_CODES,
   assertAuditBody,
   assertObserveBody,
+  assertRefusalBody,
   auditBodyPaths,
   type BriefAuditBody,
   type ObserveAuditBody,
+  type RefusalAuditBody,
 } from "./audit-body.js";
 
 // R25 and R48: the audit body is a CLOSED type and the runtime check is a
@@ -476,5 +480,108 @@ describe("the observe entry's audit body", () => {
       expect(ADMITTED_OBSERVE_PATHS.has("readings")).toBe(true);
       expect(typeof OBSERVE_BODY.readings).toBe("number");
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The REFUSAL entry's body, R21 -- the half of that ruling the code did not do.
+//
+// R21 reads "a per-observation refusal is RECORDED as a code and an observation
+// id, never as the message", and the plan's acceptance says such an observation
+// "is recorded and skipped rather than halting ingest". G19 budgets eight rows
+// for it and names a mutant that only makes sense against a body: "the message
+// put in the body".
+//
+// Nothing recorded anything. `observe` threw a `RefusedObservation` carrying the
+// code and the id, which is how a CALLER learns of it, and no durable row was
+// written at all.
+// ---------------------------------------------------------------------------
+
+const REFUSAL_BODY: RefusalAuditBody = {
+  observationId: "e3a1c6de-0000-4000-8000-000000000021",
+  code: "OBSERVATION_UNREADABLE",
+  at: "2026-09-21T00:00:00.000Z",
+};
+
+const refusalPlus = (patch: Record<string, unknown>): RefusalAuditBody =>
+  ({ ...REFUSAL_BODY, ...patch }) as unknown as RefusalAuditBody;
+
+describe("the refusal entry's audit body", () => {
+  it("admits the shipped shape, for each code the ingest path can record", () => {
+    for (const code of REFUSAL_CODES) {
+      expect(() => assertRefusalBody({ ...REFUSAL_BODY, code }), code).not.toThrow();
+    }
+  });
+
+  it("refuses a code outside the vocabulary, because the value is hashed forever", () => {
+    // The same ground R45 refuses a risk tier on. `observe` derives this code from
+    // `cause.code`, which is a property of whatever was thrown -- so an unexpected
+    // class would otherwise put an unreviewed string into a permanent row.
+    expect(() => assertRefusalBody(refusalPlus({ code: "SOMETHING_ELSE" }))).toThrow(
+      /code must be one of/,
+    );
+    expect(() => assertRefusalBody(refusalPlus({ code: "" }))).toThrow(/code must be one of/);
+  });
+
+  describe("refuses the one thing R21 names", () => {
+    it("a `message` key, which is the field the whole ruling is about", () => {
+      expect(() =>
+        assertRefusalBody(refusalPlus({ message: "amount 999…999 does not fit a double" })),
+      ).toThrow(/message is not admitted/);
+    });
+
+    it("a message hidden under another key", () => {
+      expect(() => assertRefusalBody(refusalPlus({ detail: { reason: "…" } }))).toThrow(
+        /detail is not admitted/,
+      );
+    });
+
+    it("the validator's `errors` array, which carries received VALUES verbatim", () => {
+      // zod's enum messages carry `received '<value>'` and a strict object's
+      // message carries the unknown KEY names, which on this wire can be an
+      // address. Measured during the Task 8b review.
+      expect(() => assertRefusalBody(refusalPlus({ errors: ["direction: received 'x'"] }))).toThrow(
+        /errors is not admitted/,
+      );
+    });
+
+    it("a payload or a wire source", () => {
+      expect(() => assertRefusalBody(refusalPlus({ payload: { amount: "1" } }))).toThrow(
+        /payload is not admitted/,
+      );
+      expect(() => assertRefusalBody(refusalPlus({ source: { ref: "op:0" } }))).toThrow(
+        /source is not admitted/,
+      );
+    });
+  });
+
+  describe("refuses a value the admitted type does not allow", () => {
+    it("a blank or absent observation id -- a refusal with no row is NOT recorded here", () => {
+      expect(() => assertRefusalBody(refusalPlus({ observationId: " " }))).toThrow(
+        /observationId must not be blank/,
+      );
+      expect(() => assertRefusalBody(refusalPlus({ observationId: null }))).toThrow(
+        /observationId must be a string/,
+      );
+    });
+
+    it("an instant that is not one", () => {
+      expect(() => assertRefusalBody(refusalPlus({ at: "2026-09-21" }))).toThrow(
+        /at must be an ISO instant/,
+      );
+    });
+
+    it("a missing key, said to be missing", () => {
+      for (const key of ["observationId", "code", "at"] as const) {
+        const { [key]: _dropped, ...rest } = REFUSAL_BODY;
+        expect(() => assertRefusalBody(rest as unknown as RefusalAuditBody), key).toThrow(
+          new RegExp(`auditBody\\.${key} is missing`),
+        );
+      }
+    });
+  });
+
+  it("has a whitelist equal to the shipped body's paths, with no dead entry", () => {
+    expect([...auditBodyPaths(REFUSAL_BODY)].sort()).toEqual([...ADMITTED_REFUSAL_PATHS].sort());
   });
 });

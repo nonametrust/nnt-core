@@ -442,3 +442,85 @@ export function assertObserveBody(body: ObserveAuditBody): void {
   // a reader chasing the refusal is handed the string the whitelist names.
   for (const tagId of body.tagIds) requireId("tagIds[]", tagId, false);
 }
+
+/**
+ * The codes a recorded refusal may carry, R21.
+ *
+ * A CLOSED VOCABULARY, on exactly the ground R45 closes the risk tiers: the
+ * value is hashed into a row that outlives every key. `observe` derives this
+ * code from `cause.code`, which is a property of whatever was thrown — so
+ * without this set an unexpected class would put an unreviewed string into a
+ * permanent row, and a class whose `code` happened to be built from wire content
+ * would put THAT there.
+ */
+export const REFUSAL_CODES = ["OBSERVATION_INVALID", "OBSERVATION_UNREADABLE"] as const;
+
+export type RefusalCode = (typeof REFUSAL_CODES)[number];
+
+/**
+ * A recorded per-observation refusal: a code, the id of the row it is about, and
+ * the instant. R21's whole content, and nothing else.
+ *
+ * **`observationId` IS NOT NULLABLE, AND THAT IS A RULING (R83).** The ingest
+ * path has two refusal sites. The second — a stored observation whose payload
+ * the channel validator or tagging refuses — has a row to name, and is recorded
+ * here. The first — an envelope `append`'s own `observationSchema` rejects —
+ * happens before any row exists, and is **not** written to the chain at all.
+ *
+ * Recording the first would turn malformed wire input into permanent,
+ * unerasable rows at whatever rate a producer chooses to send it: an
+ * amplification vector into the one table retention cannot reach, and
+ * `RefusedObservation` already carries a null id precisely because there is
+ * nothing to name. Structured stderr is the record for it, which is the same
+ * answer R7 gives for every condition the chain cannot hold — and for the same
+ * reason, that the chain is not the place for facts about things that do not
+ * exist in it.
+ *
+ * A refusal at the second site is already bounded by the producer cap, because
+ * the observation row it names had to be accepted first.
+ */
+export interface RefusalAuditBody {
+  readonly observationId: string;
+  readonly code: RefusalCode;
+  /** The instant the refusal happened, as an ISO string. */
+  readonly at: string;
+}
+
+/** Every path a refusal body may contain, and no others. */
+export const ADMITTED_REFUSAL_PATHS: ReadonlySet<string> = new Set([
+  "observationId",
+  "code",
+  "at",
+]);
+
+/**
+ * Refuses a recorded refusal the chain must not carry.
+ *
+ * The walk matters more here than anywhere else in this module: the thing R21
+ * forbids is a MESSAGE, and a message arrives under whatever key the code that
+ * built the body happened to choose — `message`, `errors`, `detail`, `reason`.
+ * A whitelist refuses all of them without naming any.
+ */
+export function assertRefusalBody(body: RefusalAuditBody): void {
+  if (typeof body !== "object" || body === null) {
+    throw new RangeError(`auditBody must be an object, got ${typeof body}`);
+  }
+
+  for (const path of auditBodyPaths(body)) {
+    if (!ADMITTED_REFUSAL_PATHS.has(path)) {
+      throw new RangeError(
+        `auditBody.${path} is not admitted: a recorded refusal carries a code, the ` +
+          `observation id it is about and the instant, and never the refusal's ` +
+          `message -- which on this wire carries observed values verbatim`,
+      );
+    }
+  }
+
+  for (const key of ["observationId", "code", "at"] as const) {
+    requirePresent(key, body, key);
+  }
+
+  requireId("observationId", body.observationId, false);
+  requireOneOf("code", body.code, REFUSAL_CODES);
+  requireAt("at", body.at, false);
+}

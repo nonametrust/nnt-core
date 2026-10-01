@@ -5,7 +5,13 @@ import { compose, type Composed } from "./compose.js";
 import { retrying } from "./availability.js";
 import { AuditEntryMissing } from "./run-brief.js";
 import { compositePolicyVersion } from "./composite-version.js";
-import { assertObserveBody, type ObserveAuditBody } from "./audit-body.js";
+import {
+  REFUSAL_CODES,
+  assertObserveBody,
+  assertRefusalBody,
+  type ObserveAuditBody,
+  type RefusalCode,
+} from "./audit-body.js";
 import type { BriefPolicies } from "./brief.js";
 import type { Related } from "./relatedness.js";
 
@@ -226,6 +232,71 @@ export interface ObserveResult {
 }
 
 /**
+ * Records a per-observation refusal in the chain, R21 -- and never lets the
+ * recording replace the refusal.
+ *
+ * **ONLY FOR A REFUSAL THAT HAS A ROW TO NAME, R83.** The envelope refusal
+ * `append` raises happens before any observation exists, and writing it here
+ * would turn malformed wire input into permanent, unerasable rows at whatever
+ * rate a producer chooses to send it -- an amplification vector into the one
+ * table retention cannot reach. That one goes to structured stderr instead,
+ * which is the same answer R7 gives for conditions the chain cannot hold. A
+ * refusal at THIS site is already bounded by the producer cap, because the row
+ * it names had to be accepted first.
+ *
+ * **THE REFUSAL IS THE PRIMARY FACT.** If the chain append fails -- exhausted,
+ * or the body refused because the code is not in R21's vocabulary -- the
+ * condition is written to stderr and the ORIGINAL refusal is still what the
+ * caller receives. An ingest that reported a lost audit row in place of the
+ * reason it refused the observation would have replaced the fact with a fact
+ * about recording the fact.
+ */
+async function recordRefusal(
+  composed: Composed,
+  policies: BriefPolicies,
+  at: Date,
+  observationId: string,
+  code: string,
+): Promise<void> {
+  try {
+    const body = {
+      observationId,
+      // Narrowed against R21's vocabulary rather than cast: an unexpected class's
+      // `code` is a string nobody reviewed, and this row is hashed forever.
+      code: code as RefusalCode,
+      at: at.toISOString(),
+    };
+    assertRefusalBody(body);
+    await retrying(
+      async () =>
+        composed.audit.append({
+          policyVersion: compositePolicyVersion({
+            retention: policies.retention.version,
+            tagging: policies.tagging.version,
+            calibration: policies.calibration.version,
+            brief: policies.brief.version,
+          }),
+          kind: "observe_refused",
+          body,
+        }),
+      { maxRetries: policies.brief.maxRetries, label: "observe.refusal", subject: observationId },
+    );
+  } catch {
+    // A CODE AND IDS ONLY. Whatever failed may carry an observed value, and the
+    // refusal's own message certainly does.
+    process.stderr.write(
+      `${JSON.stringify({
+        event: "engine.observe.refusal_unrecorded",
+        at: at.toISOString(),
+        code: "REFUSAL_ENTRY_MISSING",
+        observationId,
+        refusalCode: REFUSAL_CODES.includes(code as RefusalCode) ? code : "UNKNOWN_REFUSAL_CODE",
+      })}\n`,
+    );
+  }
+}
+
+/**
  * Ingest one observation: append it, fold it, tag it, and record it.
  *
  * **THE ORDER IS FORCED BY THE STORE AND BY R21.** `append` refuses to run inside a
@@ -267,6 +338,17 @@ export async function observe(
     appended = await composed.observations.append(wire);
   } catch (cause) {
     if (cause instanceof StoreError) throw cause;
+    // R83: NOT RECORDED IN THE CHAIN. There is no row to name, and writing one
+    // anyway would let a producer inflate a table retention cannot reach. The
+    // structured line is the record, and it carries a code and no wire content.
+    process.stderr.write(
+      `${JSON.stringify({
+        event: "engine.observe.envelope_refused",
+        at: at.toISOString(),
+        code: "OBSERVATION_INVALID",
+        observationId: null,
+      })}\n`,
+    );
     throw new RefusedObservation("OBSERVATION_INVALID", null, { cause });
   }
   const observationId =
@@ -288,8 +370,10 @@ export async function observe(
     readings = readingsOf(wire, namespaceId);
   } catch (cause) {
     // R21: the code and the id, never the message. The observation row exists, which is
-    // what makes the id available to name it by.
+    // what makes the id available to name it by -- and what makes this the refusal
+    // that IS recorded (R83).
     const code = (cause as { code?: string }).code ?? "OBSERVATION_UNREADABLE";
+    await recordRefusal(composed, policies, at, observationId, code);
     throw new RefusedObservation(code, observationId, { cause });
   }
 
