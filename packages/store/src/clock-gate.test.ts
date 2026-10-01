@@ -35,8 +35,14 @@ import { describe, it, expect } from "vitest";
 // clock.
 const srcDir = fileURLToPath(new URL("./", import.meta.url));
 
-const SOURCE = /\.(ts|mts|cts|tsx)$/;
-const TEST = /\.(test|spec)\.(ts|mts|cts|tsx)$/;
+// Every extension the compiler admits, PLUS the plain-JavaScript ones. Measured:
+// a `clocky.js` beside a `clocky.d.ts`, imported by a store module, held a
+// `Date.now()` this gate could not see -- and `tsc` emits nothing for a `.js`
+// without `allowJs`, so the built package was broken as well as unscanned. The
+// engine's copy of this gate was widened first and this one was left behind,
+// which a second review measured and the commit claiming it had overstated.
+const SOURCE = /\.(ts|mts|cts|tsx|js|mjs|cjs)$/;
+const TEST = /\.(test|spec)\.(ts|mts|cts|tsx|js|mjs|cjs)$/;
 
 // Each way of reaching the current instant, named, so a refusal says which
 // one fired and a reader can see what is and is not covered. Every pattern
@@ -58,7 +64,10 @@ const CLOCK_FORMS: ReadonlyArray<readonly [string, (line: string, inSql: boolean
   ["destructured from Date", (l) => /\}\s*=\s*Date\b/.test(l)],
   ["Reflect.construct(Date", (l) => /\bReflect\s*\.\s*construct\s*\(\s*Date\b/.test(l)],
   ["performance clock", (l) => /\bperformance\s*\.\s*(now|timeOrigin)\b/.test(l)],
-  ["process.hrtime", (l) => /\bprocess\s*\.\s*hrtime\b/.test(l)],
+  // `hrtime` and `uptime` both. `process.uptime()` is a clock read measured
+  // from process start rather than from the epoch, and it is a clock read all
+  // the same; review walked it past this gate.
+  ["process.hrtime", (l) => /\bprocess\s*\.\s*(hrtime|uptime)\b/.test(l)],
   // The database's clock, which this package can reach from every query it
   // writes and which no amount of watching JavaScript would catch. `now()`
   // only where it is not a method call, so the injected `clock.now()` and
@@ -123,48 +132,135 @@ function sourceFiles(): SourceFile[] {
   return out;
 }
 
+// The characters after which a `/` begins a REGEX LITERAL rather than a
+// division, plus the keywords that do the same. Needed because a regex's
+// contents must never be read as code: a `//` inside one starts no comment, a
+// quote inside one opens no string, and a `/*` inside one opens no block.
+const REGEX_MAY_FOLLOW = "([{,;:=!&|?+-~^<>*%";
+const KEYWORDS_BEFORE_REGEX = new Set([
+  "return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "case",
+  "do", "else", "yield", "await",
+]);
+
 /**
- * Comments blanked, line count preserved so line numbers still point at the
- * source. Without this a doc comment mentioning `Date.now()` counts as a
- * clock read -- which is how the exemption test below passed for a
- * `clock.ts` whose clock had been taken out entirely: the comment at its top
- * was doing all the work.
+ * The end of the regex literal starting at `start`, or null when what starts
+ * there is not one. Handles `\` escapes and `[...]` classes, inside which a `/`
+ * does not close the literal. A newline before the close means it was a
+ * division, not a regex.
  */
-function code(text: string): string {
-  return text
-    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
-    .split("\n")
-    .map(stripLineComment)
-    .join("\n");
+function endOfRegex(text: string, start: number): number | null {
+  let i = start + 1;
+  let inClass = false;
+  while (i < text.length) {
+    const c = text[i]!;
+    if (c === "\\") { i += 2; continue; }
+    if (c === "\n") return null;
+    if (c === "[") inClass = true;
+    else if (c === "]") inClass = false;
+    else if (c === "/" && !inClass) {
+      i += 1;
+      while (i < text.length && /[a-z]/.test(text[i]!)) i += 1;
+      return i;
+    }
+    i += 1;
+  }
+  return null;
 }
 
 /**
- * The line with its `//` comment removed -- where `//` means a comment and
- * not two characters inside a string.
+ * The module with its COMMENTS removed and everything else kept, line count
+ * preserved so line numbers still point at the source. String contents are
+ * KEPT on purpose: `const q = "select current_date"` is a clock read this gate
+ * refuses, and blanking strings would lose every SQL form on the list.
  *
- * A plain regex replace of everything from the first `//` to the end of the
- * line cut it wherever it was, so `const u = "https://x"; const t = Date.now();`
- * arrived at the predicate as `const u = "https:` and the clock read was
- * gone. Review planted exactly that and the gate stayed green. A url in a
- * string is not a contrived line in a package that talks to a database over
- * one.
+ * THREE THINGS THIS HANDLES, EACH BECAUSE A VERSION WITHOUT IT LOST A RULE.
  *
- * Quotes are tracked rather than parsed: single, double and backtick, with
- * backslash escapes skipped. That is enough for this file's job and stops
- * short of being a scanner -- a `//` inside a template SUBSTITUTION would
- * still be treated as code, which errs toward refusing and never toward
- * missing a clock read.
+ * 1. A comment opener inside a STRING. The first version ran the block-comment
+ *    regex before tracking quotes, so `const glob = "dist/*"` opened a comment
+ *    that the next `*\/` -- a regex, or any later doc comment -- closed, and
+ *    every clock read between them vanished.
+ *
+ * 2. A comment opener inside a REGEX. `const re = /^https?:\/\//;` ends in
+ *    `\/\/`; with `\` treated as an escape only inside quotes, that `//` read
+ *    as a line comment and blanked the rest of its line -- so
+ *    `const re = /^https?:\/\//; const t = Date.now();` walked past. A URL
+ *    scheme regex is ordinary code, and this was the most realistic of the four
+ *    regressions a second review measured. Regex literals are now skipped
+ *    whole, so nothing inside one is interpreted.
+ *
+ * 3. A DESYNC bounded to one line. A single- or double-quoted string cannot
+ *    span a line in JavaScript, so a quote still open at a newline means the
+ *    scanner was wrong -- and carrying that state onward INVERTS the parse:
+ *    string contents get read as code, and a `//` inside a real string then
+ *    blanks real code. That is how `/["]/` followed by a line holding a url and
+ *    a clock read walked past. Such a quote is dropped at the newline, so the
+ *    damage cannot leave the line it started on. A backtick is NOT dropped,
+ *    because a template legitimately spans lines.
+ *
+ * What it still does not do: a regex is only recognised where one may begin, by
+ * the character or keyword before it, so `/` after an identifier is a division.
+ * A regex containing `current_date` would be read as a clock read. Both err
+ * toward REFUSING, which is the direction this gate should fail in -- unlike the
+ * inversion above, which erred toward missing.
  */
-function stripLineComment(line: string): string {
+function code(text: string): string {
+  let out = "";
+  let i = 0;
   let quote: string | null = null;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i]!;
-    if (c === "\\") { i++; continue; }
-    if (quote !== null) { if (c === quote) quote = null; continue; }
-    if (c === "'" || c === '"' || c === "`") { quote = c; continue; }
-    if (c === "/" && line[i + 1] === "/") return line.slice(0, i);
+  let inBlock = false;
+  let lastChar = "";
+  let lastWord = "";
+  while (i < text.length) {
+    const c = text[i]!;
+    const next = text[i + 1];
+    if (inBlock) {
+      if (c === "*" && next === "/") { out += "  "; i += 2; inBlock = false; continue; }
+      out += c === "\n" ? "\n" : " ";
+      i += 1;
+      continue;
+    }
+    if (quote !== null) {
+      if (c === "\\") { out += text.slice(i, i + 2); i += 2; continue; }
+      if (c === quote) { quote = null; out += c; i += 1; continue; }
+      if (c === "\n") {
+        if (quote !== "`") quote = null;
+        out += "\n";
+        i += 1;
+        continue;
+      }
+      out += c;
+      i += 1;
+      continue;
+    }
+    if (c === "/" && next === "*") { out += "  "; i += 2; inBlock = true; continue; }
+    if (c === "/" && next === "/") {
+      while (i < text.length && text[i] !== "\n") { out += " "; i += 1; }
+      continue;
+    }
+    if (c === "/") {
+      const mayStart =
+        lastChar === "" || REGEX_MAY_FOLLOW.includes(lastChar) ||
+        (/[A-Za-z]/.test(lastChar) && KEYWORDS_BEFORE_REGEX.has(lastWord));
+      const end = mayStart ? endOfRegex(text, i) : null;
+      if (end !== null) {
+        out += text.slice(i, end);
+        lastChar = "/";
+        lastWord = "";
+        i = end;
+        continue;
+      }
+    }
+    if (c === "\\") { out += text.slice(i, i + 2); i += 2; continue; }
+    if (c === "'" || c === '"' || c === "`") { quote = c; out += c; i += 1; continue; }
+    out += c;
+    if (!/\s/.test(c)) {
+      if (/[A-Za-z0-9_$]/.test(c)) lastWord = /[A-Za-z0-9_$]/.test(lastChar) ? lastWord + c : c;
+      else lastWord = "";
+      lastChar = c;
+    }
+    i += 1;
   }
-  return line;
+  return out;
 }
 
 function clockReads(text: string): string[] {
@@ -297,6 +393,7 @@ describe("the store reads no clock but its own", () => {
       ["Reflect.construct", "const t = Reflect.construct(Date, []);"],
       ["the performance clock", "const t = performance.timeOrigin;"],
       ["process.hrtime", "const t = process.hrtime.bigint();"],
+      ["process.uptime", "const t = process.uptime();"],
       ["the database's clock in a template", "await sql`select now()`.execute(db);"],
       ["current_timestamp in SQL", "const q = sql`where t < current_timestamp`;"],
       ["current_date outside a template", "const q = \"select current_date\";"],
@@ -377,6 +474,63 @@ describe("the store reads no clock but its own", () => {
       expect(clockReads(module.join("\n"))).toEqual([
         "4: SQL now() in a template: applied_at timestamptz not null default now()",
       ]);
+    });
+
+
+    it("does not lose a clock read to a string that contains a comment opener", () => {
+      // MEASURED, and it left this gate green over the tree. The scanner used to
+      // run the block-comment regex before it tracked quotes, so `"dist/*"`
+      // opened a comment that the next `*/` closed -- and any regex literal or
+      // later doc comment supplies one. Everything between them was blanked,
+      // clock read included.
+      const module = [
+        'const glob = "dist/*";',
+        "const t = Date.now();",
+        "const re = /x*/;",
+      ].join("\n");
+      expect(clockReads(module)).toEqual([
+        "2: Date.now: const t = Date.now();",
+      ]);
+      // And the other order: a comment opener in a string AFTER the read.
+      expect(clockReads(['const t = Date.now();', 'const g = "a/*b";'].join("\n"))).toHaveLength(1);
+    });
+
+    it("scans a plain .js module, which a TypeScript-only pattern cannot see", () => {
+      expect(SOURCE.test("clocky.js")).toBe(true);
+      expect(SOURCE.test("clocky.mjs")).toBe(true);
+      expect(SOURCE.test("clocky.cjs")).toBe(true);
+      expect(SOURCE.test("retention.ts")).toBe(true);
+      expect(SOURCE.test("notes.md")).toBe(false);
+      // And the test-suffix list moves with it, or a `util.test.js` would be
+      // scanned as a module rather than skipped as a fixture.
+      expect(TEST.test("util.test.js")).toBe(true);
+      expect(TEST.test("util.spec.mjs")).toBe(true);
+      expect(TEST.test("retention.ts")).toBe(false);
+    });
+
+    it("reads nothing inside a regex literal as code", () => {
+      // REGRESSION ROWS. A version of this scanner treated `\\` as an escape only
+      // inside quotes and carried quote state across lines, and a second review
+      // measured four real clock reads walking past it. Each is a row now.
+      //
+      // A URL-scheme regex ends in `\\/\\/`, which read as a line comment and
+      // blanked the rest of its line. The most realistic of the four.
+      expect(clockReads('const re = /^https?:\\/\\//; const t = Date.now();')).toHaveLength(1);
+      // A regex with an odd quote opened a fake string that the next real string
+      // closed, so a url's `//` became code and blanked the read.
+      expect(clockReads(['const re = /["]/;', 'const u = "https://x"; const t = Date.now();'].join("\n")))
+        .toHaveLength(1);
+      // A regex holding one backtick inverted template parity.
+      expect(clockReads(['const n = (l) => (l.match(/`/g) ?? []).length;', 'const u = `https://x`; const t = Date.now();'].join("\n")))
+        .toHaveLength(1);
+      // And `/*` inside a character class opened a block comment that any later
+      // `*/` closed -- a miss BOTH the old and the new scanner had.
+      expect(clockReads(['const re = /[/*]/;', 'const t = Date.now();', '/** later */'].join("\n")))
+        .toHaveLength(1);
+      // The controls: legitimate code that must stay clean.
+      expect(clockReads('const re = /^https?:\\/\\//;')).toEqual([]);
+      expect(clockReads("const half = (a, b) => a / b; // not Date.now()")).toEqual([]);
+      expect(clockReads(["const q = `", "  select 1", "`;"].join("\n"))).toEqual([]);
     });
 
     it("reports the line number of an offender inside a module", () => {

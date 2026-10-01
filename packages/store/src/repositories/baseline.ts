@@ -1,7 +1,7 @@
-import type { Selectable } from "kysely";
+import { sql, type Selectable } from "kysely";
 import type { Clock } from "../clock.js";
 import type { Db, Schema } from "../db.js";
-import { mapPgError } from "../errors.js";
+import { BaselineStale, mapPgError } from "../errors.js";
 
 /**
  * A baseline's state, as M2's arithmetic will produce it and as this
@@ -43,21 +43,60 @@ const COLUMNS = [
 export class BaselineRepository {
   constructor(
     private readonly db: Db,
-    private readonly clock: Clock,
+    // Public and readonly so a composition root can assert every repository
+    // shares one clock -- see `surface.test.ts`. Exposing it is not a check: a
+    // reader of one repository still cannot tell whose clock this is.
+    readonly clock: Clock,
   ) {}
 
   /**
-   * Writes the state for its (namespace, channel, aspect), replacing what was
-   * there, stamped at the clock's instant. The row comes back from
-   * `returning`, so what is reported is what was stored.
+   * Writes the state for its (namespace, channel, aspect), stamped at the
+   * clock's instant, ONLY IF the stored row is still at the count the caller
+   * read. The row comes back from `returning`, so what is reported is what was
+   * stored.
    *
-   * A value outside what the table admits, NaN and the infinities among
-   * them, is refused by the check constraints and raised as
-   * ConstraintViolation with SQLSTATE 23514 and the constraint's name on
-   * it, as tag's refusals are; a namespace with no row is the same class
-   * under 23503.
+   * `expectedCount` is the `n` the caller read before folding, or `null` when it
+   * read no row at all. It is a PARAMETER and not a field on `BaselineState`,
+   * deliberately: `gates/baseline-shape.test.ts` holds that shape equal field for
+   * field between `@nonametrust/tagging` and this package, and tagging's
+   * arithmetic has no business carrying a concurrency token.
+   *
+   * WHY OPTIMISTIC AT ALL (R9, closing F14). This was `on conflict do update`
+   * with no predicate, and that is last-writer-wins. Measured: two writers each
+   * read `count = 10`, each folded one observation, each wrote `count = 11` with
+   * a different mean, both statements succeeded, and the row ended at 11 with one
+   * observation's contribution gone and NO ERROR ANYWHERE. Chosen over a per-pair
+   * advisory lock because the advisory key space is already shared and
+   * unallocated, with a measured deadlock history.
+   *
+   * A value outside what the table admits, NaN and the infinities among them, is
+   * refused by the check constraints and raised as ConstraintViolation with
+   * SQLSTATE 23514 and the constraint's name on it, as tag's refusals are; a
+   * namespace with no row is the same class under 23503.
+   *
+   * Composes on a `Transaction`, and must: R10 makes the fold and the tag write
+   * one unit of work, so a stale tag rolls the fold back with it.
+   *
+   * THREE THINGS THIS DOES NOT PROTECT, measured by review and stated rather than
+   * discovered:
+   *
+   * 1. **The token is the COUNT.** Two writers whose folds both leave `n` at the
+   *    same value are last-writer-wins, exactly as before. Unreachable through
+   *    `updateBaseline`, which always advances the count by one, so it is a
+   *    property of this predicate rather than a live defect — but a caller writing
+   *    a non-advancing state is unprotected and should know it.
+   * 2. **A count against NO row inserts.** `expectedCount: 7` on a pair that has
+   *    no row succeeds, because the predicate is only consulted on conflict. The
+   *    refusal of a skipped count is true of an existing row and not of a missing
+   *    one.
+   * 3. **Under REPEATABLE READ this raises 40001, not `BaselineStale`.** The
+   *    transaction did not commit and the cure is the same — retry the whole thing
+   *    — so `errors.ts` maps 40001 to `Deadlocked`, which R28's bounded retry
+   *    already covers. Before that mapping it surfaced as a raw driver error with
+   *    `isStoreError: false`. This store never requests that isolation level; a
+   *    caller may.
    */
-  async upsert(state: BaselineState): Promise<StoredBaseline> {
+  async upsert(state: BaselineState, expectedCount: number | null): Promise<StoredBaseline> {
     const values = {
       n: state.count,
       mean: state.mean,
@@ -70,8 +109,9 @@ export class BaselineRepository {
       slow_m2: state.slowM2,
       updated_at: this.clock.now(),
     };
+    let row;
     try {
-      const row = await this.db
+      row = await this.db
         .insertInto("baseline")
         .values({
           namespace_id: state.namespaceId,
@@ -79,13 +119,50 @@ export class BaselineRepository {
           aspect: state.aspect,
           ...values,
         })
-        .onConflict((oc) => oc.columns(["namespace_id", "channel", "aspect"]).doUpdateSet(values))
+        .onConflict((oc) => {
+          const update = oc.columns(["namespace_id", "channel", "aspect"]).doUpdateSet(values);
+          // `expectedCount` is null when the caller read no row. There is then no
+          // count to match, and a conflict means its read was stale -- so the
+          // predicate is one nothing satisfies, and the zero-row branch below
+          // reports it. Written as a false predicate rather than an impossible
+          // number, because `n >= 0` is the table's rule and not this method's.
+          return expectedCount === null
+            ? update.where(sql<boolean>`false`)
+            : update.where("baseline.n", "=", expectedCount);
+        })
         .returning(COLUMNS)
-        .executeTakeFirstOrThrow();
-      return toStored(row);
+        .executeTakeFirst();
     } catch (e) {
       throw mapPgError(e) ?? e;
     }
+    if (row !== undefined) return toStored(row);
+    // Zero rows is two conditions with two cures, told apart the way `refresh`
+    // tells `TagRefreshStale` from `TagNotFound`: a caller given the wrong one
+    // retries forever or gives up wrongly.
+    const live = await this.db
+      .selectFrom("baseline")
+      .select("n")
+      .where("namespace_id", "=", state.namespaceId)
+      .where("channel", "=", state.channel)
+      .where("aspect", "=", state.aspect)
+      .executeTakeFirst();
+    if (live === undefined) {
+      // Unreachable through the insert path -- nothing deletes a baseline row, so
+      // a conflict means a row is there. Named rather than swallowed, because an
+      // invariant that stops holding should say so instead of returning a lie.
+      throw new BaselineStale(
+        `baseline ${state.namespaceId}/${state.channel}/${state.aspect} neither conflicted ` +
+          `nor exists; the row was deleted between the write and this read`,
+      );
+    }
+    // Says what is true rather than what is likely: the row is not at the count
+    // this fold was built on. Usually that is another fold landing first; it is
+    // also what a caller handing a count that skips a step sees.
+    throw new BaselineStale(
+      `baseline ${state.namespaceId}/${state.channel}/${state.aspect} is not at count ` +
+        `${expectedCount === null ? "(none)" : expectedCount}, which this fold was built on; ` +
+        `re-read the baseline and fold again`,
+    );
   }
 
   /** Every baseline the namespace has, in channel and aspect order. */

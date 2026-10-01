@@ -57,7 +57,7 @@ async function appendUnder(nsId: string, ref: string, channel = "volume"): Promi
       kind: channel === "volume" ? "payment" : `${channel}_observed`,
     }),
   ));
-  return observation.observationId!;
+  return observation.observationId;
 }
 
 // One observation per channel this file tags on, because a tag's channel must

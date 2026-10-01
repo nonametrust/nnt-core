@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   datedAt, deriveIdempotencyKey, observationSchema,
-  type Observation, type WireObservation,
+  type Observation, type StoredObservation, type WireObservation,
 } from "@nonametrust/schema";
 import type { Clock } from "../clock.js";
 import { refuseWriteInsideTransaction, type Db } from "../db.js";
@@ -37,8 +37,8 @@ import { PERIOD_TEXT, type NamespaceRepository } from "./namespace.js";
  * case and still throws; see `append`.
  */
 export type AppendResult =
-  | { created: true; observation: Observation }
-  | { created: false; readable: true; observation: Observation }
+  | { created: true; observation: StoredObservation }
+  | { created: false; readable: true; observation: StoredObservation }
   | {
       created: false;
       readable: false;
@@ -73,11 +73,53 @@ function isDuplicateKey(e: unknown): boolean {
   return code === UNIQUE_VIOLATION && constraint === IDEMPOTENCY_CONSTRAINT;
 }
 
+/**
+ * The columns of an observation that survive in the clear, and nothing else.
+ *
+ * `datedAt` is nullable because a STATE has no dated instant -- `0002` allows a
+ * null there, and R19 makes the brief's reason shape admit a reason with no
+ * instant for exactly this reason.
+ */
+export interface ClearObservation {
+  observationId: string;
+  namespaceId: string;
+  channel: string;
+  kind: string;
+  evidenceKind: string;
+  datedAt: Date | null;
+  ingestedAt: Date;
+  producer: string;
+  /**
+   * The retention month, as `YYYY-MM-DD`, and a STRING rather than a `Date` on
+   * purpose.
+   *
+   * `period` is a `date` column, and a `date` read back through the driver is
+   * LOCAL MIDNIGHT -- which east of UTC is the previous month's last day. `read`
+   * in this file renders it through `PERIOD_TEXT` with a comment saying exactly
+   * that, and the first version of this read selected the column raw. Measured on
+   * one row whose real period is 2027-03-01: Istanbul returned
+   * 2027-02-28T21:00Z, Kiritimati 2027-02-28T10:00Z. A caller slicing the ISO
+   * string for a month got FEBRUARY for a March row.
+   *
+   * A month has no time of day, so the honest type is the text. It is pinned by
+   * VALUE in the tests, not by `toBeInstanceOf` -- which is what let the trap
+   * back in.
+   */
+  period: string;
+  /** The month key is gone: the payload will not open, and never will again. */
+  periodExpired: boolean;
+  /** The namespace key is gone: the whole counterparty space was erased. */
+  namespaceErased: boolean;
+}
+
 export class ObservationRepository {
   constructor(
     private readonly db: Db,
     private readonly namespaces: NamespaceRepository,
-    private readonly clock: Clock,
+    // Public and readonly so a composition root can assert every repository
+    // shares one clock -- see `surface.test.ts`. Exposing it is not a check: a
+    // reader of one repository still cannot tell whose clock this is.
+    readonly clock: Clock,
     // R16's sibling. Required rather than defaulted because a default is a
     // policy that reaches production, which is the argument the key ring's
     // missing default master key already made.
@@ -173,12 +215,16 @@ export class ObservationRepository {
     const ns = await this.namespaces.ensure(parsed.namespace);
     const observationId = randomUUID();
     const ingestedAt = this.clock.now();
+    // `StoredObservation` and not `Observation`: `observationId` is assigned two
+    // lines up, so the stronger type is the honest one. R32 -- the arms of
+    // `AppendResult` used to type this field two ways, and a caller narrowing on
+    // `created` got `string | undefined` from one arm and `string` from another.
     const stored = {
       ...parsed,
       observationId,
       idempotencyKey: key,
       ingestedAt: ingestedAt.toISOString(),
-    } as Observation;
+    } as StoredObservation;
 
     // datedAt is the single reader of a date off an observation, and calling
     // it here is why this package needs no exemption in the repository's
@@ -386,7 +432,7 @@ export class ObservationRepository {
     if (seen.periodExpired || seen.namespaceErased) {
       return { created: false, readable: false, ...seen };
     }
-    let opened: Observation | null;
+    let opened: StoredObservation | null;
     try {
       opened = await this.byIdempotencyKey(key);
     } catch (e) {
@@ -461,13 +507,88 @@ export class ObservationRepository {
       : null;
   }
 
-  async get(observationId: string): Promise<Observation> {
+  /**
+   * An observation's columns that survive in the clear, by observation id, with
+   * NO payload opened and none returned.
+   *
+   * R13, and the reason it is a public method rather than a use of an existing
+   * one: the brief KEEPS a reason whose evidence is unreadable, carrying a code,
+   * because omitting it would make the brief's answer change as retention runs --
+   * the output would then depend on the calendar rather than on the evidence,
+   * which is the worst of the three options. Building such a reason needs these
+   * columns, and every other public path here decrypts: `get` goes through
+   * `read`, and the non-decrypting `skeleton` is private and keyed on the
+   * idempotency key, which a caller holding an observation id does not have.
+   *
+   * WHAT IT DELIBERATELY DOES NOT RETURN, and this is not in the plan's R13 --
+   * it is in the storage card's §2c. `idempotency_key` is an unkeyed SHA-256 over
+   * `(producer, network, ref, channel, kind, namespace id)` where every part but
+   * `ref` is already a column in the clear and `ref` is a public-ledger operation
+   * id; §2c measured a three-hundred-candidate dictionary recovering 3 of 3
+   * source references of a shredded namespace. So the columns returned are exactly
+   * the plaintext survivors §2c already lists, and `source.ref` is not among them
+   * because it lives inside the sealed payload.
+   *
+   * WHAT WITHHOLDING IT BUYS, measured rather than asserted, because an earlier
+   * version of this sentence overstated it. The dictionary attack does not need
+   * this column: review reconstructed 3 of 3 source references of an erased
+   * namespace through the PUBLIC API alone in about 4600 queries, using `find`,
+   * this read, and `byIdempotencyKey` as the oracle — the last throws
+   * `NamespaceShredded` on a hit and answers null on a miss. That oracle
+   * pre-exists and the storage card's §2c records it for `append`; it should name
+   * `byIdempotencyKey` beside it. What this read adds to the attacker's inputs is
+   * `producer` and nothing else. So withholding the key does not close the attack
+   * — it declines to hand over a ready-made index to it, which is worth doing and
+   * is less than the earlier wording claimed.
+   *
+   * The two state flags come with it, so a caller can decide the reason's code
+   * without a decrypt-and-catch: `periodExpired` when the month key is gone,
+   * `namespaceErased` when the namespace key is. Both are the same booleans the
+   * private skeleton reads, and they are independent -- R18's lesson applied
+   * rather than relearned.
+   */
+  async readClear(observationId: string): Promise<ClearObservation> {
+    const found = await sql<{
+      observation_id: string; namespace_id: string; channel: string; kind: string;
+      evidence_kind: string; dated_at: Date | null; ingested_at: Date; producer: string;
+      period: string; period_expired: boolean; ns_erased: boolean;
+    }>`
+      select o.observation_id::text as observation_id, o.namespace_id::text as namespace_id,
+             o.channel, o.kind, o.evidence_kind, o.dated_at, o.ingested_at, o.producer,
+             ${PERIOD_TEXT(sql`o.period`)} as period,
+             (k.key_wrapped is null) as period_expired,
+             (n.data_key_wrapped is null) as ns_erased
+      from observation o
+      join namespace n on n.namespace_id = o.namespace_id
+      join namespace_key k
+        on k.namespace_id = o.namespace_id and k.period = o.period
+      where o.observation_id = ${observationId}`.execute(this.db);
+    const row = found.rows[0];
+    if (row === undefined) {
+      throw new ObservationNotFound(`no observation ${observationId}`);
+    }
+    return {
+      observationId: row.observation_id,
+      namespaceId: row.namespace_id,
+      channel: row.channel,
+      kind: row.kind,
+      evidenceKind: row.evidence_kind,
+      datedAt: row.dated_at,
+      ingestedAt: row.ingested_at,
+      producer: row.producer,
+      period: row.period,
+      periodExpired: row.period_expired,
+      namespaceErased: row.ns_erased,
+    };
+  }
+
+  async get(observationId: string): Promise<StoredObservation> {
     const found = await this.read("observation_id", observationId);
     if (!found) throw new ObservationNotFound(`no observation ${observationId}`);
     return found;
   }
 
-  async byIdempotencyKey(key: string): Promise<Observation | null> {
+  async byIdempotencyKey(key: string): Promise<StoredObservation | null> {
     return this.read("idempotency_key", key);
   }
 
@@ -482,7 +603,7 @@ export class ObservationRepository {
   private async read(
     column: "observation_id" | "idempotency_key",
     value: string,
-  ): Promise<Observation | null> {
+  ): Promise<StoredObservation | null> {
     // `period` is rendered rather than selected: a `date` read back as a
     // driver Date is local midnight, which is the previous month's last day
     // east of UTC, and the key it would then look up is the wrong one.
@@ -547,6 +668,9 @@ export class ObservationRepository {
         `payload on row ${row.observation_id} carries observation id ${String(parsed.observationId)}`,
       );
     }
-    return parsed;
+    // Past that check `observationId` IS `row.observation_id`, a string, so the
+    // return type is `StoredObservation` rather than `Observation` -- the check is
+    // what earns the stronger type, and R32 is why it is worth stating.
+    return parsed as StoredObservation;
   }
 }

@@ -196,9 +196,38 @@ export type Db = Kysely<Schema>;
  * the first instead of adding to it.
  */
 export function openDb(url: string): Db {
-  return new Kysely<Schema>({
-    dialect: new PostgresDialect({ pool: new pg.Pool({ connectionString: withIsoDates(url) }) }),
+  const pool = new pg.Pool({ connectionString: withIsoDates(url) });
+  // AN IDLE CLIENT'S ERROR IS FATAL WITHOUT THIS, and it was. Node's EventEmitter
+  // rethrows an unhandled `'error'`, and `pg.Pool` emits one when the SERVER drops a
+  // connection that no query is waiting on -- a restart, a failover, an administrator
+  // running `pg_terminate_backend`. Measured: terminating one idle backend killed the
+  // process with "Unhandled 'error' event ... terminating connection due to
+  // administrator command", exit 1.
+  //
+  // That defeats the whole unavailability policy rather than merely logging badly: a
+  // tiered response to a store being down cannot run in a process the store took with
+  // it. A query in flight is unaffected -- it gets its own rejection on its own
+  // promise, which is what the engine classifies.
+  //
+  // Written to stderr rather than swallowed, and structured, because this is exactly
+  // the condition that cannot be recorded in the audit chain: the chain lives in the
+  // Postgres that just dropped the connection.
+  //
+  // NO TIMESTAMP, and that is this package's own rule rather than an omission:
+  // `clock-gate.test.ts` refuses a clock read outside two exempt modules, and
+  // `openDb` is a connection factory that is handed no `Clock`. It caught the first
+  // version of this line. Whatever collects stderr stamps it, which is the right
+  // place for an instant nobody injected.
+  pool.on("error", (e: Error) => {
+    process.stderr.write(
+      `${JSON.stringify({
+        event: "store.pool.idle_client_error",
+        code: (e as { code?: unknown }).code ?? null,
+        message: e.message,
+      })}\n`,
+    );
   });
+  return new Kysely<Schema>({ dialect: new PostgresDialect({ pool }) });
 }
 
 // Two settings this package pins per connection rather than inheriting, for

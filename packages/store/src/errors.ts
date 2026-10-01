@@ -37,6 +37,22 @@ export class TagAltered extends StoreError {}
 // nothing was refused by the database, the caller's read is simply older than
 // the row. The cure is to read the live tag again and decide again, which is
 // a different instruction from "this tag does not exist".
+/**
+ * A baseline write built on a count the row has moved past.
+ *
+ * R9, closing F14. `upsert` was `on conflict do update` with no predicate --
+ * last writer wins -- and that was MEASURED losing a fold: two writers each read
+ * `count = 10`, each folded one observation, each wrote `count = 11` with a
+ * different mean, both statements succeeded, and the row ended at 11 with one
+ * observation's contribution gone and no error anywhere.
+ *
+ * The caller's cure is the same as `TagRefreshStale`'s: re-read the baseline and
+ * decide again. Under R10 both writes live in one transaction, so a stale
+ * baseline rolls the tag write back with it and the retry re-decides from a
+ * state containing neither.
+ */
+export class BaselineStale extends StoreError {}
+
 export class TagRefreshStale extends StoreError {}
 
 // Raised in TypeScript, so it carries no SQLSTATE: the database refused
@@ -192,8 +208,24 @@ const BY_SQLSTATE: Record<string, new (m: string, o?: ErrorOptions) => StoreErro
   NNT09: PayloadExpired,
   "55P03": Cancelled,
   "57014": Cancelled,
-  // Postgres's own, not one this schema allocated.
+  // Postgres's own, not ones this schema allocated.
   "40P01": Deadlocked,
+  // 40001, serialization_failure. The same shape as 40P01 -- the transaction did
+  // not commit, nothing was written wrongly, and the correct response is to retry
+  // the whole thing -- so it maps to the same class rather than to a fourth one a
+  // caller would have to learn.
+  //
+  // WHY IT IS HERE NOW. Review ran `upsert` inside a REPEATABLE READ transaction
+  // whose read had gone stale and the write came back as a RAW driver error:
+  // `code: '40001'`, `isStoreError: false`, unmapped. R28 bounds a retry over
+  // `BaselineStale`, `TagRefreshStale`, 23505 on the live-tag pair and
+  // `Deadlocked`; an unmapped 40001 falls through all of them, so M3's ingest
+  // path would have surfaced a driver error from a condition whose entire meaning
+  // is "retry me". Reachable only under an isolation level the store does not
+  // itself request, which is why it was never hit -- and R10 puts the fold and the
+  // tag write in one transaction, so a caller choosing that level is exactly the
+  // caller this now protects.
+  "40001": Deadlocked,
 };
 
 /**

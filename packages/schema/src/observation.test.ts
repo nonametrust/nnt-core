@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { observationSchema, type Observation, type WireObservation } from "./observation.js";
+import {
+  observationSchema,
+  type Observation,
+  type StoredObservation,
+  type WireObservation,
+} from "./observation.js";
 import { EVIDENCE_KINDS } from "./channel.js";
 
 // Type-level gates on WireObservation, checked by `pnpm typecheck`. The wire
@@ -176,5 +181,76 @@ describe("observation", () => {
     });
     expect(r.success).toBe(false);
     expect(r.success ? [] : r.error.issues.map((i) => i.path)).toContainEqual(["salienceHints"]);
+  });
+});
+
+// R32: the stored form's identity is required, asserted by the COMPILER.
+//
+// The plan's acceptance says "asserted by `tsc` and not by a runtime test", and
+// that is the only way to assert it: a type-level rule has no runtime trace. Each
+// function below compiles only if the rule holds, so `pnpm typecheck` is the
+// assertion and the `expect` calls merely keep vitest from reporting an empty
+// file.
+describe("StoredObservation", () => {
+  const src = {
+    producer: "stellar-indexer",
+    producerVersion: "0.1.0",
+    network: "stellar:pubnet",
+    ref: "op:1",
+    fetchedAt: "2026-09-05T10:00:00.000Z",
+  } as const;
+
+  it("requires observationId, so a consumer need not assert it", () => {
+    // If `observationId` were optional here, the return type would be
+    // `string | undefined` and this would not compile.
+    const idOf = (o: StoredObservation): string => o.observationId;
+    const stored = {
+      schemaVersion: "0.1.0", namespace: { kind: "wallet", id: "G" } as const,
+      channel: "volume" as const, evidenceKind: "event" as const, kind: "payment",
+      observedAt: "2026-09-05T09:00:00.000Z", source: src, payload: {},
+      observationId: "9f1c0f7e-0000-4000-8000-000000000000",
+    } satisfies StoredObservation;
+    expect(idOf(stored)).toBe("9f1c0f7e-0000-4000-8000-000000000000");
+  });
+
+  it("keeps the event/state discrimination, which the intersection must not lose", () => {
+    // TypeScript normalises `(A | B) & C` to `(A & C) | (B & C)` on its own, so no
+    // distribution helper is needed here -- `Omit` needs one because `keyof` of a
+    // union is only its common keys. An earlier version of this comment credited a
+    // `WithRequired` helper that has since been deleted, precisely because
+    // mutation showed it did nothing. What is held below is the property itself: a
+    // narrowing on `evidenceKind` still reaches the member's own fields.
+    const dateOf = (o: StoredObservation): string | null =>
+      o.evidenceKind === "event" ? o.observedAt : null;
+    const state = {
+      schemaVersion: "0.1.0", namespace: { kind: "wallet", id: "G" } as const,
+      channel: "protocol" as const, evidenceKind: "state" as const, kind: "trustline_open",
+      validFrom: "2026-09-01T00:00:00.000Z", validUntil: null, source: src, payload: {},
+      observationId: "9f1c0f7e-0000-4000-8000-000000000001",
+    } satisfies StoredObservation;
+    expect(dateOf(state)).toBeNull();
+  });
+
+  it("is still assignable to Observation, so nothing downstream had to change", () => {
+    const widen = (o: StoredObservation): Observation => o;
+    const stored = {
+      schemaVersion: "0.1.0", namespace: { kind: "wallet", id: "G" } as const,
+      channel: "volume" as const, evidenceKind: "event" as const, kind: "payment",
+      observedAt: "2026-09-05T09:00:00.000Z", source: src, payload: {},
+      observationId: "9f1c0f7e-0000-4000-8000-000000000002",
+    } satisfies StoredObservation;
+    expect(widen(stored).channel).toBe("volume");
+  });
+
+  it("is NOT what the wire form is, and the three forms say three things", () => {
+    // `WireObservation` refuses the field, `Observation` admits it, this one
+    // requires it. Held by a value that satisfies the wire form and, by
+    // construction, cannot satisfy this one.
+    const wire = {
+      schemaVersion: "0.1.0", namespace: { kind: "wallet", id: "G" } as const,
+      channel: "volume" as const, evidenceKind: "event" as const, kind: "payment",
+      observedAt: "2026-09-05T09:00:00.000Z", source: src, payload: {},
+    } satisfies WireObservation;
+    expect("observationId" in wire).toBe(false);
   });
 });

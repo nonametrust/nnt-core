@@ -1,0 +1,423 @@
+import { requirePositive, requireUnitInterval } from "@nonametrust/tagging";
+import { VERSION_SEPARATOR } from "./composite-version.js";
+
+/**
+ * The brief's numbers, versioned, and the third such value in the tree.
+ *
+ * WHY A THIRD VALUE rather than ten fields on `Policy`. `Policy`
+ * belongs to `@nonametrust/tagging` and the brief belongs to the engine, so a
+ * brief field there is a number that package never reads. And the M2
+ * collision map is the harder reason: `thresholdBase`, `surpriseScale` and
+ * `winsorMadMultiple` are all 3 in the shipped tagging policy, so a
+ * computation reading the wrong field of a default policy got the right
+ * number back and no test could see it. A separate value removes that class
+ * of bug instead of testing for it, and `policy.test.ts` holds this value's
+ * own numbers to being pairwise distinct so the class cannot reappear here.
+ *
+ * WHAT IT COSTS, recorded rather than hidden: the audit body's
+ * `policy_version` is now a composite of four versions, not two -- retention,
+ * tagging policy, calibration and this one -- and the champion-challenger key
+ * is a quadruple.
+ *
+ * NONE OF THESE NUMBERS IS MEASURED. The backtest behind this project
+ * measured whether evidence exists before a loss, not how an engine should
+ * weigh it, so none of them is derivable from it. Each was chosen so that the
+ * parent spec's section 9 scenario behaves as the whitepaper describes, which
+ * is the same admission design §8 already makes about its own defaults; this
+ * value does not improve on that by pretending otherwise. Every one is
+ * re-derivable when the shadow evaluation measures a population, and each
+ * carries below what it is, what it is not, and what would replace it.
+ *
+ * All fields are readonly. A policy is a value, and a value one computation
+ * could edit for the next would make the version a lie.
+ */
+export interface BriefPolicy {
+  /**
+   * What the champion-challenger arrangement keys on and what every audit body
+   * names. May not contain `/`: R26 joins the four versions as
+   * `retention/tagging/calibration/brief`, and a component carrying the
+   * separator would make the composite unparseable.
+   */
+  readonly version: string;
+  /**
+   * The amount at or above which an intent is held when nothing lowers the
+   * bar, in `thresholdUnit`.
+   *
+   * NOT the tag threshold. `tagThreshold` in `@nonametrust/tagging` is θ_tag
+   * in robust-z units, applied per reading at ingest; this is an amount in
+   * value units, applied per counterparty at brief time. The design's
+   * vocabulary has both and the code had only the first, which is F2.
+   */
+  readonly briefThreshold: number;
+  /**
+   * The unit `briefThreshold` and `mediumCeiling` are denominated in. An
+   * intent carrying a different unit is refused by name rather than coerced:
+   * a coercion here would need an exchange rate, which is a price feed and a
+   * trust assumption this system does not have.
+   *
+   * Refused if it is not already trimmed. The BRIEF compares this against the
+   * intent's unit (R44 moved that from Task 6), and against a padded policy the
+   * comparison refuses a CORRECT intent -- the coercion problem arriving as a false refusal instead
+   * of a wrong answer. Trimming on read would be the coercion; refusing where
+   * the value is declared is not.
+   */
+  readonly thresholdUnit: string;
+  /**
+   * What one active tag multiplies the threshold by. Multiplicative and not
+   * subtractive, because the threshold is an amount in value units and a
+   * subtraction would have to name a currency while a factor does not; two
+   * active tags compose by multiplying.
+   *
+   * Must lie strictly inside (0, 1). At 1 an active tag lowers nothing, which
+   * makes the whole mechanism a no-op that still passes any test phrased as
+   * "lower than it was".
+   *
+   * WHAT IT CANNOT EXPRESS: "never above X regardless", which a subtraction
+   * can. If that is wanted it is a separate cap and not this number.
+   *
+   * It composes PER ACTIVE TAG, so the lowered threshold is
+   * `briefThreshold × activeTagFactor^k` for k active tags — not a single
+   * multiplication. The shipped default's derivation is written out at
+   * `BRIEF_POLICY_V0`, where an earlier version of that sentence described one
+   * tag and the merged acceptance corpus has two.
+   */
+  readonly activeTagFactor: number;
+  /**
+   * The decayed strength at or above which a tag counts as ACTIVE.
+   *
+   * Why a floor and not "live": nothing in this system retires a tag,
+   * `listLive` returns every tag ever opened, and `strengthAt` reaches zero
+   * only after about 1074 suppressed half-lives. "Active = live" therefore
+   * means every tag ever opened lowers the threshold forever, and the
+   * threshold means nothing.
+   *
+   * MEASURED HAZARD: at the calibrated half-life the section 9 scenario's two
+   * tags sit 0.0014 apart around 0.415, so a floor chosen there flips which
+   * one is active between two scenarios that differ in nothing else. Held by a
+   * test, not only by this sentence.
+   */
+  readonly activeFloor: number;
+  /**
+   * The relatedness at or above which a tag is a reason for this intent. "At or
+   * above", so the comparison is `>=` and a term equal to the floor is a reason.
+   *
+   * WHAT IT IS NOT: a measured number. Nothing in the study speaks to how
+   * related two pieces of evidence must be before one bears on the other.
+   *
+   * `(0, 1]`, CLOSED at 1, and the history of that bound is worth the lines because
+   * two rulings moved it. It was closed; then declared OPEN, on the measurement that
+   * the cross-field rule `crossChannelAffinity >= relatednessFloor` refused a floor of
+   * 1 under every admissible affinity, so the closed end was unreachable and the
+   * declared interval said otherwise. R36 then RETIRED that cross-field rule, which
+   * made 1 reachable again, and the bound closed for a second time — because "only the
+   * same aspect counts" is a configuration a challenger policy should be able to
+   * choose.
+   *
+   * So the sentence to trust is the code: `requireUnitInterval(..., true)` admits 1,
+   * `policy.test.ts` asserts it does, and Task 6's own threshold rows build a fixture
+   * on a floor of exactly 1. An earlier version of this docstring still described the
+   * open interval and the retired rule that justified it — and the patch that was
+   * supposed to fix it silently matched nothing, which is why it survived one round
+   * longer than the others.
+   *
+   * WHAT WOULD REPLACE IT: a measured rate of how often same-namespace
+   * cross-channel evidence precedes a loss, from the shadow evaluation.
+   *
+   * IT DECIDES THREE DIFFERENT BRIEFS, and it decided nothing before R35. With
+   * three relatedness values and the cross-field rule in force, the floor had
+   * exactly one admissible position, so every policy partitioned those values
+   * identically and two policies differing only here returned byte-identical
+   * briefs -- measured at 0.01, 0.3 and 0.55. R35's `crossAspectAffinity` made a
+   * fourth value and R36 retired the rule, so it now has three positions:
+   *
+   * - at or below `crossChannelAffinity`: every same-namespace term counts
+   * - above it, at or below `crossAspectAffinity`: cross-channel evidence excluded
+   * - above `crossAspectAffinity`: only the same aspect counts
+   *
+   * An earlier version of this docstring said it decides nothing and described the
+   * three-value world, and it went stale the moment R35 was ruled.
+   */
+  readonly relatednessFloor: number;
+  /**
+   * Relatedness of two readings in the same namespace on DIFFERENT channels.
+   *
+   * Strictly between 0 and 1, and both bounds carry a reason. Zero was the
+   * first version of this plan's implicit answer and it made the acceptance
+   * scenario's own case score nothing: the day-twelve tag is
+   * `address_integrity/transition` and the day-twenty-one intent is `price`,
+   * so a zero term makes the address change not a reason while design §9 and
+   * Task 9 both require it to be one. One would make a different channel worth
+   * exactly as much as the same channel, which is the term deleted rather than
+   * declared.
+   *
+   * Its own `> 0` bound is what kills a zero, and that is a CORRECTION. While the
+   * cross-field rule `crossChannelAffinity >= relatednessFloor` existed the bound
+   * was redundant -- a floor is always positive, so a zero affinity failed the pair
+   * first -- and this comment said so. R36 retired the rule, so the bound is now
+   * the only thing refusing a zero, and the test row for 0 is killed by it.
+   */
+  readonly crossChannelAffinity: number;
+  /**
+   * Relatedness of two readings in the same namespace, on the SAME channel, for
+   * DIFFERENT aspects -- `volume/amount/USDC/in` against `volume/amount/XLM/in`,
+   * which the corpus really produces. An earlier version of this comment paired
+   * `price/quoted/USDC` with `price/quoted/XLM` as well; replaying the corpus
+   * found no `price/quoted/XLM` in it, and a claim about what the corpus contains
+   * is a claim that gets replayed.
+   *
+   * R12 NAMES THREE TERMS AND THE DATA MODEL HAS FOUR. This is the case it
+   * leaves out, and design §1 puts aspect matching inside `rel()` rather than
+   * outside it, so it is not out of scope either. Left unruled it would have been
+   * decided on the day Task 4 met a second aspect, by whichever branch happened to
+   * catch it.
+   *
+   * Strictly between 0 and 1, and NOT required to exceed `crossChannelAffinity`.
+   * The ordering by specificity -- same quantity closer than another quantity on
+   * the same channel, closer than another channel -- is the SHIPPED DEFAULT'S
+   * assumption and not a law, because nobody has measured it: under those numbers
+   * a payment address CHANGING scores 0.55 against a price intent while a quote in
+   * another currency scores 0.75, so identity evidence ranks lower, which is at
+   * least arguable. `assertBriefPolicy` therefore does not impose it, and the
+   * ordering is asserted on `BRIEF_POLICY_V0` in `policy.test.ts` instead. An
+   * earlier version of this docstring stated the ordering as a bound on every
+   * policy, which the code has never enforced since that rule was removed.
+   *
+   * AND IT IS WHAT MAKES `relatednessFloor` DECIDE ANYTHING. With three values the
+   * floor had one admissible position and every policy partitioned them the same
+   * way; with four it has three, and two of those were forbidden by a rule this
+   * value's arrival retired.
+   */
+  readonly crossAspectAffinity: number;
+  /**
+   * The amount below which a MEDIUM-risk intent proceeds while a store is
+   * unavailable, in `thresholdUnit`.
+   *
+   * On the policy and NOT on the brief's input, which is where an earlier
+   * ruling put it: a caller supplying its own ceiling is a caller raising it,
+   * and design §6:281 says degrading availability is not a way to bypass the
+   * layer.
+   *
+   * Strictly below `briefThreshold`, and that rule is the same argument
+   * reaching the ceiling's VALUE rather than only its location. Measured when the
+   * threshold was 3000: ceilings of 5000, 3000 and 2900 were all accepted, and at
+   * 5000 a medium-risk intent of 4000 PROCEEDS while a store is unreachable and
+   * is HELD when it is reachable. That is the layer bypassed by making it
+   * unavailable, wearing a valid-looking policy.
+   *
+   * NECESSARY AND NOT SUFFICIENT, and the gap is declared rather than implied:
+   * an active tag multiplies the threshold down, so at the SHIPPED numbers
+   * 600 × 0.8^9 = 80.53 sits under the ceiling of 100, and a counterparty with
+   * nine active tags is again more permissively treated when a store is down.
+   * Nothing in M3 bounds the number of active tags, so no rule over these two
+   * numbers can close it; closing it needs a floor under the lowered threshold,
+   * which is a number nobody has measured. The count is computed by the test
+   * rather than recalled here, because an earlier version of this sentence said
+   * seven -- true of the defaults it was written for and stale the moment they
+   * moved.
+   *
+   * WHAT WOULD REPLACE IT: a measured loss rate by amount band, which would
+   * also give the floor above.
+   */
+  readonly mediumCeiling: number;
+  /**
+   * How many times a retryable refusal is retried before it is recorded and
+   * given up on. `BaselineStale`, `TagRefreshStale`, a 23505 on
+   * `tag_one_live_per_pair` and `Deadlocked` all retry; an unbounded retry
+   * loop is a denial of service on ourselves, which is the argument the
+   * producer cap already makes in the store.
+   *
+   * A positive integer: a bound of 2.5 retries is a bound nothing can honour.
+   * Zero is refused, so "never retry" is not expressible — declared rather than
+   * left to be discovered, and defensible because under R7 a `Deadlocked` that
+   * is never retried becomes an unavailability, which is the one response 40P01
+   * was mapped to `Deadlocked` to avoid.
+   *
+   * NAMED FOR THE BRIEF AND USED BY INGEST. `BaselineStale`, `TagRefreshStale`
+   * and the 23505 on `tag_one_live_per_pair` are all ingest-path refusals, and
+   * this bound governs them too. The name is the plan's; a reader expecting a
+   * brief-only value will trip on it, so it is said here.
+   */
+  readonly maxRetries: number;
+}
+
+// The separator comes from `composite-version.ts`, which is the module that
+// performs the join. It used to be declared here, and the build caught the
+// duplicate the moment the join existed: `index.ts` promises that each module is
+// the single origin of the names it exports, and two origins for one constant is
+// how the two ends of a format drift apart.
+
+/**
+ * v0. Fitted so that BOTH scenarios' assertions hold, and that is the whole
+ * derivation. Recorded as fitted, because design §8:338-339 admits the same of
+ * its own defaults and the failure this project has already paid for is a number
+ * chosen to make a test pass and then described as measured.
+ *
+ * WHAT THE TWO SCENARIOS ASSERT. Design §9:358 says a FIVE HUNDRED unit
+ * authorization is held on day twenty-one and that its reasons include the
+ * day-twelve address change with its own timestamp; R15 rules M3's acceptance
+ * scenario is M1's story at 2500 USDC. F8 records that the two disagree on the
+ * amount. Replaying M2's corpus -- which R15 merges in -- through the real
+ * `tagObservation` and the store's real `strengthAt` at the day-twenty-one
+ * instant gives a `protocol/event/trustline_open` state at 0.5197, the
+ * `address_integrity/transition` tag at 0.4165 and the `price/quoted/USDC` tag
+ * the quote opens at 0.4151. R22 excludes the last as the intent's own, so TWO
+ * tags are active and the threshold is 600 × 0.8² = 384. Both 500 and 2500 are
+ * held there.
+ *
+ * TWO VERSIONS OF THIS SENTENCE HAVE BEEN WRONG, both corrected by replaying the
+ * corpus rather than by rereading the prose, and both are recorded because the
+ * cause was the same each time. The first said "3000 × 0.8 = 2400 < 2500", which
+ * is one tag where there are two. The second said a 500 request passes at zero
+ * active tags and holds at one -- "the tag is what flips it" -- which the corpus
+ * refutes: §9 and R15 share ONE corpus and therefore its active-tag count, the
+ * trustline state is active from day one, and with the address tag filtered out
+ * 500 is STILL held at 480. The day-twelve tag flips nothing at either amount,
+ * and the windows where it would -- base in (625, 781.25] for 500, in
+ * (3125, 3906.25] for 2500 -- are disjoint, so no single base can give both a
+ * flip. §9 asks for a hold and for the address change to be among the reasons;
+ * it says the tag LOWERS the threshold, and lowering is not flipping.
+ *
+ * WHAT THAT COSTS TASK 9, recorded here because it is where the numbers live:
+ * the trustline state is refreshed every morning, so it is active from day ONE
+ * and the provider's threshold is lowered before the day-twelve address change
+ * exists. Task 9's acceptance -- "the provider's threshold lower than the same
+ * query returns for a counterparty with no active tag" -- is therefore
+ * satisfiable with the day-twelve tag doing no work at all, which is R22's
+ * failure one tag over. The comparison Task 9 needs is the provider before and
+ * after day twelve, or with the address tag filtered out.
+ *
+ * Every number here differs from every other, held by a test. The M2
+ * collision map is why.
+ */
+export const BRIEF_POLICY_V0: BriefPolicy = {
+  version: "brief-policy-v0",
+  briefThreshold: 600,
+  thresholdUnit: "USDC",
+  activeTagFactor: 0.8,
+  activeFloor: 0.25,
+  relatednessFloor: 0.3,
+  crossChannelAffinity: 0.55,
+  crossAspectAffinity: 0.75,
+  mediumCeiling: 100,
+  maxRetries: 5,
+};
+
+/** Refused unless a non-blank string. Returns the value for the caller to use. */
+function requireNonBlank(label: string, value: string): string {
+  if (value.trim().length === 0) throw new RangeError(`${label} must not be blank`);
+  return value;
+}
+
+/** Refused unless a positive integer. Returns the value for the caller to use. */
+function requirePositiveInteger(label: string, value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(`${label} must be a positive integer, got ${value}`);
+  }
+  return value;
+}
+
+const label = (field: keyof BriefPolicy): string => `briefPolicy.${field}`;
+
+/**
+ * A policy the brief can use, refused up front and once rather than
+ * discovered as a NaN three functions deep.
+ *
+ * The three range predicates come from `@nonametrust/tagging` rather than
+ * being written again here. One predicate cannot drift from itself, and one
+ * phrasing per predicate is what lets a test hold two callers to the same
+ * message -- the habit that caught four rules on the storage card.
+ */
+export function assertBriefPolicy(policy: BriefPolicy): void {
+  requireNonBlank(label("version"), policy.version);
+  if (policy.version.includes(VERSION_SEPARATOR)) {
+    throw new RangeError(
+      `${label("version")} must not contain the composite separator ${VERSION_SEPARATOR}, got ${policy.version}`,
+    );
+  }
+  requireNonBlank(label("thresholdUnit"), policy.thresholdUnit);
+  // Refused rather than trimmed: the brief compares this against the intent's unit
+  // (R44) and a padded policy refuses a correct intent.
+  if (policy.thresholdUnit !== policy.thresholdUnit.trim()) {
+    throw new RangeError(
+      `${label("thresholdUnit")} must not be padded, got ${JSON.stringify(policy.thresholdUnit)}`,
+    );
+  }
+  requirePositive(label("briefThreshold"), policy.briefThreshold);
+  // Open at 1: a factor of 1 lowers nothing.
+  requireUnitInterval(label("activeTagFactor"), policy.activeTagFactor, false);
+  // CLOSED at 1, deliberately: it is the nearest thing to an OFF setting this
+  // value has, the control configuration for a champion-challenger run in which
+  // almost no tag lowers any threshold. Which is also why refusing
+  // `activeTagFactor` of 1 is not over-strict: the two express different things.
+  //
+  // WHAT "ALMOST" IS DOING THERE, because an earlier version of this comment
+  // said "a saturated tag at the instant of its own refresh and nothing else"
+  // and that was wrong twice, both measured. `strengthAt` returns `g0` for
+  // EVERY non-positive elapsed (`strength.ts:38`), not only for zero, so a floor
+  // of 1 admits any tag with `g0 === 1` whose `taggedAt` is at or AFTER the
+  // instant being asked about -- which the synchronous path never produces, but
+  // a REPLAY does, since the brief's `at` is an input. And `g0 === 1` is
+  // reachable on an OPEN tag under an admissible policy, not only by saturation:
+  // `categoricalBase` and the calibration weights are each closed at 1, so their
+  // product can be 1. Under the shipped numbers no open tag gets there -- the
+  // largest categorical g0 is 0.774 -- but the bound admits a policy where one
+  // does.
+  requireUnitInterval(label("activeFloor"), policy.activeFloor, true);
+  // CLOSED at 1: "only the same aspect counts" is a reachable configuration now
+  // that R36 has retired the rule pinning this field below the smallest affinity
+  // term. It was briefly declared OPEN, on the measurement that the retired rule
+  // made 1 unreachable; both sentences sat here at once until a review read them
+  // together.
+  requireUnitInterval(label("relatednessFloor"), policy.relatednessFloor, true);
+  // Open at 1 by R12: at 1 the term is not a cross-channel affinity.
+  requireUnitInterval(label("crossChannelAffinity"), policy.crossChannelAffinity, false);
+  requireUnitInterval(label("crossAspectAffinity"), policy.crossAspectAffinity, false);
+  requirePositive(label("mediumCeiling"), policy.mediumCeiling);
+  requirePositiveInteger(label("maxRetries"), policy.maxRetries);
+  // ONE cross-field rule, and one that used to be here is gone.
+  //
+  // RETIRED: `crossChannelAffinity >= relatednessFloor`. It was added on the
+  // argument that a floor above the affinity leaves the cross-channel term "in
+  // range and dead", and review then measured what it cost: with three relatedness
+  // values the floor had exactly one admissible position, so every policy
+  // partitioned them identically and `relatednessFloor` decided nothing. The two
+  // configurations it forbade -- excluding cross-channel evidence, and admitting
+  // only the same aspect -- are choices a challenger policy should be able to make,
+  // not incoherent states. What that rule was really protecting is that the
+  // SHIPPED default admits cross-channel evidence, because design §9 needs a
+  // day-twelve `address_integrity` change to bear on a day-twenty-one `price`
+  // intent; that is asserted on `BRIEF_POLICY_V0` in `policy.test.ts`, where it
+  // belongs, rather than imposed on every policy.
+  //
+  // WHAT IS NOT HERE, and its absence is the same finding twice. An earlier
+  // version imposed `crossChannelAffinity < crossAspectAffinity` on EVERY policy,
+  // justified by "relatedness is ordered by specificity". Review pointed out that
+  // this repeats, one commit later, the mistake that retired the rule above: it is
+  // an UNMEASURED modelling claim imposed as a law, and it forbids an inversion a
+  // challenger might have good reason to want.
+  //
+  // The reason it might: under the shipped numbers an `address_integrity`
+  // transition -- a payment address changing, which is what design §9 is built
+  // around -- scores 0.55 against a price intent while a quote in another currency
+  // scores 0.75. So identity evidence ranks BELOW a second currency's price, and
+  // nobody has measured which is actually more predictive of a loss. That is
+  // exactly the kind of question the champion-challenger arrangement exists to
+  // settle, and a universal rule would settle it by fiat instead.
+  //
+  // So the ordering is asserted on `BRIEF_POLICY_V0` in `policy.test.ts`, where the
+  // cross-channel requirement also lives, and declared in `relatedness.ts` as the
+  // shipped default's assumption rather than as a property of relatedness.
+  // Second: a ceiling at or above the threshold it sits under makes the
+  // unavailable path MORE permissive than the available one, which is design
+  // §6:281's prohibition -- degrading availability is not a way to bypass the
+  // layer. Necessary and not sufficient: the lowered threshold can still fall
+  // under the ceiling, and `mediumCeiling`'s own comment carries the measured
+  // active-tag count, which the test computes rather than recalls.
+  if (!(policy.mediumCeiling < policy.briefThreshold)) {
+    throw new RangeError(
+      `${label("mediumCeiling")} ${policy.mediumCeiling} must be below ` +
+        `${label("briefThreshold")} ${policy.briefThreshold}, or a medium-risk intent proceeds ` +
+        `while a store is unavailable and is held when it is reachable`,
+    );
+  }
+}
