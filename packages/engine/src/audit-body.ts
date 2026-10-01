@@ -321,3 +321,124 @@ export function assertAuditBody(body: BriefAuditBody): void {
     requireFiniteNumber("reasons[].relatedness", reason.relatedness);
   }
 }
+
+/**
+ * The INGEST entry's body: a closed type too, R25.
+ *
+ * **WHY THIS EXISTS, MEASURED AND NOT ARGUED.** The brief's body has been closed
+ * and walked since Task 5. The ingest path wrote a second body into the same
+ * chain with no type and no walk, and a mutation audit measured what that bought:
+ * `aspects` dropped, `tagIds` dropped and `at` dropped each survived the ENTIRE
+ * suite. Three fields of a hash-chained row that outlives every key, held by the
+ * comment beside them.
+ *
+ * And the field that was really there was the dangerous one. `aspects` is
+ * templated from the payload -- `amount/${assetCode}/${direction}`,
+ * `event/${p.event}`, `quoted/${p.unit}` -- and the schema bounds none of those
+ * strings, so a 56-character address-shaped `assetCode` reached the canonical
+ * form verbatim. R77 removed the field; this type is what stops it coming back,
+ * because a sentence does not.
+ *
+ * WHAT IT CARRIES AND WHY EACH IS ADMITTED UNDER R25's "ids, codes, versions and
+ * instants":
+ *
+ * - `observationId`, `namespaceId`, `tagIds` -- ids, and the only way to find the
+ *   rows this fold touched.
+ * - `at` -- the instant the ingest was ABOUT. `AuditChain.append` stamps its own
+ *   `occurredAt` from the chain's clock and a caller cannot supply one, so the
+ *   instant has to travel in the body, exactly as it does for a brief.
+ * - `readings` -- a COUNT. It is not one of R25's four, and it is admitted on the
+ *   same ground R48 admits the brief's six numbers: without it nothing records
+ *   that this observation derived two readings rather than one, which is what
+ *   R46 turns on. A count is derived from a payload and names nothing in one,
+ *   which is the line the aspects crossed.
+ *
+ * WHAT IT DELIBERATELY DOES NOT CARRY:
+ *
+ * - **no aspects and no channel.** The aspects are recoverable from the tag rows
+ *   the ids name, for as long as those rows exist -- which is the right lifetime
+ *   for them and not the chain's.
+ * - **no surprise and no baseline count.** Both are a read of the store at one
+ *   instant, and the fold moves them afterwards; a permanent row asserting one
+ *   would assert something the store can already contradict. This is the same
+ *   ground on which the brief's body refuses `refreshCount`.
+ * - **no `created` / `folded` flags.** A re-delivery writes no entry at all, so
+ *   every entry that exists folded; a flag that is always true records nothing.
+ */
+export interface ObserveAuditBody {
+  readonly observationId: string;
+  readonly namespaceId: string;
+  /** The instant the ingest was about, as an ISO string. */
+  readonly at: string;
+  /** How many readings the payload derived, R46's quantity. */
+  readonly readings: number;
+  /** R41: the tags this observation opened OR refreshed. Empty is the common case. */
+  readonly tagIds: readonly string[];
+}
+
+/**
+ * Every path an observe body may contain, and no others.
+ *
+ * `tagIds[]` is ABSENT ON PURPOSE and is not a missing entry: `auditBodyPaths`
+ * walks into objects and arrays only, so an array of strings contributes the
+ * single path `tagIds`. An element that is an OBJECT does produce `tagIds[].…`
+ * paths, which this set does not admit -- which is how a tag "id" smuggling an
+ * aspect alongside it is refused.
+ */
+export const ADMITTED_OBSERVE_PATHS: ReadonlySet<string> = new Set([
+  "observationId",
+  "namespaceId",
+  "at",
+  "readings",
+  "tagIds",
+]);
+
+function requirePositiveInteger(path: string, value: unknown): void {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new RangeError(
+      `auditBody.${path} must be a positive integer, got ${JSON.stringify(value)}`,
+    );
+  }
+}
+
+/**
+ * Refuses an ingest entry's body the chain must not carry, naming the field or
+ * the path.
+ *
+ * The same two checks and the same order as `assertAuditBody`, for the same
+ * measured reasons: the walk refuses a key nobody admitted and runs FIRST, so an
+ * unadmitted key is reported as itself; the field checks then refuse a value the
+ * admitted type does not allow, which a walk cannot see because a `Date` renders
+ * as an admitted-looking string.
+ */
+export function assertObserveBody(body: ObserveAuditBody): void {
+  if (typeof body !== "object" || body === null) {
+    throw new RangeError(`auditBody must be an object, got ${typeof body}`);
+  }
+
+  for (const path of auditBodyPaths(body)) {
+    if (!ADMITTED_OBSERVE_PATHS.has(path)) {
+      throw new RangeError(
+        `auditBody.${path} is not admitted: the audit row outlives both the month key ` +
+          `and the namespace key, so an ingest entry carries ids, instants and the ` +
+          `reading count, and nothing an aspect or a payload could travel in`,
+      );
+    }
+  }
+
+  for (const key of ["observationId", "namespaceId", "at", "readings", "tagIds"] as const) {
+    requirePresent(key, body, key);
+  }
+
+  requireId("observationId", body.observationId, false);
+  requireId("namespaceId", body.namespaceId, false);
+  requireAt("at", body.at, false);
+  requirePositiveInteger("readings", body.readings);
+
+  if (!Array.isArray(body.tagIds)) {
+    throw new RangeError(`auditBody.tagIds must be an array, got ${typeof body.tagIds}`);
+  }
+  // The path is written without an index on purpose, as the brief's reasons are:
+  // a reader chasing the refusal is handed the string the whitelist names.
+  for (const tagId of body.tagIds) requireId("tagIds[]", tagId, false);
+}

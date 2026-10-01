@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { WireObservation } from "@nonametrust/schema";
-import { CALIBRATION_V0, POLICY_V0, emptyBaseline, updateBaseline, robustScale, scaleFloorFor } from "@nonametrust/tagging";
+import { CALIBRATION_V0, POLICY_V0, emptyBaseline, judgeSurprise, updateBaseline, robustScale, scaleFloorFor } from "@nonametrust/tagging";
 import {
   Deadlocked,
   NamespaceShredded,
@@ -17,6 +17,8 @@ import {
 import { compose, type Composed } from "./compose.js";
 import { BRIEF_POLICY_V0 } from "./policy.js";
 import { observe, RefusedObservation } from "./observe.js";
+import { assertObserveBody } from "./audit-body.js";
+import { compositePolicyVersion } from "./composite-version.js";
 import { AuditEntryMissing } from "./run-brief.js";
 import type { BriefPolicies } from "./brief.js";
 
@@ -442,16 +444,19 @@ describe("R24: an audit row that never lands is NAMED, not rolled back", () => {
       } as unknown as Composed["audit"],
     };
 
+    let thrown: AuditEntryMissing | null = null;
     try {
-      await expect(
-        observe(broken, payment("op:noaudit", "11.0000000", "NOAUDIT"), {
-          ...policies,
-          brief: { ...BRIEF_POLICY_V0, maxRetries: 1 },
-        }),
-      ).rejects.toBeInstanceOf(AuditEntryMissing);
+      thrown = await observe(broken, payment("op:noaudit", "11.0000000", "NOAUDIT"), {
+        ...policies,
+        brief: { ...BRIEF_POLICY_V0, maxRetries: 1 },
+      }).then(
+        () => null,
+        (e: unknown) => e as AuditEntryMissing,
+      );
     } finally {
       (process.stderr as { write: unknown }).write = realWrite;
     }
+    expect(thrown, "a lost chain entry was not named").toBeInstanceOf(AuditEntryMissing);
 
     // NOT ROLLED BACK: the fold is there.
     const nsId = await namespaceIdOf("NOAUDIT");
@@ -471,6 +476,17 @@ describe("R24: an audit row that never lands is NAMED, not rolled back", () => {
     expect(missing!["code"]).toBe("AUDIT_ENTRY_MISSING");
     expect(missing!["observationId"]).toMatch(/^[0-9a-f-]{36}$/);
     expect(Object.keys(missing!)).not.toContain("message");
+
+    // R28's SUBJECT ON THE AUDIT RETRY TOO. Dropping `subject: observationId`
+    // from this `retrying` call survived the whole suite: this row asserted the
+    // stderr line's id, which is written by hand a few lines later in the source,
+    // and never the exhausted retry's own. They are different claims and the
+    // second one was unheld.
+    const cause = (thrown!.cause as Error | undefined);
+    expect(cause, "the named inconsistency carried no cause").toBeDefined();
+    expect(cause!.message, "the exhausted audit retry named no observation").toContain(
+      String(missing!["observationId"]),
+    );
   }, 60_000);
 });
 
@@ -488,5 +504,604 @@ describe("R24: the audit row is written after the transaction commits", () => {
     // followed, which is why R24 makes a missing one a named inconsistency.
     const nsId = await namespaceIdOf("AUDITED");
     expect((await baselineOf(nsId, "volume", "amount/USDC/in"))!.count).toBe(1);
+  }, 30_000);
+});
+
+// ===========================================================================
+// What a mutation audit of this path measured, and the rows that hold it now.
+//
+// The audit ran 83 mutants and 17 of them SURVIVED the whole suite. Four groups:
+// the tag write (R10's own named defect -- a committed fold with no tag -- turned
+// nothing red), `holdsAt`, the `surprise` return, and every field of the audit
+// body but two. Plus three properties held only indirectly: "every read is inside
+// the transaction" was held in the narrower form "the retry re-reads", R9's
+// `expectedCount` was held only by the R10 forty-writer row and only through
+// retry exhaustion, and `at` coming from the composition clock was held only by a
+// source scan.
+//
+// Each row below names the mutant it was written for, so a later task that
+// disarms one is a red test rather than a silent loss.
+// ===========================================================================
+
+describe("R10: every read the fold makes is on the TRANSACTION's connection", () => {
+  it("reaches for no repository outside the transaction", async () => {
+    // THE DOCSTRING'S PROPERTY, HELD AT LAST. `observe` says "every read is
+    // inside, so the retry re-runs them". The audit measured that moving the
+    // baseline read OUTSIDE the transaction but inside `retrying` survived the
+    // whole suite: what the suite held was only the second half of the sentence.
+    //
+    // A PROXY AND NOT A SCAN. The fold composes again onto `trx`, so its
+    // repositories are the inner ones; a read through the OUTER composition is a
+    // read on a different connection, and that is observable without any
+    // arrangement of commits -- the outer object simply must not be touched.
+    //
+    // This also retires a mutant that previously "died" only by deadlocking the
+    // pool: replacing `compose(trx, …)` with the outer `composed` inside the
+    // transaction left all ten pool backends idle-in-transaction and took 340
+    // seconds to fail on vitest's own timeouts. It now fails in milliseconds.
+    const reached: string[] = [];
+    const guarded = new Proxy(composed, {
+      get(target, key, receiver): unknown {
+        if (key === "baselines" || key === "tags") {
+          reached.push(String(key));
+          throw new Error(`observe reached composed.${String(key)} outside the transaction`);
+        }
+        return Reflect.get(target, key, receiver) as unknown;
+      },
+    }) as Composed;
+
+    const out = await observe(guarded, payment("op:proxy", "7.0000000", "PROXYNS"), policies);
+    expect(out.folded).toBe(true);
+    expect(reached, "the fold read a repository on the outer connection").toEqual([]);
+
+    // And the fold really happened, so this is not a green over a path that did
+    // nothing.
+    const nsId = await namespaceIdOf("PROXYNS");
+    expect((await baselineOf(nsId, "volume", "amount/USDC/in"))!.count).toBe(1);
+  }, 30_000);
+
+  it("and the guard DOES trap, which is what makes the row above mean something", () => {
+    // The control. A proxy whose trap never fires would make the assertion above
+    // pass over a composition nothing was checking.
+    const guarded = new Proxy(composed, {
+      get(target, key, receiver): unknown {
+        if (key === "baselines" || key === "tags") throw new Error(`trapped ${String(key)}`);
+        return Reflect.get(target, key, receiver) as unknown;
+      },
+    }) as Composed;
+    expect(() => guarded.baselines).toThrow(/trapped baselines/);
+    expect(() => guarded.tags).toThrow(/trapped tags/);
+    // And it lets through exactly what the ingest path legitimately needs.
+    expect(guarded.clock).toBe(composed.clock);
+    expect(guarded.ring).toBe(composed.ring);
+    expect(guarded.handle).toBe(composed.handle);
+    expect(guarded.observations).toBe(composed.observations);
+    expect(guarded.namespaces).toBe(composed.namespaces);
+  });
+});
+
+describe("the ingest entry's audit body, read BACK out of the chain", () => {
+  it("carries the ids, the instant and the reading count, and nothing else", async () => {
+    // FOUR MUTANTS SURVIVED HERE: `tagIds` dropped, `at` dropped, `aspects`
+    // dropped (while it was still present), and `policyVersion` reduced to
+    // tagging's version alone. Nothing read the body back and nothing typed it.
+    //
+    // `protocol` is the channel, because a categorical reading always produces a
+    // tag decision -- so `tagIds` is NON-EMPTY here and dropping it is visible. A
+    // volume event on a cold namespace opens nothing, and a row asserting `[]`
+    // cannot tell an empty list from a missing field.
+    const out = await observe(
+      composed,
+      wire({
+        source: { ...source, ref: "op:bodyback" },
+        namespace: { kind: "wallet", id: "BODYBACK" },
+        channel: "protocol",
+        kind: "event_observed",
+        payload: { event: "trustline_open" },
+      }),
+      policies,
+    );
+    expect(out.ownTagIds, "no tag was opened, so this row would prove nothing").toHaveLength(1);
+
+    const head = await composed.audit.head();
+    const body = head!.body as Record<string, unknown>;
+    const nsId = await namespaceIdOf("BODYBACK");
+
+    // EXACTLY these keys. A sixth would be a field nothing refused.
+    expect(Object.keys(body).sort()).toEqual(["at", "namespaceId", "observationId", "readings", "tagIds"]);
+    expect(body["observationId"]).toBe(out.observationId);
+    expect(body["namespaceId"]).toBe(nsId);
+    // THE COMPOSITION CLOCK'S INSTANT, by value. `at` was held only by
+    // `clock-gate.test.ts`, a source scan: swapping it for `new Date()` changed
+    // the row and no behavioural test noticed.
+    expect(body["at"]).toBe(AT.toISOString());
+    expect(body["readings"]).toBe(1);
+    expect(body["tagIds"]).toEqual(out.ownTagIds);
+  }, 30_000);
+
+  it("carries all FOUR policy versions, R26, and not one of them alone", async () => {
+    const out = await observe(composed, payment("op:pv", "2.0000000", "POLICYVER"), policies);
+    const head = await composed.audit.head();
+    expect(head!.canonical).toContain(out.observationId);
+
+    const expected = compositePolicyVersion({
+      retention: RETENTION_V0.version,
+      tagging: POLICY_V0.version,
+      calibration: CALIBRATION_V0.version,
+      brief: BRIEF_POLICY_V0.version,
+    });
+    expect(head!.policyVersion).toBe(expected);
+    // The control: reducing it to tagging's version alone was the surviving
+    // mutant, and that is a DIFFERENT string -- so the assertion above can tell.
+    expect(head!.policyVersion).not.toBe(POLICY_V0.version);
+    expect(head!.policyVersion.split("/")).toHaveLength(4);
+  }, 30_000);
+
+  it("refuses a body the chain must not carry, at the ingest path and not only in the brief", async () => {
+    // The assertion is called on what the STORE handed back -- the tag ids are
+    // `open`'s own return values and the namespace id came from a namespace row,
+    // and none of the three was validated on the way in. Held here with the
+    // shapes those values could really take.
+    expect(() =>
+      assertObserveBody({
+        observationId: "obs-1",
+        namespaceId: "ns-1",
+        at: AT.toISOString(),
+        readings: 1,
+        tagIds: ["tag-1"],
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertObserveBody({
+        observationId: "obs-1",
+        namespaceId: "ns-1",
+        at: AT.toISOString(),
+        readings: 1,
+        tagIds: [" "],
+      }),
+    ).toThrow(/tagIds\[\] must not be blank/);
+  });
+});
+
+describe("R9: the fold's upsert carries the count it READ", () => {
+  it("never leaves a baseline whose count is below the folds that committed", async () => {
+    // HELD BY THE WRONG TEST BEFORE THIS ROW. The audit measured that replacing
+    // `expectedCount` with `null` is caught only by the forty-writer R10 row, and
+    // there only as `observe gave up after 201 attempts` -- retry exhaustion,
+    // never an assertion about the count. No single-writer row folds a SECOND
+    // observation onto the same pair at all, so outside forty-way contention a
+    // dropped expected count is invisible.
+    //
+    // THE INVARIANT HOLDS UNDER EVERY INTERLEAVING, so this row cannot flake: a
+    // writer that threw rolled back and folded nothing, and a writer that
+    // returned committed exactly one fold. Whatever the database chooses, and
+    // however many writers exhaust their retries, the count equals the folds.
+    // Without the expected count the concurrent writers all read the same
+    // baseline and all write count 2, so the count falls below the folds.
+    //
+    // ONE RETRY AND NOT ZERO, because `BRIEF_POLICY_V0` refuses a `maxRetries` of
+    // 0 by name -- `maxRetries must be a positive integer` -- which my first
+    // version of this row did not know and which made all eight writers fail for
+    // a reason that had nothing to do with R9. A tight bound is still what this
+    // row wants: it is the contention, not the retry, that exercises the
+    // predicate.
+    await observe(composed, payment("op:occ0", "10.0000000", "OCCNS"), policies);
+    const tightBound = { ...policies, brief: { ...BRIEF_POLICY_V0, maxRetries: 1 } };
+
+    const settled = await Promise.allSettled(
+      Array.from({ length: 8 }, (_, i) =>
+        observe(composed, payment(`op:occ${i + 1}`, "10.0010000", "OCCNS"), tightBound),
+      ),
+    );
+    const folded = settled.filter((s) => s.status === "fulfilled").length;
+    expect(folded, "no writer got through at all").toBeGreaterThanOrEqual(1);
+
+    const nsId = await namespaceIdOf("OCCNS");
+    const baseline = await baselineOf(nsId, "volume", "amount/USDC/in");
+    expect(baseline!.count, "a fold committed without moving the count").toBe(1 + folded);
+
+    // R28's subject, on the FOLD's retry and not only the audit's: dropping it
+    // from this `retrying` call survived the whole suite. A refusal that does not
+    // name its observation cannot be acted on.
+    const refused = settled.filter((s): s is PromiseRejectedResult => s.status === "rejected");
+    if (refused.length > 0) {
+      expect(
+        (refused[0]!.reason as Error).message,
+        "the exhausted fold named no observation",
+      ).toMatch(/on [0-9a-f-]{36}$/);
+    }
+  }, 60_000);
+});
+
+describe("a baseline is matched on the channel AND the aspect", () => {
+  it("folds a second asset onto its OWN baseline, not onto the first one found", async () => {
+    // A surviving mutant: `baselines.find((b) => b.channel === reading.channel)`.
+    // Two aspects of one channel is not exotic -- it is two assets -- and the
+    // first volume baseline found would then absorb the second asset's value and
+    // hand tagging the wrong history to judge it against.
+    for (const [i, amount] of ["10.0000000", "10.0010000", "10.0020000"].entries()) {
+      await observe(
+        composed,
+        wire({
+          source: { ...source, ref: `op:usdc${i}` },
+          namespace: { kind: "wallet", id: "TWOASSET" },
+          payload: { amount, assetCode: "USDC", direction: "in" },
+        }),
+        policies,
+      );
+    }
+    await observe(
+      composed,
+      wire({
+        source: { ...source, ref: "op:eurc0" },
+        namespace: { kind: "wallet", id: "TWOASSET" },
+        payload: { amount: "100.0000000", assetCode: "EURC", direction: "in" },
+      }),
+      policies,
+    );
+
+    const nsId = await namespaceIdOf("TWOASSET");
+    const usdc = await baselineOf(nsId, "volume", "amount/USDC/in");
+    const eurc = await baselineOf(nsId, "volume", "amount/EURC/in");
+
+    expect(usdc!.count, "the USDC baseline absorbed the EURC fold").toBe(3);
+    expect(eurc!.count, "the EURC fold landed on another aspect's baseline").toBe(1);
+    expect(eurc!.mean).toBeCloseTo(100, 9);
+    // And the two really are different histories, which is what makes the mix-up
+    // detectable at all.
+    expect(Math.abs(usdc!.mean - eurc!.mean)).toBeGreaterThan(1);
+  }, 60_000);
+});
+
+describe("the surprise an ingest returns", () => {
+  it("is the INTENT reading's own, by value, once the baseline is warm", async () => {
+    // TWO MUTANTS SURVIVED HERE: taking the first measured verdict instead of the
+    // intended one, and `surprise * 2`. The only assertion anywhere was
+    // `toBeNull()` on a cold baseline, so every warm value was unheld.
+    //
+    // COMPARED AGAINST TAGGING'S OWN ARITHMETIC, deliberately. The engine's job
+    // in this field is a pass-through: the number is tagging's, computed by
+    // `judgeSurprise`, which has its own tests over its own arithmetic. What this
+    // row holds is that the engine returns THAT number, for the reading a brief
+    // would be handed, unscaled and unswapped -- which a fitted literal would
+    // hold no better and would re-fit on every calibration change.
+    const floor = scaleFloorFor(POLICY_V0, "volume", "amount/USDC/in");
+    for (let i = 0; i < POLICY_V0.minObservations; i += 1) {
+      await observe(
+        composed,
+        payment(`op:surp${i}`, (10 + i * 0.001).toFixed(7), "SURPRISE"),
+        policies,
+      );
+    }
+    const nsId = await namespaceIdOf("SURPRISE");
+    const before = await baselineOf(nsId, "volume", "amount/USDC/in");
+    expect(before!.count).toBe(POLICY_V0.minObservations);
+
+    const out = await observe(composed, payment("op:surpN", "40.0000000", "SURPRISE"), policies);
+    const verdict = judgeSurprise(40, before!, "volume", floor, POLICY_V0);
+    if (verdict.kind !== "measured") throw new Error("the fixture did not reach a measured verdict");
+
+    expect(out.surprise, "the warm surprise was not returned").not.toBeNull();
+    expect(out.surprise!).toBeCloseTo(verdict.surprise, 9);
+    // The control: the value is far from zero and far from twice itself, so the
+    // assertion above can tell a doubled one from an honest one.
+    expect(Math.abs(verdict.surprise)).toBeGreaterThan(1);
+    expect(verdict.surprise).toBeGreaterThan(0);
+  }, 120_000);
+
+  it("is NULL when the observation derives two readings, because a scalar names neither (R79)", async () => {
+    // R46 refuses to brief a two-reading intent. The surprise field now agrees
+    // with it: "the last measured verdict" made the answer depend on the order
+    // `readObservation` returns its readings, and for a `cluster_proximity`
+    // carrying an amount that order decides between two unrelated quantities.
+    const dust = (ref: string, hops: number, amount: string): WireObservation =>
+      wire({
+        source: { ...source, ref },
+        namespace: { kind: "wallet", id: "TWOREAD" },
+        channel: "cluster_proximity",
+        payload: { clusterId: "c-1", hops, amount },
+      });
+
+    for (let i = 0; i < POLICY_V0.minObservations; i += 1) {
+      await observe(composed, dust(`op:dust${i}`, 3, (1 + i * 0.001).toFixed(7)), policies);
+    }
+    const out = await observe(composed, dust("op:dustN", 9, "500.0000000"), policies);
+
+    expect(out.intent.briefable, "the fixture derived one reading, not two").toBe(false);
+    expect(out.surprise, "a scalar surprise was returned for a two-reading intent").toBeNull();
+
+    // AND BOTH READINGS WERE STILL FOLDED. The null is about what a brief may be
+    // handed; deleting the channel's signal to enforce a rule about briefs is the
+    // mistake R46's own correction was written against.
+    const nsId = await namespaceIdOf("TWOREAD");
+    expect((await baselineOf(nsId, "cluster_proximity", "hops"))!.count).toBe(11);
+    expect((await baselineOf(nsId, "cluster_proximity", "amount"))!.count).toBe(11);
+  }, 120_000);
+});
+
+describe("a second observation on an aspect that already has a live tag", () => {
+  it("REFRESHES that tag and returns its id, rather than opening a second one", async () => {
+    // THE REFRESH BRANCH WAS HELD BY NOTHING. Three mutants survived: skipping
+    // the refresh entirely, dropping `ownTagIds.push(live.tagId)`, and -- before
+    // this row -- nothing read a tag row back after an ingest at all. `observe`
+    // is the first path in the engine that opens tags, which made it the largest
+    // untested surface on the branch.
+    const protocolEvent = (ref: string, observedAt: string): WireObservation =>
+      wire({
+        source: { ...source, ref },
+        namespace: { kind: "wallet", id: "REFRESHNS" },
+        channel: "protocol",
+        kind: "event_observed",
+        observedAt,
+        payload: { event: "trustline_open" },
+      });
+
+    const first = await observe(
+      composed,
+      protocolEvent("op:ref1", "2026-09-20T00:00:00.000Z"),
+      policies,
+    );
+    expect(first.ownTagIds).toHaveLength(1);
+    const nsId = await namespaceIdOf("REFRESHNS");
+    const opened = (await composed.tags.listLive(nsId)).find((t) => t.tagId === first.ownTagIds[0]);
+    expect(opened, "the opened tag is not in the store").toBeDefined();
+    expect(opened!.refreshCount).toBe(0);
+    expect(opened!.observationId, "the tag does not name its opening observation (R30)").toBe(
+      first.observationId,
+    );
+
+    // A DAY LATER, so the live tag's strength has decayed and the refresh has
+    // something to compute from. The clock is the composition's, which is what
+    // makes this observable at all.
+    clock.advance(24 * 60 * 60 * 1000);
+    const secondObservedAt = "2026-09-21T12:00:00.000Z";
+    const second = await observe(
+      composed,
+      protocolEvent("op:ref2", secondObservedAt),
+      policies,
+    );
+
+    expect(second.ownTagIds, "the refresh returned no tag id").toEqual([opened!.tagId]);
+    const live = await composed.tags.listLive(nsId);
+    expect(live, "a second tag was opened instead of refreshing the live one").toHaveLength(1);
+    expect(live[0]!.tagId).toBe(opened!.tagId);
+    expect(live[0]!.refreshCount, "the refresh count did not move").toBe(1);
+    // R30: a refreshed tag keeps its OPENING observation and does not re-point at
+    // the one that refreshed it.
+    expect(live[0]!.observationId).toBe(first.observationId);
+    // R19: A TAG IS DATED AT ITS EVIDENCE AND NOT AT THE CLOCK. Measured here
+    // rather than assumed -- my first version of this row asserted the clock's
+    // instant and was red, because `taggedAt` follows the observation's
+    // `observedAt`. That is the correct behaviour and it was worth pinning: it is
+    // what makes a backfilled observation decay from when it happened.
+    expect(live[0]!.taggedAt.toISOString()).toBe(secondObservedAt);
+    expect(live[0]!.taggedAt.getTime()).toBeGreaterThan(opened!.taggedAt.getTime());
+    clock.advance(-24 * 60 * 60 * 1000);
+  }, 60_000);
+});
+
+describe("R21: a refusal carries the code of the refusal that happened", () => {
+  it("names OBSERVATION_INVALID for a payload the store accepted and the validator refuses", async () => {
+    // A surviving mutant hard-coded the code to `OBSERVATION_UNREADABLE`, and no
+    // row could tell: `append` parses the ENVELOPE only, so the only refusal any
+    // test drove past it was the 309-digit amount, which really is unreadable.
+    //
+    // THE GAP BETWEEN THE TWO VALIDATIONS IS REAL AND THIS IS IT: the envelope
+    // types the payload as `z.record(z.string(), z.unknown())`, so ANY object
+    // passes `append`, and `validateObservation` is the only thing that checks the
+    // payload against its CHANNEL's schema. A `volume` observation carrying a
+    // `protocol` payload is therefore stored and then refused, with an observation
+    // id to name it by -- which is exactly the case R21 is about.
+    //
+    // MEASURED, after a wrong first attempt. I first used a mismatched
+    // `idempotencyKey`, which `append` itself refuses (observation.ts:198) as a
+    // `StoreError` -- rethrown unwrapped and carrying no code at all, so the row
+    // was red against a path that never reaches `readingsOf`.
+    const wrongPayload = wire({
+      source: { ...source, ref: "op:wrongpayload" },
+      namespace: { kind: "wallet", id: "WRONGPAYLOAD" },
+      channel: "volume",
+      payload: { event: "trustline_open" },
+    });
+
+    const failure = await observe(composed, wrongPayload, policies).then(
+      () => null,
+      (e: unknown) => e as RefusedObservation,
+    );
+    expect(failure, "a payload from another channel was accepted").not.toBeNull();
+    expect(failure!.code, "the refusal reported the wrong code").toBe("OBSERVATION_INVALID");
+    // The row exists, which is what makes the id available -- the difference
+    // between this and the envelope refusal, whose id is null.
+    expect(failure!.observationId).toMatch(/^[0-9a-f-]{36}$/);
+  }, 30_000);
+});
+
+describe("R28: the audit append's retry obeys the policy it was given", () => {
+  it("retries up to the policy's bound, so a chain that recovers on the fourth try lands", async () => {
+    // A surviving mutant replaced `maxRetries: policies.brief.maxRetries` with a
+    // literal 1. The R24 row cannot tell, because it uses maxRetries 1 itself.
+    //
+    // THE STUB HAS AN ESCAPE HATCH, and that is not decoration: an unbounded-retry
+    // mutant on this branch once HUNG instead of failing, vitest aborted the test
+    // while the promise kept spinning, and three mutation runs were lost.
+    let calls = 0;
+    const flaky: Composed = {
+      ...composed,
+      audit: {
+        ...composed.audit,
+        append: async (entry: Parameters<Composed["audit"]["append"]>[0]) => {
+          calls += 1;
+          if (calls <= 3) throw new Deadlocked("deadlock detected");
+          if (calls > 10) throw new Error("the retry is unbounded");
+          return composed.audit.append(entry);
+        },
+      } as unknown as Composed["audit"],
+    };
+
+    const out = await observe(flaky, payment("op:retry4", "6.0000000", "RETRY4"), {
+      ...policies,
+      brief: { ...BRIEF_POLICY_V0, maxRetries: 3 },
+    });
+    expect(out.folded).toBe(true);
+    expect(calls, "the append was not retried to the policy's bound").toBe(4);
+    const head = await composed.audit.head();
+    expect(head!.canonical).toContain(out.observationId);
+  }, 60_000);
+});
+
+describe("a refresh is computed from the tag's DECAYED strength", () => {
+  it("applies the increment to what the tag decayed to, not to what it was opened at", async () => {
+    // A SURVIVING MUTANT: `decayedStrength: live.g0` -- the refresh decision handed
+    // the tag's undecayed strength. A tag would then never weaken: every refresh
+    // would raise it from its old peak, so a counterparty quiet for a year would
+    // refresh exactly as strongly as one seen yesterday.
+    //
+    // ONLY THE SECOND REFRESH CAN SEE IT, which is why no cheaper row works and
+    // why this one is as long as it is. `refreshTag` takes
+    // `held = max(decayedStrength, freshG0)`, and the fresh weight is a function
+    // of the CHANNEL, not of the observation -- so on a tag's first refresh the
+    // fresh weight is at least the opening strength and dominates either way. Only
+    // once a crossing has raised g0 ABOVE the fresh weight does the decayed value
+    // decide.
+    //
+    // MEASURED, both ways round, with a 60-second half-life and two one-hour gaps:
+    //
+    //   open   g0 0.4837000000000000
+    //   first  g0 0.5567333333333334   (identical under the mutant)
+    //   second g0 0.5776727272727273   <- honest
+    //   second g0 0.6067333333333335   <- the mutant: 0.5567333 + 0.05 exactly
+    //
+    // So the assertion is the RELATION and not a fitted number: the second refresh
+    // must land BELOW the previous strength plus the increment, because the
+    // increment is applied to a decayed value. The mutant lands exactly on it.
+    const quickDecay = {
+      ...policies,
+      calibration: { ...CALIBRATION_V0, halfLifeMs: 60_000 },
+    };
+    const nsName = "DECAYNS";
+    for (let i = 0; i < POLICY_V0.minObservations; i += 1) {
+      await observe(composed, payment(`op:dk${i}`, (10 + i * 0.001).toFixed(7), nsName), quickDecay);
+    }
+    const nsId = await namespaceIdOf(nsName);
+    const g0Now = async (): Promise<number> => {
+      const live = await composed.tags.listLive(nsId);
+      expect(live, "the aspect does not hold exactly one live tag").toHaveLength(1);
+      return live[0]!.g0;
+    };
+
+    // Three escalating crossings: the first opens, the second raises g0 above the
+    // fresh weight, the third is the one that can tell.
+    await observe(composed, payment("op:dkA", "40.0000000", nsName), quickDecay);
+    const opened = await g0Now();
+    clock.advance(60 * 60 * 1000);
+    await observe(composed, payment("op:dkB", "400.0000000", nsName), quickDecay);
+    const afterFirst = await g0Now();
+    clock.advance(60 * 60 * 1000);
+    await observe(composed, payment("op:dkC", "4000.0000000", nsName), quickDecay);
+    const afterSecond = await g0Now();
+    clock.advance(-2 * 60 * 60 * 1000);
+
+    // The fixture really did raise g0 above the fresh weight, which is the
+    // precondition for the assertion below being able to tell anything at all.
+    expect(afterFirst, "the first refresh did not raise g0").toBeGreaterThan(opened);
+    expect((await composed.tags.listLive(nsId))[0]!.refreshCount).toBe(2);
+
+    // THE WITNESS. An hour at a 60-second half-life is sixty halvings, so the
+    // decayed strength is effectively zero and `held` falls back to the fresh
+    // weight; the undecayed path would hold the full previous strength instead.
+    expect(
+      afterSecond,
+      "the refresh was computed from the tag's undecayed strength",
+    ).toBeLessThan(afterFirst + POLICY_V0.refreshIncrement);
+    // And it is strictly below the previous strength plus the increment by a
+    // margin no rounding accounts for.
+    expect(afterFirst + POLICY_V0.refreshIncrement - afterSecond).toBeGreaterThan(0.01);
+  }, 120_000);
+});
+
+describe("R28: an exhausted FOLD retry names the observation it gave up on", () => {
+  it("carries the observation id, not only the label and the attempt count", async () => {
+    // A SURVIVING MUTANT dropped `subject: observationId` from the fold's
+    // `retrying` call. R28 says an exhausted retry records its code AND the
+    // observation id; a refusal that names no observation cannot be acted on.
+    //
+    // DETERMINISTIC, and that is the point. My first attempt read the subject off
+    // whichever of eight contending writers happened to be refused, and with the
+    // policy's tightest bound none of them was -- so the assertion never ran and
+    // the mutant survived a row written for it. A handle whose transaction always
+    // refuses exhausts every time.
+    const alwaysDeadlocked: Composed = {
+      ...composed,
+      handle: {
+        ...composed.handle,
+        transaction: () => ({
+          execute: async () => {
+            throw new Deadlocked("deadlock detected");
+          },
+        }),
+      } as unknown as Composed["handle"],
+    };
+
+    const failure = await observe(
+      alwaysDeadlocked,
+      payment("op:nofold", "9.0000000", "NOFOLD"),
+      { ...policies, brief: { ...BRIEF_POLICY_V0, maxRetries: 2 } },
+    ).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+    expect(failure, "a fold that never committed returned normally").not.toBeNull();
+    expect(failure!.message).toMatch(/^observe gave up after 3 attempts on [0-9a-f-]{36}$/);
+
+    // AND THE FOLD REALLY FOLDED NOTHING -- the plan's clause, which nothing held
+    // either: an exhausted retry leaves the baseline absent, not half-written.
+    const nsId = await namespaceIdOf("NOFOLD");
+    expect(await baselineOf(nsId, "volume", "amount/USDC/in")).toBeNull();
+    expect(await composed.tags.listLive(nsId)).toEqual([]);
+  }, 60_000);
+});
+
+describe("the ingest path's body assertion runs on what the STORE handed back", () => {
+  it("refuses a blank observation id from `append` BEFORE the chain sees it", async () => {
+    // B22 OF TASK 5, AGAIN AND IN THE SAME SHAPE. Deleting `assertObserveBody`
+    // from the ingest path SURVIVED the whole suite, because every field in the
+    // body came from input the path had already refused. The uncovered direction
+    // is what the store hands back: the tag ids are `open`'s own return values,
+    // the namespace id came from a namespace row, and the observation id came from
+    // `append` -- none of the three was validated on the way in.
+    //
+    // The chain is checked afterwards, because "refused" is only the right word if
+    // nothing was written.
+    const before = await composed.audit.head();
+    const blanked: Composed = {
+      ...composed,
+      observations: {
+        ...composed.observations,
+        append: async (w: WireObservation) => {
+          const real = await composed.observations.append(w);
+          // NARROWED, NOT CAST. `AppendResult`'s third arm carries no
+          // `observation` at all, and `pnpm typecheck` caught this while
+          // `pnpm test` was green -- the FIFTH divergence on this branch.
+          if (!("observation" in real)) return real;
+          return { ...real, observation: { ...real.observation, observationId: "   " } };
+        },
+      } as unknown as Composed["observations"],
+    };
+
+    const failure = await observe(
+      blanked,
+      payment("op:blankid", "8.0000000", "BLANKID"),
+      policies,
+    ).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+    expect(failure, "a blank observation id reached the chain").not.toBeNull();
+    expect(failure!.message).toMatch(/auditBody\.observationId must not be blank/);
+
+    const after = await composed.audit.head();
+    expect(after?.seq, "an entry was appended before the body was checked").toBe(before?.seq);
   }, 30_000);
 });

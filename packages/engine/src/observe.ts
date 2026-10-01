@@ -5,6 +5,7 @@ import { compose, type Composed } from "./compose.js";
 import { retrying } from "./availability.js";
 import { AuditEntryMissing } from "./run-brief.js";
 import { compositePolicyVersion } from "./composite-version.js";
+import { assertObserveBody, type ObserveAuditBody } from "./audit-body.js";
 import type { BriefPolicies } from "./brief.js";
 import type { Related } from "./relatedness.js";
 
@@ -213,7 +214,14 @@ export interface ObserveResult {
   readonly intent: IntentReading;
   /** R41: the tags this observation opened OR refreshed. */
   readonly ownTagIds: readonly string[];
-  /** R18/R29: null for a categorical reading and for a cold baseline. */
+  /**
+   * The surprise of the reading a brief would be handed, R18/R29/R79.
+   *
+   * Null for a categorical reading, for a cold baseline, AND for an observation
+   * that derives more than one reading -- where a single scalar would name
+   * neither of them. R46 refuses to brief such an intent; this field agrees with
+   * it rather than answering whichever reading came last.
+   */
   readonly surprise: number | null;
 }
 
@@ -365,7 +373,22 @@ export async function observe(
             const before = contexts.get(result.reading.aspect)?.baseline ?? null;
             await inner.baselines.upsert(result.baseline, before === null ? null : before.count);
           }
-          if (result.verdict !== null && result.verdict.kind === "measured") {
+          // THE INTENT'S READING AND NOT "THE LAST MEASURED ONE", R79. A mutation
+          // audit measured that taking the FIRST measured verdict instead of the
+          // last survived the whole suite, and asking why led somewhere worse than
+          // a missing test: for an observation deriving TWO readings -- a
+          // `cluster_proximity` carrying an amount, which is the dust signal M2
+          // calibrates for -- a single `surprise` scalar names neither of them, and
+          // "last wins" made the answer depend on the order `readObservation`
+          // happens to return. R46 already says such an intent cannot be briefed, so
+          // the honest value is the surprise of the reading a brief would be handed,
+          // and NULL when there is no single such reading.
+          if (
+            readings.intent.briefable &&
+            result.reading.aspect === readings.intent.reading.aspect &&
+            result.verdict !== null &&
+            result.verdict.kind === "measured"
+          ) {
             surprise = result.verdict.surprise;
           }
           // A state past its validity opens no tag, and a refresh of one is likewise
@@ -427,8 +450,15 @@ export async function observe(
       at: at.toISOString(),
       readings: readings.all.length,
       tagIds: folded.ownTagIds,
-    },
+    } satisfies ObserveAuditBody,
   };
+  // CHECKED BEFORE THE APPEND, and the direction that matters is what the STORE
+  // handed back. `tagIds` are `open`'s and `refresh`'s own return values and
+  // `namespaceId` came from a namespace row -- none of the three was validated on
+  // the way in, and a mutation audit measured that dropping any of `at`, `tagIds`
+  // or the count turned nothing red. R25 is enforced here or it is enforced by a
+  // comment.
+  assertObserveBody(entry.body);
   try {
     await retrying(async () => composed.audit.append(entry), {
       maxRetries: policies.brief.maxRetries,

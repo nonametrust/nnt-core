@@ -2293,3 +2293,233 @@ ids name, which is the right lifetime for them and not the chain's.
 
 Both times in this round were casts in a test file that only `tsc` sees. The rule is
 unchanged and it keeps earning its place.
+
+## Task 8b's mutation audit — 83 mutants, 17 survivors, and the largest untested surface on the branch
+
+A second reviewer ran 83 mutants against the ingest path in its own worktree and its own
+database, detached at `e9e3074`. Seventeen SURVIVED the whole suite. Four of its findings
+had already been closed by `b8c1b3c`, which landed after its baseline — and its
+measurements of the one I had already withdrawn are better than mine, so they are
+recorded here rather than paraphrased.
+
+### The R75 withdrawal, corroborated by someone else's measurement
+
+I withdrew R75 on the strength of an order-independence measurement. The audit measured
+the thing I should have measured first: **what the envelope it replaced actually
+detected**. With count-preserving defects planted in `observe.ts` and run against the
+real forty-writer row:
+
+| planted defect | envelope verdict |
+| --- | --- |
+| the 39th writer folds twice, the 40th not at all | **SURVIVED**, three runs |
+| the 40th writer commits mean+1 / +3 / +8 | **SURVIVED**, all three |
+| the 40th writer folds twice its wire amount | **SURVIVED** |
+
+And offline, over 5000 trials per defect: one fold dropped passes 98.9% of the time, one
+doubled 99.5%, drop-one-and-double-another 98.7%, five folds dropped 95.8%, **ten folds
+dropped 87.7%**, the mean shifted by +10 still 60.3%. Only "every fold written as 0" was
+caught. The envelope was 7.5–33.3 wide over 100k shuffles, not the 9.19 I reported — 9.19
+was ascending versus descending alone, and neither extreme is an extreme.
+
+It also measured a **~0.55% false-red rate** per run: a correct forty-fold mean falls
+outside a fresh 200-sample envelope about one run in 180. So the row I shipped was both
+blind to every single-fold defect and weakly flaky by construction. The count was doing
+all of the work, and "a lost fold, a doubled fold, or a retry that re-read without
+rolling back all produce a state no ordering of the forty can produce" was **false of the
+mean**. The in-band fixture in `b8c1b3c` is what makes the plan's own sentence hold.
+
+### My attribution was wrong for the FOURTH time
+
+`aad8557` says "five mutants, each killed by the row naming the rule". Measured:
+
+- **R9's `expectedCount` mutant** is killed only by the R10 forty-writer row — a
+  different rule — and only through `observe gave up after 201 attempts`, retry
+  exhaustion rather than any assertion about a count.
+- **R10's "read outside the transaction" mutant** likewise dies by exhaustion, and its
+  narrower form — the read hoisted out of the transaction but left inside `retrying` —
+  **survives**.
+
+This is the same error I have now made four times on this branch: I write what a row
+holds from what it is called rather than from re-running the mutant. The rule stands and
+I keep breaking it.
+
+### R79. `surprise` is the INTENT reading's, and null when there is no single one
+
+Two mutants survived on this field: taking the FIRST measured verdict instead of the
+last, and `surprise * 2`. The only assertion anywhere was `toBeNull()` on a cold
+baseline.
+
+Asking why the first mutant survived found something worse than a missing test. A
+`cluster_proximity` carrying an amount derives **two** readings — `hops` and `amount` —
+and for such an observation a single `surprise` scalar names neither. "The last measured
+one wins" made the answer depend on the order `readObservation` happens to return its
+readings, which is an implementation detail of another package. R46 already refuses to
+brief a two-reading intent; this field now agrees with it: the surprise of the reading a
+brief would be handed, and **null when there is no single such reading**. Both readings
+are still folded — deleting a channel's signal to enforce a rule about briefs is the
+mistake R71 was written against.
+
+### R80. The ingest entry's audit body is a closed type too
+
+The brief's body has been closed, walked and whitelisted since Task 5. The ingest path
+wrote a **second body into the same chain with no type and no walk**, and four mutants on
+its fields survived the whole suite: `tagIds` dropped, `at` dropped, `aspects` dropped
+(while that field was still there), and `policyVersion` reduced to tagging's version
+alone. Nothing read the body back.
+
+The field that was really there was the dangerous one, which is R77: `aspects` is
+templated from the payload and the schema bounds none of those strings. R77 removed it;
+`ObserveAuditBody`, `ADMITTED_OBSERVE_PATHS` and `assertObserveBody` are what stop it
+coming back, because a sentence does not. The assertion runs on what the **store** handed
+back — the tag ids are `open`'s and `refresh`'s own return values and the namespace id
+came from a namespace row, and none of the three was validated on the way in. That is the
+same direction B22 of Task 5 was found in.
+
+`readings` is admitted as a COUNT and on purpose: it is not one of R25's four, and it is
+admitted on the ground R48 admits the brief's six numbers — without it nothing records
+that an observation derived two readings rather than one, which is what R46 turns on. A
+count is derived from a payload and names nothing in one. That is the line the aspects
+crossed.
+
+### R81. "Every read is inside the transaction" is held by a PROXY, not by a commit order
+
+`observe`'s docstring claims every read is inside the transaction so the retry re-runs
+them. The audit measured that only the second half was held: the baseline read moved
+outside the transaction but kept inside `retrying` survived the whole suite.
+
+The witness is a `Proxy` over the composition whose `get` trap throws for `baselines` and
+`tags`. The fold composes again onto `trx`, so its repositories are the inner ones and
+the outer object must simply never be touched — observable with no arrangement of commits
+at all. It also retires a mutant that previously "died" only by **deadlocking the pool**:
+replacing `compose(trx, …)` with the outer composition left all ten backends
+idle-in-transaction and took 340 seconds to fail on vitest's own timeouts. It now fails in
+milliseconds, and the same row covers "the fold outside, the tag inside" for free.
+
+A control row asserts the trap fires and that it lets through exactly what the ingest
+path legitimately needs, so this is not a green over a composition nothing was checking.
+
+### Three of my own fixtures were wrong, and each was worth keeping
+
+- **`maxRetries: 0`** is refused by `BRIEF_POLICY_V0` — `must be a positive integer` — so
+  my first R9 row had all eight writers failing for a reason that had nothing to do with
+  R9. The row uses the tightest bound the policy admits.
+- **A tag is dated at its EVIDENCE, not at the clock.** I asserted the refreshed tag's
+  `taggedAt` was the clock's instant; it is the observation's `observedAt`. That is R19
+  and it is correct behaviour — it is what makes a backfilled observation decay from when
+  it happened — so the row now pins it rather than working around it.
+- **`append` refuses a mismatched idempotency key itself** (`observation.ts:198`), as a
+  `StoreError` carrying no code. The real gap between the two validations is the
+  **payload**: the envelope types it as `z.record(z.string(), z.unknown())`, so any
+  object passes `append`, and `validateObservation` is the only thing that checks it
+  against its channel's schema. A `volume` observation carrying a `protocol` payload is
+  stored and then refused — which is the case R21 is about, and which no row had driven.
+
+### R82. A refresh is computed from the tag's DECAYED strength, and only the SECOND one can see it
+
+`decayedStrength: live.g0` survived. Under it a tag would never weaken: every refresh
+would raise it from its old peak, so a counterparty quiet for a year would refresh
+exactly as strongly as one seen yesterday.
+
+**Why no cheap row holds it.** `refreshTag` takes `held = max(decayedStrength, freshG0)`,
+and `channelWeight` is a function of the CHANNEL alone — not of the observation. So on a
+tag's first refresh the fresh weight is at least the opening strength and dominates
+whichever number is passed. Only once a crossing has raised `g0` above the fresh weight
+does the decayed value decide, so the witness needs three crossings. Categorical channels
+cannot provide one at all: `crossed` is false for them, so their `g0` never rises above
+the weight.
+
+Measured both ways, 60-second half-life, two one-hour gaps:
+
+| | honest | mutant |
+| --- | --- | --- |
+| open | 0.4837000000000000 | same |
+| first refresh | 0.5567333333333334 | same |
+| second refresh | **0.5776727272727273** | **0.6067333333333335** |
+
+The mutant's value is the previous strength plus `refreshIncrement` exactly. So the
+assertion is the RELATION and not a fitted literal: the second refresh must land strictly
+below `previous + increment`, because the increment is applied to a decayed value. A
+fitted number would have held this no better and would re-fit on every calibration
+change.
+
+### Two subjects, two different claims, and I had conflated them
+
+`subject: observationId` was dropped from BOTH `retrying` calls and both survived.
+
+- **The fold's.** My first row read the subject off whichever of eight contending writers
+  happened to be refused — and at the policy's tightest bound none of them was, so the
+  assertion never ran and the mutant survived a row written for it. A handle whose
+  transaction always refuses exhausts every time; the row now also holds the plan's
+  untested clause that **an exhausted retry folds nothing** — no baseline, no tag.
+- **The audit's.** The R24 row asserted the stderr line's observation id. That line is
+  written by hand a few lines further down in the same function, so it was never evidence
+  about the retry's subject. The row now asserts the named inconsistency's own `cause`.
+
+### A check nothing could distinguish from its neighbour
+
+Removing the presence loop from `assertObserveBody` survived — every field has a type
+check that refuses `undefined` anyway, so the loop was unreachable as a distinct failure.
+The loose assertion I had written (`is missing` OR `must …`) was what hid it. The two
+messages carry different information — whether the producer omitted a field or sent a
+wrong value — so the row now requires the word MISSING, which makes the loop load-bearing
+rather than deleting it.
+
+### The call site, not the function: B22 in the same shape
+
+Deleting `assertObserveBody(entry.body)` from the ingest path survived the whole suite
+even with all 24 unit rows green, for exactly B22's reason: every field in the body came
+from input the path had already refused. The uncovered direction is **what the store hands
+back** — the tag ids are `open`'s own return values, the namespace id came from a
+namespace row, the observation id came from `append`, and none of the three was validated
+on the way in. The row stubs `append` to hand back a blank id and then checks the chain
+head is unchanged, because "refused" is only the right word if nothing was written.
+
+Note also that `satisfies ObserveAuditBody` makes a DROPPED field a compile error, which
+is a second gate — but only `pnpm typecheck` sees it. `pnpm test` runs through esbuild,
+which strips types, so the runtime assertion is what holds it under `pnpm test` alone.
+Both mutants for the dropped fields had to be written as casts to stay compilable.
+
+### The measured result: 24 mutants, 24 dead, one control alive
+
+Re-run at this head after the rows above:
+
+| mutant | killed by |
+| --- | --- |
+| the fold's baseline read on the OUTER composition | the Proxy row |
+| the OUTER composition used inside the transaction | the Proxy row (was: a 340s pool deadlock) |
+| every tag open and refresh skipped | three rows |
+| `holdsAt` ignored / inverted | the state row, both directions |
+| the OPEN branch skipped / the REFRESH branch skipped | the state row / the refresh row |
+| either `ownTagIds.push` removed | the state row / the refresh row |
+| the intent-aspect match dropped | the two-reading row (R79) |
+| the surprise doubled | the warm-surprise row |
+| the refresh given an undecayed strength | the decay row (R82) |
+| a baseline matched on the channel only | the two-asset row |
+| the refusal code hard-coded | the wrong-payload row |
+| `tagIds` / `at` dropped from the body | the body read-back row |
+| `at` from a fresh `Date` | the body read-back row (was: a source scan only) |
+| `policyVersion` reduced to tagging's | the four-version row |
+| either retry's subject dropped | the exhausted-fold row / the R24 row |
+| the audit retry bound fixed at 1 | the recovering-chain row |
+| `assertObserveBody` deleted from the path | the blank-id row |
+| the body's whitelist walk / presence loop removed | two unit rows |
+
+And a control — `subject: observationId + ""`, which changes nothing observable —
+**SURVIVED**, so the harness is not simply red for any edit to this file.
+
+### `pnpm test` and `pnpm typecheck` diverged a FIFTH time
+
+`AppendResult`'s third arm carries no `observation` field at all, and a stub spreading
+`real.observation` typechecked nowhere while the whole suite was green. Narrowed with an
+`in` check rather than cast. Five for five: the rule has never once failed to earn its
+place on this branch.
+
+### Confirmed by the audit, not changed
+
+The audit re-ran 32 earlier-task mutants at this head and all 32 died at rows naming
+their rule. It also confirmed two counts this ledger had already corrected against
+commit messages that were wrong: removing `assertAuditBody` from the brief core turns
+exactly **two** rows red, and the old `e.name` discriminator turns **eight** red. The
+suite was also run under `TZ=America/St_Johns` and with the database's own session
+timezone set to `Pacific/Kiritimati` — green both times, `ALTER DATABASE` verified to
+have taken on a fresh connection before the run rather than assumed.

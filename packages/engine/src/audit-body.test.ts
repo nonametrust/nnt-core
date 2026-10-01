@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
+  ADMITTED_OBSERVE_PATHS,
   ADMITTED_PATHS,
   assertAuditBody,
+  assertObserveBody,
   auditBodyPaths,
   type BriefAuditBody,
+  type ObserveAuditBody,
 } from "./audit-body.js";
 
 // R25 and R48: the audit body is a CLOSED type and the runtime check is a
@@ -294,6 +297,184 @@ describe("the audit body", () => {
 
     it("treats a null as a leaf rather than walking into it", () => {
       expect([...auditBodyPaths({ ...BODY, triggerId: null })]).toContain("triggerId");
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The OBSERVE entry's body, R25 again -- and this half existed with no closed
+// type at all until a mutation audit measured what that cost.
+//
+// WHAT THE AUDIT MEASURED. Four separate mutants on the ingest path's body
+// survived the entire suite: `aspects` dropped, `tagIds` dropped, `at` dropped,
+// and `policyVersion` reduced to tagging's version alone. Nothing read the body
+// back and nothing typed it, so every field in a hash-chained row that outlives
+// every key was held by the sentence next to it and by nothing else.
+//
+// And the direction that matters was already proven dangerous: `aspects` DID
+// reach the chain carrying a 56-character address-shaped `assetCode`, because an
+// aspect is templated from the payload and the schema bounds none of those
+// strings. The brief's body has refused a payload field since Task 5. The
+// ingest path's body was writing one.
+// ---------------------------------------------------------------------------
+
+const OBSERVE_BODY: ObserveAuditBody = {
+  observationId: "e3a1c6de-0000-4000-8000-000000000011",
+  namespaceId: "e3a1c6de-0000-4000-8000-000000000012",
+  at: "2026-09-21T00:00:00.000Z",
+  readings: 2,
+  tagIds: ["e3a1c6de-0000-4000-8000-000000000013"],
+};
+
+const observePlus = (patch: Record<string, unknown>): ObserveAuditBody =>
+  ({ ...OBSERVE_BODY, ...patch }) as unknown as ObserveAuditBody;
+
+describe("the observe entry's audit body", () => {
+  it("admits the shipped shape", () => {
+    expect(() => assertObserveBody(OBSERVE_BODY)).not.toThrow();
+  });
+
+  it("admits an observation that opened no tag, which is the commonest ingest", () => {
+    // A cold namespace's first observation opens nothing (R29). An empty array is
+    // the honest answer and must not read as a missing field.
+    expect(() => assertObserveBody({ ...OBSERVE_BODY, tagIds: [] })).not.toThrow();
+  });
+
+  describe("refuses a key the whitelist does not name", () => {
+    it("named `aspects` -- the one this body really carried", () => {
+      // Not a hypothetical. `aspects` was in the shipped body and an aspect is
+      // `amount/${assetCode}/${direction}`, so the whole of a payload field
+      // reached the canonical form. This is the regression test for that removal:
+      // R77 took the field out, and without this row nothing stops it returning.
+      expect(() => assertObserveBody(observePlus({ aspects: ["amount/USDC/in"] }))).toThrow(
+        /aspects is not admitted/,
+      );
+    });
+
+    it("named `payload`", () => {
+      expect(() => assertObserveBody(observePlus({ payload: { amount: "10" } }))).toThrow(
+        /payload is not admitted/,
+      );
+    });
+
+    it("named `source` -- the WIRE source's name, which no body may carry (G13)", () => {
+      expect(() => assertObserveBody(observePlus({ source: { ref: "op:0" } }))).toThrow(
+        /source is not admitted/,
+      );
+    });
+
+    it("NESTED under a key of its own, which a top-level name check would pass", () => {
+      expect(() =>
+        assertObserveBody(observePlus({ evidence: { ref: "tx/deadbeef" } })),
+      ).toThrow(/evidence is not admitted/);
+    });
+
+    it("inside the tag id ARRAY, where an object would carry whatever it liked", () => {
+      expect(() =>
+        assertObserveBody(observePlus({ tagIds: [{ tagId: "x", aspect: "amount/USDC/in" }] })),
+      ).toThrow(/tagIds\[\]\.(tagId|aspect) is not admitted/);
+    });
+
+    it("SPELLED like an admitted path, which is how a whitelist of joined strings is fooled", () => {
+      // The same bypass the brief's body pays for: `.`, `[` and `]` are legal in a
+      // JSON key, so a key literally named `tagIds[]` renders an admitted-looking
+      // path while the real field is read elsewhere.
+      expect(() =>
+        assertObserveBody(observePlus({ "tagIds[]": "G".repeat(56) })),
+      ).toThrow(/contains path punctuation/);
+    });
+  });
+
+  describe("refuses a value the admitted type does not allow", () => {
+    it("a Date where an instant must already be a string", () => {
+      // A `Date` renders as an ISO string, so the path walk alone reads it as
+      // admitted -- which is why the field checks exist as well.
+      expect(() => assertObserveBody(observePlus({ at: new Date("2026-09-21") }))).toThrow(
+        /at must be an ISO instant/,
+      );
+    });
+
+    it("an instant that is a string but not an instant", () => {
+      expect(() => assertObserveBody(observePlus({ at: "2026-09-21" }))).toThrow(
+        /at must be an ISO instant/,
+      );
+    });
+
+    it("a blank observation id, which is an id nothing can be traced by", () => {
+      expect(() => assertObserveBody(observePlus({ observationId: "  " }))).toThrow(
+        /observationId must not be blank/,
+      );
+    });
+
+    it("a blank namespace id", () => {
+      expect(() => assertObserveBody(observePlus({ namespaceId: "" }))).toThrow(
+        /namespaceId must not be blank/,
+      );
+    });
+
+    it("a reading count that is not a positive integer, in both directions", () => {
+      // Every channel produces at least one reading, so zero is not a count this
+      // path can honestly write; and a fraction is not a count at all.
+      expect(() => assertObserveBody(observePlus({ readings: 0 }))).toThrow(
+        /readings must be a positive integer/,
+      );
+      expect(() => assertObserveBody(observePlus({ readings: 1.5 }))).toThrow(
+        /readings must be a positive integer/,
+      );
+      expect(() => assertObserveBody(observePlus({ readings: Number.NaN }))).toThrow(
+        /readings must be a positive integer/,
+      );
+    });
+
+    it("a tag id list that is not a list", () => {
+      expect(() => assertObserveBody(observePlus({ tagIds: "one-tag" }))).toThrow(
+        /tagIds must be an array/,
+      );
+    });
+
+    it("a blank tag id INSIDE the list, not only a blank one at the top", () => {
+      expect(() => assertObserveBody(observePlus({ tagIds: ["ok", " "] }))).toThrow(
+        /tagIds\[\] must not be blank/,
+      );
+    });
+
+    it("a missing key entirely, SAID to be missing and not merely malformed", () => {
+      // THE MESSAGE IS THE ASSERTION, and the loose version of this row is why.
+      // It accepted `${key} is missing` OR `${key} must ...`, and every field here
+      // has a type check that refuses `undefined` anyway -- so deleting the
+      // presence loop entirely SURVIVED, and the loop was code no test could
+      // distinguish from its neighbour. The two messages carry different
+      // information: whether the producer omitted the field or sent a wrong value.
+      for (const key of ["observationId", "namespaceId", "at", "readings", "tagIds"] as const) {
+        const { [key]: _dropped, ...rest } = OBSERVE_BODY;
+        expect(() => assertObserveBody(rest as unknown as ObserveAuditBody), key).toThrow(
+          new RegExp(`auditBody\\.${key} is missing`),
+        );
+      }
+    });
+  });
+
+  describe("the whitelist itself", () => {
+    it("is exactly the set of paths the shipped body produces, with no dead entry", () => {
+      expect([...auditBodyPaths(OBSERVE_BODY)].sort()).toEqual([...ADMITTED_OBSERVE_PATHS].sort());
+    });
+
+    it("names no key an aspect, a channel or a payload field would travel under", () => {
+      // `aspects` is first in this list because it is the one that was really
+      // there. The others are the shapes the same mistake would take next.
+      for (const forbidden of ["aspects", "aspect", "channel", "payload", "source", "ref", "evidence", "amount", "assetCode"]) {
+        expect([...ADMITTED_OBSERVE_PATHS].some((p) => p.split(".").includes(forbidden)), forbidden).toBe(
+          false,
+        );
+      }
+    });
+
+    it("carries the reading COUNT and not the readings, which is the whole of R25 here", () => {
+      // A count is not derived from a payload and names nothing in one. The
+      // readings themselves are each an aspect, and an aspect is a payload field
+      // in a string.
+      expect(ADMITTED_OBSERVE_PATHS.has("readings")).toBe(true);
+      expect(typeof OBSERVE_BODY.readings).toBe("number");
     });
   });
 });
