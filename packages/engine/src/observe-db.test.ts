@@ -572,12 +572,14 @@ describe("R10: every read the fold makes is on the TRANSACTION's connection", ()
     // observation exercises `findLive` and `open`, the second `findLive` and
     // `refresh`. Both go through the guarded composition.
     const reached: string[] = [];
+    let handleReads = 0;
     const guarded = new Proxy(composed, {
       get(target, key, receiver): unknown {
         if (key === "baselines" || key === "tags") {
           reached.push(String(key));
           throw new Error(`observe reached composed.${String(key)} outside the transaction`);
         }
+        if (key === "handle") handleReads += 1;
         return Reflect.get(target, key, receiver) as unknown;
       },
     }) as Composed;
@@ -598,6 +600,16 @@ describe("R10: every read the fold makes is on the TRANSACTION's connection", ()
     expect(refreshed.ownTagIds, "the guarded ingest refreshed no tag").toEqual(opened.ownTagIds);
 
     expect(reached, "a tag was written on the outer connection").toEqual([]);
+
+    // AND `handle` IS TOUCHED EXACTLY TWICE -- once per `observe` call, for the one
+    // `transaction()`. A review found the hole this closes: the guard traps the
+    // IDENTIFIERS `composed.baselines` and `composed.tags`, so a nested
+    // `compose(composed.handle, ...)` built inside the transaction reads on the
+    // outer connection while touching neither name, and the control row below
+    // positively asserts that `handle` passes. Counting it is what turns the
+    // guard from a rule about spelling into a rule about the connection: a second
+    // composition needs a second `handle` read.
+    expect(handleReads, "the ingest path reached for the handle more than once per call").toBe(2);
     const nsId = await namespaceIdOf("PROXYTAGS");
     const live = await composed.tags.listLive(nsId);
     expect(live).toHaveLength(1);
@@ -652,14 +664,13 @@ describe("the ingest entry's audit body, read BACK out of the chain", () => {
     const nsId = await namespaceIdOf("BODYBACK");
 
     // EXACTLY these keys. A sixth would be a field nothing refused.
-    expect(Object.keys(body).sort()).toEqual(["at", "namespaceId", "observationId", "readings", "tagIds"]);
+    expect(Object.keys(body).sort()).toEqual(["at", "namespaceId", "observationId", "tagIds"]);
     expect(body["observationId"]).toBe(out.observationId);
     expect(body["namespaceId"]).toBe(nsId);
     // THE COMPOSITION CLOCK'S INSTANT, by value. `at` was held only by
     // `clock-gate.test.ts`, a source scan: swapping it for `new Date()` changed
     // the row and no behavioural test noticed.
     expect(body["at"]).toBe(AT.toISOString());
-    expect(body["readings"]).toBe(1);
     expect(body["tagIds"]).toEqual(out.ownTagIds);
   }, 30_000);
 
@@ -691,7 +702,6 @@ describe("the ingest entry's audit body, read BACK out of the chain", () => {
         observationId: "obs-1",
         namespaceId: "ns-1",
         at: AT.toISOString(),
-        readings: 1,
         tagIds: ["tag-1"],
       }),
     ).not.toThrow();
@@ -700,7 +710,6 @@ describe("the ingest entry's audit body, read BACK out of the chain", () => {
         observationId: "obs-1",
         namespaceId: "ns-1",
         at: AT.toISOString(),
-        readings: 1,
         tagIds: [" "],
       }),
     ).toThrow(/tagIds\[\] must not be blank/);
@@ -1349,6 +1358,128 @@ describe("R28: the refusal recording's retry obeys the policy too", () => {
   }, 60_000);
 });
 
+describe("R28: a retry bound is a bound in BOTH directions", () => {
+  it("gives up at the policy's bound rather than retrying past it", async () => {
+    // A SURVIVING MUTANT: `maxRetries: 50` hard-coded in the refusal recorder.
+    // The row above asserts the append is retried to FOUR attempts under a policy
+    // of three -- which a bound of fifty satisfies just as well, because the stub
+    // recovers on the fourth call. The row could tell "too few" and not "too
+    // many", and "too many" is the direction R28 exists for: an unbounded retry
+    // is the denial of service on ourselves that the ruling names.
+    //
+    // A chain that NEVER recovers is what separates them: at a bound of one the
+    // append must be attempted exactly twice and then abandoned.
+    let calls = 0;
+    const neverRecovers: Composed = {
+      ...composed,
+      audit: {
+        ...composed.audit,
+        append: async () => {
+          calls += 1;
+          if (calls > 10) throw new Error("the retry is unbounded");
+          throw new Deadlocked("deadlock detected");
+        },
+      } as unknown as Composed["audit"],
+    };
+
+    const lines: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string): boolean => {
+      lines.push(String(chunk));
+      return true;
+    };
+    let failure: RefusedObservation | null = null;
+    try {
+      failure = await observe(
+        neverRecovers,
+        payment("op:upperbound", "9".repeat(309), "UPPERBOUND"),
+        { ...policies, brief: { ...BRIEF_POLICY_V0, maxRetries: 1 } },
+      ).then(
+        () => null,
+        (e: unknown) => e as RefusedObservation,
+      );
+    } finally {
+      (process.stderr as { write: unknown }).write = realWrite;
+    }
+
+    // The refusal still reaches the caller, and the recording gave up where the
+    // policy said to: one retry means two attempts, not fifty.
+    expect(failure!.code).toBe("OBSERVATION_UNREADABLE");
+    expect(calls, "the refusal's append ignored the policy's bound upward").toBe(2);
+    expect(
+      lines.some((l) => l.includes("engine.observe.refusal_unrecorded")),
+      "an abandoned refusal recording was reported nowhere",
+    ).toBe(true);
+  }, 60_000);
+});
+
+describe("R28: an exhausted FOLD is RECORDED, not only thrown", () => {
+  it("writes a structured line naming the observation whose fold was abandoned", async () => {
+    // R28 reads "an exhausted retry RECORDS its code and the observation id". A
+    // review measured that this path recorded nothing at all: the audit-append
+    // exhaustion and the refusal-recording exhaustion each write a structured
+    // line, and the FOLD's exhaustion -- the one the ruling is literally about,
+    // "and the observation is not folded" -- wrote none, so the fact lived only
+    // in a thrown object.
+    const alwaysDeadlocked: Composed = {
+      ...composed,
+      handle: {
+        ...composed.handle,
+        transaction: () => ({
+          execute: async () => {
+            throw new Deadlocked("deadlock detected");
+          },
+        }),
+      } as unknown as Composed["handle"],
+    };
+
+    const lines: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: unknown }).write = (chunk: string): boolean => {
+      lines.push(String(chunk));
+      return true;
+    };
+    let failure: Error | null = null;
+    try {
+      failure = await observe(
+        alwaysDeadlocked,
+        payment("op:foldrec", "4.0000000", "FOLDREC"),
+        { ...policies, brief: { ...BRIEF_POLICY_V0, maxRetries: 1 } },
+      ).then(
+        () => null,
+        (e: unknown) => e as Error,
+      );
+    } finally {
+      (process.stderr as { write: unknown }).write = realWrite;
+    }
+    expect(failure, "a fold that never committed returned normally").not.toBeNull();
+
+    const reported = lines
+      .map((l) => {
+        try {
+          return JSON.parse(l) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .filter((l): l is Record<string, unknown> => l !== null);
+    const line = reported.find((l) => l["event"] === "engine.observe.fold_abandoned");
+    expect(line, "an abandoned fold was recorded nowhere").toBeDefined();
+    expect(line!["code"]).toBe("FOLD_ABANDONED");
+    expect(line!["observationId"]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(line!["at"]).toBe(AT.toISOString());
+    // R21 even here: a code and ids, never the message.
+    expect(Object.keys(line!)).not.toContain("message");
+
+    // AND THE CHAIN WAS NOT USED FOR IT, deliberately: the commonest cause of an
+    // abandoned fold is the store being unavailable, which is the condition R7
+    // answers with a line rather than a row -- and a row here would be one per
+    // DELIVERY, which is the amplification R83 had to be corrected for once.
+    const nsId = await namespaceIdOf("FOLDREC");
+    expect(await baselineOf(nsId, "volume", "amount/USDC/in")).toBeNull();
+  }, 60_000);
+});
+
 describe("R10: a concurrent REFRESH of one tag rolls back and the retry lands exactly one", () => {
   it("leaves one live tag whose refresh count is the number of observations that folded", async () => {
     // THE PLAN'S CLAUSE, AND NOTHING HELD IT. The R10 forty-writer row holds the
@@ -1392,4 +1523,131 @@ describe("R10: a concurrent REFRESH of one tag rolls back and the retry lands ex
     // And every writer named the tag it refreshed, so none of them folded silently.
     for (const r of results) expect(r.ownTagIds).toEqual([live[0]!.tagId]);
   }, 120_000);
+});
+
+describe("R83 CORRECTED: a re-delivered refusal is recorded ONCE, not once per delivery", () => {
+  it("writes exactly one chain entry however many times the same refusal is re-sent", async () => {
+    // THE AMPLIFICATION R83 CLAIMED TO AVOID, OPEN AT THE SITE R83 CHOSE TO
+    // RECORD. Two independent reviews measured it and the store says it in so
+    // many words (`observation.ts`, the producer-cap transaction): "the pre-read
+    // is deliberately OUTSIDE this transaction: a re-delivery has already
+    // returned by now, so the indexer's retry never consumes a slot."
+    //
+    // So "bounded by the producer cap" was false. `append` answers
+    // `{created:false}` for a repeat without charging the cap, `readingsOf` runs
+    // before the re-delivery branch, the payload fails again, and the refusal was
+    // recorded again -- ONE accepted observation buying N permanent rows in the
+    // one table retention cannot reach, at whatever rate a producer re-sends.
+    //
+    // Worse than a missing bound: the HONEST path writes no entry on a
+    // re-delivery at all, so chain growth used to be cap-bounded and this
+    // introduced the only unbounded path into it.
+    //
+    // The fix is the first delivery, which is the one the cap charged for. This
+    // row is the regression test against the behaviour it replaced: measured at
+    // five deliveries it wrote FIVE entries before the fix.
+    const huge = "9".repeat(309);
+    const observation = payment("op:reamplify", huge, "REAMPLIFY");
+
+    const first = await observe(composed, observation, policies).then(
+      () => null,
+      (e: unknown) => e as RefusedObservation,
+    );
+    expect(first!.code).toBe("OBSERVATION_UNREADABLE");
+    const afterFirst = await composed.audit.head();
+    expect(afterFirst!.kind, "the first delivery recorded nothing").toBe("observe_refused");
+
+    // Four more deliveries of the SAME wire observation, unchanged.
+    for (let i = 0; i < 4; i += 1) {
+      const again = await observe(composed, observation, policies).then(
+        () => null,
+        (e: unknown) => e as RefusedObservation,
+      );
+      // Still refused, and still by its code and its id: the caller is not left
+      // to infer that a re-delivery of an unreadable observation was fine.
+      expect(again, `delivery ${i + 2} was accepted`).not.toBeNull();
+      expect(again!.code).toBe("OBSERVATION_UNREADABLE");
+      expect(again!.observationId, "a re-delivery was given a new id").toBe(first!.observationId);
+    }
+
+    const afterFive = await composed.audit.head();
+    expect(
+      Number(afterFive!.seq) - Number(afterFirst!.seq),
+      "a re-delivery wrote another permanent row into the chain",
+    ).toBe(0);
+  }, 60_000);
+
+  it("and an erased namespace's re-delivery records nothing either", async () => {
+    // The third `append` arm. A reviewer measured three more rows here: the
+    // refusal is re-derived from the WIRE, which is still in hand after the
+    // namespace key is gone, so an erased counterparty's observation id was
+    // being written into a row that outlives the key by design.
+    const observation = payment("op:eraseamp", "9".repeat(309), "ERASEAMP");
+    await observe(composed, observation, policies).catch(() => undefined);
+    const nsId = await namespaceIdOf("ERASEAMP");
+    await composed.namespaces.shred(nsId);
+    const before = await composed.audit.head();
+
+    for (let i = 0; i < 3; i += 1) {
+      await observe(composed, observation, policies).catch(() => undefined);
+    }
+    const after = await composed.audit.head();
+    expect(
+      Number(after!.seq) - Number(before!.seq),
+      "an erased namespace's re-delivery was recorded",
+    ).toBe(0);
+  }, 60_000);
+});
+
+describe("R10: a stale tag refresh rolls the FOLD back with it", () => {
+  it("leaves the baseline count and the refresh count agreeing, under contention", async () => {
+    // THE CLAUSE'S FIRST HALF, WHICH HAD NO WITNESS. A review found that the
+    // concurrent-refresh row above uses `protocol`, and tagging's own docstrings
+    // say a CATEGORICAL reading has no baseline -- `result.baseline` is null, so
+    // `inner.baselines.upsert` is never reached and there is no fold in that
+    // transaction to roll back. The row held "the retry lands exactly one
+    // refresh" and nothing about the fold.
+    //
+    // A continuous channel with a warm baseline is the witness the plan means:
+    // every writer both folds AND refreshes, in one transaction, so the two
+    // counts must agree. A tag refresh that rolled back while its fold committed
+    // would leave the baseline ahead of the refresh count -- which is R10's
+    // "committed fold with no tag" seen from the other end.
+    const nsName = "FOLDROLL";
+    const warm = POLICY_V0.minObservations;
+    for (let i = 0; i < warm; i += 1) {
+      await observe(composed, payment(`op:fr${i}`, (10 + i * 0.001).toFixed(7), nsName), policies);
+    }
+    // One big crossing to OPEN the tag, so every concurrent writer refreshes
+    // rather than racing to open.
+    const opened = await observe(composed, payment("op:frOpen", "4000.0000000", nsName), policies);
+    expect(opened.ownTagIds, "the opening crossing opened no tag").toHaveLength(1);
+
+    const nsId = await namespaceIdOf(nsName);
+    const writers = 4;
+    const contended = { ...policies, brief: { ...BRIEF_POLICY_V0, maxRetries: 60 } };
+    const results = await Promise.all(
+      Array.from({ length: writers }, (_, i) =>
+        observe(composed, payment(`op:frC${i}`, "9000.0000000", nsName), contended),
+      ),
+    );
+    expect(results.filter((r) => r.folded).length).toBe(writers);
+
+    const baseline = await baselineOf(nsId, "volume", "amount/USDC/in");
+    const live = await composed.tags.listLive(nsId);
+
+    // EVERY FOLD LANDED EXACTLY ONCE.
+    expect(baseline!.count, "a fold was lost or doubled under contention").toBe(
+      warm + 1 + writers,
+    );
+    // AND EVERY REFRESH LANDED EXACTLY ONCE, on the one tag.
+    expect(live, "a concurrent refresh opened a second tag for the pair").toHaveLength(1);
+    expect(live[0]!.tagId).toBe(opened.ownTagIds[0]);
+    expect(
+      live[0]!.refreshCount,
+      "the fold and the tag write disagree, so one rolled back without the other",
+    ).toBe(writers);
+    // Each writer named the tag it refreshed, so none folded silently.
+    for (const r of results) expect(r.ownTagIds).toEqual([live[0]!.tagId]);
+  }, 180_000);
 });

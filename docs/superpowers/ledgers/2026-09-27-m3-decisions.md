@@ -2653,3 +2653,127 @@ has no observation id to write. My attempt to mutate it produced a no-op, which 
 right answer — the API makes the defect inexpressible. Better than a test, and worth
 naming so nobody later "improves" `TagRefresh` by adding the field.
 
+## The review of Tasks 8b and 9, and R83 was the worst ruling I have made on this branch
+
+Two reviewers, each in its own worktree and database, detached at `564e2fa`. They
+converged independently on the same most-severe finding, and it was mine.
+
+### R83 IS CORRECTED. The site it chose to record was the UNBOUNDED one
+
+R83 argued that a refusal with a stored row may be recorded in the chain because "that
+row had to be accepted first, so its rate is already bounded by the producer cap", and
+that the envelope refusal must not be recorded because doing so would be an amplification
+vector into the one table retention cannot reach.
+
+**The premise is false, and the function I relied on says so in a comment.**
+`ObservationRepository.append` answers `{created:false}` for a re-delivery from a
+skeleton pre-read taken *outside* the cap transaction, deliberately: *"the pre-read is
+deliberately OUTSIDE this transaction: a re-delivery has already returned by now, so the
+indexer's retry never consumes a slot."* And `readingsOf` runs before the
+`!appended.created` branch, so a re-delivered unreadable observation was re-refused and
+**re-recorded** every time.
+
+Measured, by both reviewers and then by me: the same 309-digit-amount observation
+delivered five times wrote **five** permanent hash-chained rows against one cap slot;
+after `shred`, three more. One accepted observation buys unbounded `audit_entry` growth
+at whatever rate a producer re-sends, with no per-producer bound at all.
+
+**And it was worse than an unbounded path.** The honest path writes no chain entry on a
+re-delivery, so chain growth *was* cap-bounded, and the commit that claimed to be avoiding
+an amplification vector introduced the only one into `audit_entry` — already named in this
+project's own memory as an unbounded table.
+
+The fix is one condition: `if (appended.created)`. The refusal is still thrown on every
+delivery, so no caller is misled; only the recording happens once, on the delivery the cap
+charged for. That makes R83's asserted bound real. Two regression rows hold it — five
+deliveries, and three after erasure — and removing the gate turns both red.
+
+The residual exposure is the cap itself: 10,000,000 rows/day keyed on a free-text producer
+name, which `errors.ts` already says "is not a defence against an attacker". That is the
+pre-existing open gap and this round no longer adds to it.
+
+### R82's REASON was wrong, and it is R75's mistake a second time
+
+The ledger said "`channelWeight` is a function of the CHANNEL alone, so on a tag's first
+refresh the fresh weight is at least the opening strength and dominates". Measured: the
+value handed to `refreshTag` is `calibrateG0(verdict.surprise, uncertaintyOf(count),
+weight, policy)` — `weight × (1 − uncertainty) × (1 − e^(−|surprise|/τ))`. It depends on
+the SURPRISE and the baseline count, not on the channel.
+
+So "only the SECOND refresh can see it" is not a property of the arithmetic. It is a
+property of **my fixture**, which used three escalating large surprises; a first refresh
+at a barely-crossing surprise would let the decayed value decide. **This is exactly the
+error R75 was withdrawn for** — attributing a fixture's behaviour to the mechanism — and I
+made it again four commits later. The row still kills the mutant it was written for; the
+explanation beside it was false and is replaced.
+
+A reviewer also notes the row holds "not undecayed" and not "decayed at the policy's
+half-life": `decayedStrength: 0` or a 1 ms half-life would satisfy it, because an hour at a
+60-second half-life is already ~0. Recorded as a known limit of that row.
+
+### Three more things the reviews found, each fixed with a row
+
+- **R28's exhausted FOLD recorded nothing.** The audit-append exhaustion and the
+  refusal-recording exhaustion each write a structured stderr line; the fold's — the one
+  the ruling is literally about — wrote none, so the fact lived only in a thrown object.
+  It now writes `FOLD_ABANDONED`. Stderr and not the chain, for two reasons that agree:
+  the commonest cause is the store being unavailable, which is what R7 answers with a
+  line; and a row here would be one per DELIVERY, which is the mistake above.
+- **A retry bound was a bound in one direction only.** `maxRetries: 50` hard-coded in the
+  refusal recorder SURVIVED: the row asserted four attempts under a policy of three, which
+  fifty also satisfies because the stub recovers on the fourth call. "Too many" is the
+  direction R28 exists for. A chain that never recovers separates them.
+- **The Proxy held a SPELLING.** It traps `composed.baselines` and `composed.tags`, so a
+  nested `compose(composed.handle, …)` inside the transaction reads on the outer connection
+  while touching neither name — and the control row positively asserted that `handle`
+  passes. The guard now COUNTS `handle` reads and requires exactly one per call, which a
+  second composition cannot satisfy. The nested-composition mutant dies there now.
+
+### R80 loses the reading COUNT, because my defence of it was false
+
+`readings` is removed from the ingest body. A count of 2 is reachable only for a
+`cluster_proximity` carrying an `amount` (R70: no other channel can produce two), so
+`readings: 2` names the channel AND says a dust amount was in the payload — one bit about
+a payload's keys, in a row that outlives every key. The ledger's defence, "a count is
+derived from a payload and names nothing in one", was simply false of that count. Nothing
+read it, and the reading count lives on the observation row for as long as that row does.
+
+### "A TagRefreshStale rolls the FOLD back" had no witness
+
+The concurrent-refresh row uses `protocol`, and a CATEGORICAL reading has no baseline:
+`result.baseline` is null, so the fold never runs in that transaction. The row held "the
+retry lands exactly one refresh" and nothing about the fold. A continuous channel with a
+warm baseline is the witness the plan means, and four concurrent crossings now require the
+baseline count and the refresh count to agree.
+
+### Corrections to my own record, the fifth and sixth of this branch
+
+- **"G19 budgets eight rows" is a misreading of the plan's gate table.** The column is the
+  TASK number — G20 reads "5", which is Task 5. The plan has no row budgets. I repeated
+  the error into a reviewer's brief, which is how a wrong reading becomes a shared one.
+- **The message-in-the-body mutant dies at ONE row, not two.** Measured by a reviewer.
+  That is the fifth time on this branch I have written a kill count from what a row is
+  called rather than from re-running the mutant.
+- **The plan's "308-digit amount" is wrong**; `Number("9".repeat(308))` is finite and only
+  309 digits overflows. The tests use 309 and are right.
+- **G17's "the transaction removed" mutant dies at an R28 row, not at the forty-writer
+  row.** Recorded: the forty-writer row is not the witness for that mutant that it reads
+  as being.
+
+### Owed, and not fixed in this round
+
+- **The BRIEF body's `amount` is the payment amount**, hashed into `audit_entry` forever
+  beside `namespaceId`. It is called "an input under R8", but for a payment intent it is
+  the one payload value the retention design seals, and it survives crypto-shredding. R48
+  admits it so a grade can be recomputed; a ratio or a bucket would recompute the grade
+  without the absolute value. This needs its own ruling and its own round.
+- **No ruling says what `surprise` a re-delivered briefable intent carries.** It is
+  unconditionally null on the re-delivery arm, the fold's surprise is recorded nowhere by
+  design, and a row invites briefing a re-delivered intent — which will therefore build no
+  trigger.
+- **One shared forbidden-key set across all three bodies.** The three whitelists are
+  checked against three DIFFERENT hand-written forbidden lists and the refusal body has no
+  such row at all. A reviewer's proposal is one `FORBIDDEN_BODY_KEYS` asserted against all
+  three, plus a lexical gate that every `.audit.append(` sits in a function that also calls
+  an `assert*Body(`. Worth doing; not this round.
+

@@ -347,11 +347,15 @@ export function assertAuditBody(body: BriefAuditBody): void {
  * - `at` -- the instant the ingest was ABOUT. `AuditChain.append` stamps its own
  *   `occurredAt` from the chain's clock and a caller cannot supply one, so the
  *   instant has to travel in the body, exactly as it does for a brief.
- * - `readings` -- a COUNT. It is not one of R25's four, and it is admitted on the
- *   same ground R48 admits the brief's six numbers: without it nothing records
- *   that this observation derived two readings rather than one, which is what
- *   R46 turns on. A count is derived from a payload and names nothing in one,
- *   which is the line the aspects crossed.
+ * **AND NOT A READING COUNT**, which an earlier version carried and a review
+ * took out. A count of 2 is reachable only for a `cluster_proximity` carrying an
+ * `amount` (R70: no other channel can produce two), so `readings: 2` names the
+ * channel and tells a reader that a dust amount was present -- one bit about a
+ * payload's KEYS, in a permanent row, for a namespace that may later be erased.
+ * The defence offered for it, "a count is derived from a payload and names
+ * nothing in one", was simply false of that count. Nothing read it, and the
+ * reading count lives on the observation row for as long as that row does, which
+ * is the right lifetime for it and not the chain's.
  *
  * WHAT IT DELIBERATELY DOES NOT CARRY:
  *
@@ -370,8 +374,6 @@ export interface ObserveAuditBody {
   readonly namespaceId: string;
   /** The instant the ingest was about, as an ISO string. */
   readonly at: string;
-  /** How many readings the payload derived, R46's quantity. */
-  readonly readings: number;
   /** R41: the tags this observation opened OR refreshed. Empty is the common case. */
   readonly tagIds: readonly string[];
 }
@@ -389,17 +391,8 @@ export const ADMITTED_OBSERVE_PATHS: ReadonlySet<string> = new Set([
   "observationId",
   "namespaceId",
   "at",
-  "readings",
   "tagIds",
 ]);
-
-function requirePositiveInteger(path: string, value: unknown): void {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
-    throw new RangeError(
-      `auditBody.${path} must be a positive integer, got ${JSON.stringify(value)}`,
-    );
-  }
-}
 
 /**
  * Refuses an ingest entry's body the chain must not carry, naming the field or
@@ -426,14 +419,13 @@ export function assertObserveBody(body: ObserveAuditBody): void {
     }
   }
 
-  for (const key of ["observationId", "namespaceId", "at", "readings", "tagIds"] as const) {
+  for (const key of ["observationId", "namespaceId", "at", "tagIds"] as const) {
     requirePresent(key, body, key);
   }
 
   requireId("observationId", body.observationId, false);
   requireId("namespaceId", body.namespaceId, false);
   requireAt("at", body.at, false);
-  requirePositiveInteger("readings", body.readings);
 
   if (!Array.isArray(body.tagIds)) {
     throw new RangeError(`auditBody.tagIds must be an array, got ${typeof body.tagIds}`);
@@ -476,8 +468,13 @@ export type RefusalCode = (typeof REFUSAL_CODES)[number];
  * reason, that the chain is not the place for facts about things that do not
  * exist in it.
  *
- * A refusal at the second site is already bounded by the producer cap, because
- * the observation row it names had to be accepted first.
+ * A refusal at the second site is recorded ONLY ON ITS FIRST DELIVERY, which is
+ * the delivery the producer cap charged for. The claim this sentence used to make
+ * -- that the site is bounded because the row it names had to be accepted first
+ * -- was refuted by measurement: `append` answers `{created:false}` for a
+ * re-delivery from a pre-read taken OUTSIDE the cap transaction deliberately, so
+ * re-deliveries are free and the recording was once per delivery. `observe` gates
+ * it on `appended.created`; the bound lives there, not here.
  */
 export interface RefusalAuditBody {
   readonly observationId: string;

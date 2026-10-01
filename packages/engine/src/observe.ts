@@ -241,8 +241,11 @@ export interface ObserveResult {
  * rate a producer chooses to send it -- an amplification vector into the one
  * table retention cannot reach. That one goes to structured stderr instead,
  * which is the same answer R7 gives for conditions the chain cannot hold. A
- * refusal at THIS site is already bounded by the producer cap, because the row
- * it names had to be accepted first.
+ * refusal at THIS site is recorded ONLY ON THE FIRST DELIVERY, and its caller is
+ * what gates that. Measured, twice, by two reviews: without the gate a
+ * re-delivery is NOT bounded by the producer cap, because `append` answers
+ * `{created:false}` from a pre-read taken outside the cap transaction on
+ * purpose, so one accepted observation bought a permanent row per delivery.
  *
  * **THE REFUSAL IS THE PRIMARY FACT.** If the chain append fails -- exhausted,
  * or the body refused because the code is not in R21's vocabulary -- the
@@ -293,6 +296,54 @@ async function recordRefusal(
         refusalCode: REFUSAL_CODES.includes(code as RefusalCode) ? code : "UNKNOWN_REFUSAL_CODE",
       })}\n`,
     );
+  }
+}
+
+/**
+ * Runs the fold under R28's bound and RECORDS an exhausted retry before it
+ * leaves.
+ *
+ * **R28 SAYS "RECORDS", AND THIS PATH RECORDED NOTHING.** A review measured it:
+ * with a transaction that always refuses, `observe` threw `RetriesExhausted`
+ * carrying the code and the observation id, wrote no stderr line, and left the
+ * chain head unmoved. The audit-append exhaustion and the refusal-recording
+ * exhaustion both write a structured line; the FOLD's exhaustion -- the one R28
+ * is literally about, "and the observation is not folded" -- wrote nothing, so
+ * the fact existed only in a thrown object nobody durably sees.
+ *
+ * **STDERR AND NOT THE CHAIN**, for two reasons that both point the same way. The
+ * fold failed, and the commonest reason for that is the store being unavailable,
+ * in which case a chain append fails too -- which is exactly the condition R7
+ * answers with a structured line. And a chain entry here would be one per
+ * DELIVERY rather than one per accepted observation, which is the amplification
+ * R83 had to be corrected for once already.
+ */
+async function foldWithRecord<T>(
+  composed: Composed,
+  policies: BriefPolicies,
+  at: Date,
+  observationId: string,
+  namespaceId: string,
+  body: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await retrying(body, {
+      maxRetries: policies.brief.maxRetries,
+      label: "observe",
+      subject: observationId,
+    });
+  } catch (cause) {
+    // A CODE AND IDS ONLY, R21: whatever failed may carry an observed value.
+    process.stderr.write(
+      `${JSON.stringify({
+        event: "engine.observe.fold_abandoned",
+        at: at.toISOString(),
+        code: "FOLD_ABANDONED",
+        observationId,
+        namespaceId,
+      })}\n`,
+    );
+    throw cause;
   }
 }
 
@@ -373,7 +424,27 @@ export async function observe(
     // what makes the id available to name it by -- and what makes this the refusal
     // that IS recorded (R83).
     const code = (cause as { code?: string }).code ?? "OBSERVATION_UNREADABLE";
-    await recordRefusal(composed, policies, at, observationId, code);
+    // ONLY ON THE FIRST DELIVERY, R83 CORRECTED -- and this condition is the only
+    // thing that makes the recording bounded at all. Two reviews measured the
+    // version without it: `append` answers `{created:false}` for a repeat WITHOUT
+    // charging the producer cap, which `observation.ts` says where the cap is
+    // enforced -- "the pre-read is deliberately OUTSIDE this transaction: a
+    // re-delivery has already returned by now, so the indexer's retry never
+    // consumes a slot" -- and `readingsOf` runs before the re-delivery branch, so
+    // the payload failed again and the refusal was recorded again. ONE accepted
+    // observation bought N permanent rows in the one table retention cannot
+    // reach, at whatever rate a producer chose to re-send.
+    //
+    // Worse than an unbounded path: the HONEST path writes no chain entry on a
+    // re-delivery at all, so this was the ONLY unbounded growth path into
+    // `audit_entry`, and it was introduced by the commit that claimed to be
+    // avoiding exactly it.
+    //
+    // `appended.created` is the delivery the cap charged for, so one refusal row
+    // per accepted observation is the bound R83 asserted and did not have. The
+    // caller is still told every time: the refusal is thrown on every delivery
+    // and only the RECORDING happens once.
+    if (appended.created) await recordRefusal(composed, policies, at, observationId, code);
     throw new RefusedObservation(code, observationId, { cause });
   }
 
@@ -413,8 +484,7 @@ export async function observe(
   // date reader, and an event always holds.
   const holds = holdsAt(observation, at);
 
-  const folded = await retrying(
-    async () =>
+  const folded = await foldWithRecord(composed, policies, at, observationId, namespaceId, async () =>
       // R10's unit of work. Every read is inside, so the retry re-runs them.
       composed.handle.transaction().execute(async (trx) => {
         const inner = compose(trx, composed.clock, composed.ring, composed.retention);
@@ -502,7 +572,6 @@ export async function observe(
         }
         return { ownTagIds, surprise };
       }),
-    { maxRetries: policies.brief.maxRetries, label: "observe", subject: observationId },
   );
 
   // R24: AFTER the commit, because `AuditChain.append` refuses a transaction — and
@@ -520,6 +589,16 @@ export async function observe(
     }),
     kind: "observe",
     // R25: IDS, CODES, VERSIONS AND INSTANTS. An earlier version carried `aspects`,
+    // and a later one carried `readings`, the COUNT. The count is gone too, and for
+    // the same reason once a review drew the line properly: a count of 2 is
+    // reachable only for a `cluster_proximity` carrying an `amount` (R70 -- no
+    // other channel produces two), so `readings: 2` names the channel AND tells a
+    // reader a dust amount was in the payload. One bit, in a permanent row, about
+    // a namespace that may later be erased. My ledger defence -- "a count is
+    // derived from a payload and names nothing in one" -- was false of this count.
+    // Nothing read it, and the reading count lives on the observation row for as
+    // long as that row does, which is the right lifetime for it.
+    //
     // and a review measured what that costs: an aspect is templated from the payload
     // (`amount/${assetCode}/${direction}`, `event/${p.event}`, `quoted/${p.unit}`) and
     // the schema bounds none of those strings, so a 56-character address-shaped
@@ -532,7 +611,6 @@ export async function observe(
       observationId,
       namespaceId,
       at: at.toISOString(),
-      readings: readings.all.length,
       tagIds: folded.ownTagIds,
     } satisfies ObserveAuditBody,
   };

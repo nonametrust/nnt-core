@@ -326,7 +326,6 @@ const OBSERVE_BODY: ObserveAuditBody = {
   observationId: "e3a1c6de-0000-4000-8000-000000000011",
   namespaceId: "e3a1c6de-0000-4000-8000-000000000012",
   at: "2026-09-21T00:00:00.000Z",
-  readings: 2,
   tagIds: ["e3a1c6de-0000-4000-8000-000000000013"],
 };
 
@@ -416,17 +415,13 @@ describe("the observe entry's audit body", () => {
       );
     });
 
-    it("a reading count that is not a positive integer, in both directions", () => {
-      // Every channel produces at least one reading, so zero is not a count this
-      // path can honestly write; and a fraction is not a count at all.
-      expect(() => assertObserveBody(observePlus({ readings: 0 }))).toThrow(
-        /readings must be a positive integer/,
-      );
-      expect(() => assertObserveBody(observePlus({ readings: 1.5 }))).toThrow(
-        /readings must be a positive integer/,
-      );
-      expect(() => assertObserveBody(observePlus({ readings: Number.NaN }))).toThrow(
-        /readings must be a positive integer/,
+    it("a reading COUNT, which was in this body and is now refused outright", () => {
+      // The regression test against the field this body used to carry. A count of
+      // 2 is reachable only for a `cluster_proximity` carrying an `amount` (R70),
+      // so it named the channel and the presence of a dust amount -- one bit about
+      // a payload's keys, in a row that outlives every key.
+      expect(() => assertObserveBody(observePlus({ readings: 2 }))).toThrow(
+        /readings is not admitted/,
       );
     });
 
@@ -449,7 +444,7 @@ describe("the observe entry's audit body", () => {
       // presence loop entirely SURVIVED, and the loop was code no test could
       // distinguish from its neighbour. The two messages carry different
       // information: whether the producer omitted the field or sent a wrong value.
-      for (const key of ["observationId", "namespaceId", "at", "readings", "tagIds"] as const) {
+      for (const key of ["observationId", "namespaceId", "at", "tagIds"] as const) {
         const { [key]: _dropped, ...rest } = OBSERVE_BODY;
         expect(() => assertObserveBody(rest as unknown as ObserveAuditBody), key).toThrow(
           new RegExp(`auditBody\\.${key} is missing`),
@@ -466,19 +461,25 @@ describe("the observe entry's audit body", () => {
     it("names no key an aspect, a channel or a payload field would travel under", () => {
       // `aspects` is first in this list because it is the one that was really
       // there. The others are the shapes the same mistake would take next.
-      for (const forbidden of ["aspects", "aspect", "channel", "payload", "source", "ref", "evidence", "amount", "assetCode"]) {
+      for (const forbidden of ["aspects", "aspect", "channel", "payload", "source", "ref", "evidence", "amount", "assetCode", "readings", "message", "errors"]) {
         expect([...ADMITTED_OBSERVE_PATHS].some((p) => p.split(".").includes(forbidden)), forbidden).toBe(
           false,
         );
       }
     });
 
-    it("carries the reading COUNT and not the readings, which is the whole of R25 here", () => {
-      // A count is not derived from a payload and names nothing in one. The
-      // readings themselves are each an aspect, and an aspect is a payload field
-      // in a string.
-      expect(ADMITTED_OBSERVE_PATHS.has("readings")).toBe(true);
-      expect(typeof OBSERVE_BODY.readings).toBe("number");
+    it("carries IDS AND AN INSTANT and nothing that counts or names a payload", () => {
+      // R25 as written, with no exception claimed. The reading count was the last
+      // exception and it did not survive review.
+      expect([...ADMITTED_OBSERVE_PATHS].sort()).toEqual([
+        "at",
+        "namespaceId",
+        "observationId",
+        "tagIds",
+      ]);
+      for (const counted of ["readings", "count", "n", "surprise"]) {
+        expect(ADMITTED_OBSERVE_PATHS.has(counted), counted).toBe(false);
+      }
     });
   });
 });
