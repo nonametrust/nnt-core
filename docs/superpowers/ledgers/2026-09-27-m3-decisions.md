@@ -2595,3 +2595,61 @@ exactly **two** rows red, and the old `e.name` discriminator turns **eight** red
 suite was also run under `TZ=America/St_Johns` and with the database's own session
 timezone set to `Pacific/Kiritimati` — green both times, `ALTER DATABASE` verified to
 have taken on a fresh connection before the run rather than assumed.
+
+## Task 9 — acceptance, and the one assertion the scenario exists to make
+
+R15's story runs end to end through the engine on one database with one clock advanced
+through twenty-one simulated days: a standing condition and a payment on day zero,
+twenty prior quotes, the address change and its same-afternoon revert on day twelve, the
+2500 USDC quote on day twenty-one, then the brief.
+
+**The prior-quote count is derived**, `POLICY_V0.minObservations * 2`, which is M2's
+twenty while the minimum is ten and stays correct when the policy moves. **Every
+assertion reads out of the `BriefOutput`** rather than out of an array the test filled
+in — the trap the storage card's acceptance test fell into twice.
+
+### R84. The day-zero condition FADES, and that is the acceptance's real content
+
+The brief returns **one** reason, not two, and finding out why is what makes this
+scenario worth running at twenty-one days rather than three. The day-zero protocol tag is
+**still live in the store**; it is absent from the brief because its decayed strength has
+fallen below R49's floor. Measured at the brief's instant, with the calibrated fourteen-day
+half-life:
+
+| tag | g0 | tagged | strength at day 21 |
+| --- | --- | --- | --- |
+| `protocol/event/accepts_usdc` | 0.51968 | day 0 | **0.1837** |
+| `address_integrity/transition` | 0.63872 | day 12 | **0.4142** |
+
+The floor falls between them. So the threshold is `600 × 0.8 = 480` and not
+`600 × 0.8² = 384`, and the brief says the day-twelve fact is current while the day-zero
+fact has faded — which is the whole product in one number. The row asserts the COUNT of
+reasons and not only their content, and it asserts the day-zero tag is still live, so the
+exclusion is provably the floor's work and not the tag's absence.
+
+Mutants, each killed by that row with the message *"the day-zero condition did not fade
+out of the brief"*:
+
+| mutant | result |
+| --- | --- |
+| the undecayed `g0` used as the tag's strength | KILLED |
+| the active floor removed | KILLED |
+| both R22 filters removed, so the intent cites its own evidence | KILLED |
+| a comment added (control) | SURVIVED |
+
+### R22's two filters are redundant on the supported path, measured
+
+Removing EITHER filter alone — `ownTagIds` or the observation-id comparison — survives
+this scenario. That is not a hole: `threshold.ts`'s own comment says so ("on the supported
+path `ownTagIds` covers both"), and the second filter exists for a caller that passes an
+incomplete list, which `brief-db.test.ts` holds separately. Recorded because a survivor
+nobody explains looks identical to a survivor nobody noticed.
+
+### R30 is held STRUCTURALLY, not by a test
+
+"A refresh does not move the tag's opening observation" cannot be violated: `TagRefresh`
+is `{g0, taggedAt, refreshCount, saturationState}` and the store's `refresh(tagId, next)`
+has no observation id to write. My attempt to mutate it produced a no-op, which is the
+right answer — the API makes the defect inexpressible. Better than a test, and worth
+naming so nobody later "improves" `TagRefresh` by adding the field.
+
