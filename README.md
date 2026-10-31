@@ -9,7 +9,8 @@ copies of the shape they would drift the first week. The contract between them
 is narrow on purpose, so the two sides run in parallel once the schema is
 agreed.
 
-Private until the `v0` tag, then public. Apache-2.0.
+Public since 1 November 2026, ahead of the `v0` tag: milestones M1 to M3 are on
+`main` and M4, the night consolidation, is next. Apache-2.0.
 
 ## What is here
 
